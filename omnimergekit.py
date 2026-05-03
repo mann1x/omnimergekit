@@ -311,7 +311,7 @@ def _apply_drop(delta: torch.Tensor, method: str, density: float,
 
 
 def _omnimerge_v2_chunk(
-    base_chunk: torch.Tensor,  # fp32, flat 1D
+    base_chunk: torch.Tensor,  # fp32, flat 1D — what merged delta gets added to
     source_chunks: List[torch.Tensor],  # fp32, flat 1D
     weights: List[float],
     density: float,
@@ -319,6 +319,7 @@ def _omnimerge_v2_chunk(
     fisher_chunks: Optional[List[torch.Tensor]] = None,
     features: Optional[set] = None,
     generator: Optional[torch.Generator] = None,
+    task_base_chunk: Optional[torch.Tensor] = None,  # fp32 flat 1D — what deltas are computed FROM. None = same as base_chunk (legacy).
 ) -> torch.Tensor:
     """Omnimerge v2: configurable enhancements over DARE-TIES.
 
@@ -333,6 +334,8 @@ def _omnimerge_v2_chunk(
     """
     if features is None:
         features = {"obim", "darex", "emr"}
+    if task_base_chunk is None:
+        task_base_chunk = base_chunk
 
     N = base_chunk.nelement()
     k = max(1, int(density * N))
@@ -354,7 +357,7 @@ def _omnimerge_v2_chunk(
     # Step 1+2: Compute deltas with masking + rescaling
     masked = []
     for i, s in enumerate(source_chunks):
-        delta = s - base_chunk
+        delta = s - task_base_chunk
         if density < 1.0:
             if "obim" in features:
                 # OBIM-lite: deterministic top-k by |delta|
@@ -426,7 +429,7 @@ def _omnimerge_v2_chunk(
 
 
 def _merge_chunk(
-    base_chunk: torch.Tensor,  # fp32
+    base_chunk: torch.Tensor,  # fp32 — what the merged delta is added to
     source_chunks: List[torch.Tensor],  # fp32
     weights: List[float],  # per-source weights, same order as source_chunks
     method: str,  # dare_ties | dare_linear | task_arithmetic | della | omnimerge_v2
@@ -436,6 +439,7 @@ def _merge_chunk(
     darex_q: Optional[float] = None,
     fisher_chunks: Optional[List[torch.Tensor]] = None,
     v2_features: Optional[set] = None,
+    task_base_chunk: Optional[torch.Tensor] = None,  # fp32 — what deltas are computed FROM. None = same as base_chunk (legacy).
 ) -> torch.Tensor:
     """Merge a single flat 1D chunk with the requested method.
 
@@ -446,17 +450,21 @@ def _merge_chunk(
       - della: MAGPRUNE drop (magnitude-ranked) + TIES sign consensus
       - omnimerge_v2: magnitude top-k (OBIM-lite) + DAREx rescaling + EMR election
     """
+    if task_base_chunk is None:
+        task_base_chunk = base_chunk
+
     if method == "omnimerge_v2":
         return _omnimerge_v2_chunk(base_chunk, source_chunks, weights,
                                    density, darex_q or density,
                                    fisher_chunks=fisher_chunks,
                                    features=v2_features,
-                                   generator=generator)
+                                   generator=generator,
+                                   task_base_chunk=task_base_chunk)
 
     # Compute and drop deltas per source
     masked = []
     for s in source_chunks:
-        delta = s - base_chunk  # fp32, ~200 MB per chunk
+        delta = s - task_base_chunk  # fp32, ~200 MB per chunk
         delta = _apply_drop(delta, method, density, epsilon, generator)
         masked.append(delta)
         del delta
@@ -528,6 +536,7 @@ def dare_ties_merge_tensor(
     m7_layer_aware: bool = False,
     m7_tau_norm: Optional[float] = None,
     m7_flip_strength: float = 100.0,
+    task_base: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Apply DARE-TIES to a single tensor (returns merged result, same shape/dtype).
 
@@ -579,15 +588,23 @@ def dare_ties_merge_tensor(
     base_flat = base.reshape(-1)
     source_flats = [s.reshape(-1) for s in sources]
     fisher_flats = [f.reshape(-1) for f in fisher_tensors] if fisher_tensors else None
+    # Task arithmetic: when task_base differs from base, deltas are computed from task_base
+    # but the merged delta is added to base. None → legacy behavior (delta vs base).
+    task_base_flat = task_base.reshape(-1) if task_base is not None else None
 
     for start in range(0, n, CHUNK_ELEMENTS):
         end = min(start + CHUNK_ELEMENTS, n)
         base_chunk = base_flat[start:end].to(dtype=torch.float32, device=device).contiguous()
         source_chunks = [s[start:end].to(dtype=torch.float32, device=device).contiguous() for s in source_flats]
         f_chunks = [f[start:end].to(dtype=torch.float32, device=device).contiguous() for f in fisher_flats] if fisher_flats else None
-        merged_chunk = _merge_chunk(base_chunk, source_chunks, weights, method, density, epsilon, generator, darex_q=darex_q, fisher_chunks=f_chunks, v2_features=v2_features)
+        tb_chunk = task_base_flat[start:end].to(dtype=torch.float32, device=device).contiguous() if task_base_flat is not None else None
+        merged_chunk = _merge_chunk(base_chunk, source_chunks, weights, method, density, epsilon, generator,
+                                    darex_q=darex_q, fisher_chunks=f_chunks, v2_features=v2_features,
+                                    task_base_chunk=tb_chunk)
         out_flat[start:end] = merged_chunk.to(dtype=orig_dtype, device="cpu")
         del base_chunk, source_chunks, merged_chunk
+        if tb_chunk is not None:
+            del tb_chunk
         if device != "cpu":
             torch.cuda.empty_cache()
         gc.collect()
@@ -604,7 +621,14 @@ def human_bytes(n: int) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base", required=True, type=Path, help="Base model directory (HF safetensors)")
+    ap.add_argument("--base", required=True, type=Path, help="Base model directory (HF safetensors). The merged delta is added TO this — it's the starting point of the output model.")
+    ap.add_argument("--task-base", type=Path, default=None,
+                    help="Optional separate base from which task-vector deltas are computed. "
+                         "If omitted (default), deltas are computed vs --base (legacy behavior). "
+                         "When provided, enables task-arithmetic-style merging: delta_i = source_i - task_base, "
+                         "then merged = base + Σ w_i · apply(delta_i). Use case: --task-base Qwen3.5-4B "
+                         "--base jackrong-v2 → preserves jackrong-v2 reasoning while adding code/python deltas "
+                         "from sister fine-tunes computed against their shared ancestor.")
     ap.add_argument("--source", required=True, action="append", type=Path,
                     help="Source fine-tune directory. Pass multiple times for multi-source.")
     ap.add_argument("--output", required=True, type=Path, help="Output merged model directory")
@@ -783,6 +807,8 @@ def main():
     print(f"  shard   : {args.shard_size} GB")
     if skip_patterns:
         print(f"  skip    : {skip_patterns}  (matching tensors copied from base)")
+    if args.task_base is not None:
+        print(f"  task_base: {args.task_base}  (TASK ARITHMETIC: delta_i = source_i - task_base, then base + Σ w_i · apply(delta_i))")
     print(flush=True)
 
     print("Loading weight maps...", flush=True)
@@ -808,6 +834,20 @@ def main():
     print(f"  base: {len(base_handles)} shards", flush=True)
     for i, h in enumerate(src_handles_list):
         print(f"  source {i}: {len(h)} shards", flush=True)
+
+    # Optional task-base for task-arithmetic merging (delta computed from task_base, added to base)
+    task_base_handles = None
+    task_base_wm = None
+    if args.task_base is not None:
+        task_base_wm, task_base_names = load_weight_map(args.task_base)
+        # Verify name overlap with base — we'll use the intersection for delta computation
+        tb_set = set(task_base_wm.keys())
+        base_set = set(base_wm.keys())
+        missing_in_tb = base_set - tb_set
+        if missing_in_tb:
+            print(f"  NOTE   : task_base missing {len(missing_in_tb)} tensors from base (those tensors fall back to delta-vs-base)", flush=True)
+        task_base_handles = open_shard_handles(args.task_base, task_base_wm)
+        print(f"  task_base: {len(task_base_handles)} shards (deltas computed from this; merged delta added to --base)", flush=True)
 
     # Load Fisher scores if provided
     fisher_handles = None
@@ -927,6 +967,16 @@ def main():
                             fisher_ts = None
                             break
 
+                # Look up task-base tensor for this name if task-arithmetic mode is on.
+                # If the tensor exists in base but not in task_base (or shapes mismatch),
+                # fall back to delta-vs-base for that single tensor.
+                task_base_t = None
+                if task_base_handles is not None:
+                    task_base_t = get_tensor(task_base_handles, task_base_wm, name)
+                    if task_base_t is not None and task_base_t.shape != base_t.shape:
+                        print(f"  WARNING: {name}: task_base shape {task_base_t.shape} != base {base_t.shape} — falling back to delta-vs-base for this tensor", flush=True)
+                        task_base_t = None
+
                 try:
                     merged = dare_ties_merge_tensor(
                         base_t, sources, args.density, generator,
@@ -939,6 +989,7 @@ def main():
                         m7_layer_aware=args.m7_layer_aware,
                         m7_tau_norm=args.m7_tau_norm,
                         m7_flip_strength=args.m7_flip_strength,
+                        task_base=task_base_t,
                     )
                 except Exception as e:
                     print(f"     ERROR merging {name}: {type(e).__name__}: {e}", flush=True)
