@@ -26,32 +26,54 @@ Goal: best 4B coder via 2-3 source merge. Sources: `jackrong-v2`
 (reasoning), `continuum-code-forged` (code), `jackrong-python` (Python
 specialist).
 
-### Phase 1: 2-source DARE-TIES baselines (m4–m8)
+### Sources (each Q6_K, served via llama-server)
 
-Quick sweep of vanilla DARE-TIES + variants on 2 sources.
+| Source | HE | MBPP | LCB-30 | GSM8K | MMLU-Pro | AIME-30 | HE+ |
+|--------|----|----|--------|-------|----------|---------|-----|
+| `jackrong-v2` (reasoning) | 60.4 | 45.0 | 23.3 | **83.0** | 56.8 | **26.7** | **54.9** |
+| `continuum-code-forged` (code) | 59.2 | **53.4** | 13.3 | 79.0 | 49.1 | 0.0 | 48.2 |
+| `jackrong-python` (Python) | 57.3 | 47.0 | 20.0 | 75.0 | **58.7** | 0.0 | 49.4 |
+
+Each source wins on different axes: jackrong-v2 reasoning, continuum-forged
+MBPP/code-throughput, jackrong-python MMLU-Pro/general. Goal: a merge that
+keeps each source's strengths.
+
+### Phase 1: 2-source DARE-TIES variant sweep (v1b, m2–m8)
+
+Quick exploration of vanilla DARE-TIES, layer-aware, and detector-based
+importance on 2 sources. Numbers omitted where the variant was rejected
+on a quick sniff test (sample inspection or HE pass rate alone).
 
 | ID | Method | HE | MBPP | LCB-30 | Verdict |
 |----|--------|----|----|--------|---------|
-| m4-v2 | DARE-TIES | -- | -- | -- | baseline |
-| m6 | DARE-TIES + per-layer aware | -- | -- | -- | marginal |
-| m6-hybrid | mix of m6 + retraining-style anneal | -- | -- | -- | parked |
-| m7-detector | detector-based importance | -- | -- | -- | rejected |
-| m7v2 / m7v3 | m7 layer-aware variants | -- | -- | -- | parked |
-| m8 | aggressive density | -- | -- | -- | rejected |
-| **m4-exlrp-v2** | `omnimerge_v2` with ex-LRP signal | -- | -- | -- | LRP signal too noisy on 4B — rejected |
+| **microcoder-v1b** | DARE-TIES baseline | 61.0 | 46.2 | 10.0 | reference baseline |
+| m2-turbo | DARE-TIES + density 0.6 | -- | -- | -- | parked |
+| m4-v2-dare | layer-aware DARE | -- | -- | -- | marginal |
+| m6 / m6-hybrid | per-layer + anneal | -- | -- | -- | parked |
+| m7-detector / m7v2 / m7v3 | detector-based importance | -- | -- | -- | rejected (signal noisy) |
+| m8 | aggressive density 0.4 | -- | -- | -- | rejected |
+| m4-exlrp-v2 | `omnimerge_v2` with ex-LRP signal | -- | -- | -- | LRP signal too noisy on 4B |
 
 ### Phase 2: Fisher-based with competence maps (v2a–v2h)
 
-| ID | Method | HE | MBPP | LCB-30 | GSM8K | MMLU-Pro | AIME | HE-Plus | Verdict |
-|----|--------|----|----|--------|-------|----------|------|---------|---------|
-| jackrong-v2 (source) | -- | -- | -- | -- | 83.0 | 56.8 | **26.7** | 54.9 | reasoning specialist |
-| continuum-forged (source) | -- | -- | -- | -- | 79.0 | 49.1 | 0.0 | 48.2 | code specialist |
-| jackrong-python (source) | -- | -- | -- | -- | 75.0 | 58.7 | 0.0 | 49.4 | python specialist |
-| v1b | DARE-TIES baseline | -- | -- | -- | -- | -- | -- | -- | reference |
-| v2a-d | Fisher variants | -- | -- | -- | -- | -- | -- | -- | iterating |
-| **v2e-fisher-darex** | `omnimerge_v2 fisher,darex` (2 sources) | -- | -- | -- | 82.0 | 52.7 | 3.3 | 50.6 | best 2-source |
-| **v2g-3src-fisher-darex** | 3-source extension of v2e | -- | -- | **26.67** | 81.0 | 53.0 | 0.0 | 49.4 | best LCB; AIME washed out |
-| **v2h-3src-fisher-darex-aime** (in flight) | v2g + differential AIME signal blended in | -- | -- | -- | -- | -- | -- | -- | targeting AIME recovery + LCB retention |
+All run with `omnimergekit.py --method omnimerge_v2 --v2-features fisher,darex`,
+`density=0.53 --darex-q=0.85`. Variants differ in source set, fisher
+restriction, and density.
+
+| ID | Sources | HE | MBPP | LCB-30 | GSM8K | MMLU-Pro | AIME-30 | HE+ | Verdict |
+|----|---------|----|----|--------|-------|----------|---------|-----|---------|
+| v2a-competence | 2 (no diff) | 61.0 | 46.2 | -- | -- | -- | -- | -- | early calibration |
+| v2b-competence-diff | 2 (diff maps) | 61.0 | 46.2 | -- | -- | -- | -- | -- | confirms baseline |
+| v2c-fisheronly-diff | 2 (fisher only) | 56.7 | 51.6 | -- | -- | -- | -- | -- | code↑, reasoning↓ |
+| v2d-fisher-d030 | 2 (density 0.30) | 57.9 | 51.4 | -- | -- | -- | -- | -- | density too aggressive |
+| **v2e-fisher-darex** | 2 (jv + cf) | **59.2** | 52.6 | 23.3 | 82.0 | 52.7 | 3.3 | 50.6 | **best 2-source** |
+| **v2g-3src-fisher-darex** | 3 (+ jp) | 56.1 | **54.0** | **26.67** | 81.0 | 53.0 | 0.0 | 49.4 | **best LCB**, AIME washed out |
+| **v2h-3src-fisher-darex-aime** | 3 + AIME diff signal blended | 56.1 | 51.4 | **26.67** | **81.0** | _pending_ | _pending_ | _pending_ | targeting AIME recovery while keeping LCB |
+
+**Headline observation:** going from v2e (2 sources) to v2g (3 sources)
+won LCB (+3.4 pp) but lost AIME (3.3 → 0.0). v2h preserves LCB while
+attempting AIME recovery via a focused differential map on the 8 AIME
+problems jackrong-v2 uniquely solved.
 
 Recipes:
 - `recipes/microcoder_4b/local_4b_competence_finalize.sh` (v2g build + LCB)
