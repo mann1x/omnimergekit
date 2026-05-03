@@ -68,12 +68,42 @@ restriction, and density.
 | v2d-fisher-d030 | 2 (density 0.30) | 57.9 | 51.4 | -- | -- | -- | -- | -- | density too aggressive |
 | **v2e-fisher-darex** | 2 (jv + cf) | **59.2** | 52.6 | 23.3 | 82.0 | 52.7 | 3.3 | 50.6 | **best 2-source** |
 | **v2g-3src-fisher-darex** | 3 (+ jp) | 56.1 | **54.0** | **26.67** | 81.0 | 53.0 | 0.0 | 49.4 | **best LCB**, AIME washed out |
-| **v2h-3src-fisher-darex-aime** | 3 + AIME diff signal blended | 56.1 | 51.4 | **26.67** | **81.0** | _pending_ | _pending_ | _pending_ | targeting AIME recovery while keeping LCB |
+| **v2h-3src-fisher-darex-aime** | 3 + AIME diff signal blended | 56.1 | 51.4 | **26.67** | **81.0** | 53.3 | **0.0** | 49.4 | **rejected** — strictly worse than v2g (-2.6 MBPP, AIME unmoved) |
 
 **Headline observation:** going from v2e (2 sources) to v2g (3 sources)
-won LCB (+3.4 pp) but lost AIME (3.3 → 0.0). v2h preserves LCB while
-attempting AIME recovery via a focused differential map on the 8 AIME
-problems jackrong-v2 uniquely solved.
+won LCB (+3.4 pp) but lost AIME (3.3 → 0.0). v2h tried to recover AIME
+via a focused differential map on the 8 AIME problems jackrong-v2
+uniquely solved. **It did not work.** AIME stayed at 0/30, LCB held at
+26.67, MBPP slipped 2.6 pp. Every other axis flat to within ±0.3 pp.
+
+**Why the v2h fisher-blend failed:**
+
+8 winning AIME problems gave too sparse a gradient signal to redirect
+the merge toward AIME-solving capability. Per-element fisher importance
+identifies which params jackrong-v2 used to solve those 8 problems, but
+biasing the merge weights on those params (via blend `(1.05·old +
+0.27·aime_jv) / 1.32`) only marginally tilts those params toward jv —
+not enough to overcome the averaging-toward-base effect on the
+AIME-distinguishing direction in parameter space. The MBPP loss
+indicates the AIME signal did pull params away from their code-utility
+configuration, but didn't compensate with usable AIME ability.
+
+**What would actually work for AIME recovery (future):**
+
+1. **SFT distillation** of jackrong-v2's AIME outputs (or its full
+   reasoning corpus) into the merge — cleanly transfers the
+   problem-solving direction with proper gradient density.
+2. **Direct interpolation toward jackrong-v2** on the layers that hold
+   the reasoning policy (likely `mlp.gate_proj` mid-layers, given
+   Qwen3.6 token-leak experiments showed policy lives there). Skip
+   fisher entirely on those layers; pass jv straight through.
+3. **More extraction data** — collect AIME-style problems from open
+   datasets (MATH, NuminaMath), eval jackrong-v2 on them, extract
+   fisher on the larger winning set. With 30-50 docs the signal might
+   become dense enough to bias the merge meaningfully.
+
+**Verdict:** **v2g remains the published candidate** for the 3-source
+MicroCoder line. v2h is logged as a negative result.
 
 Recipes:
 - `recipes/microcoder_4b/local_4b_competence_finalize.sh` (v2g build + LCB)
