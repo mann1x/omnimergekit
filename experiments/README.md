@@ -69,6 +69,7 @@ restriction, and density.
 | **v2e-fisher-darex** | 2 (jv + cf) | **59.2** | 52.6 | 23.3 | 82.0 | 52.7 | 3.3 | 50.6 | **best 2-source** |
 | **v2g-3src-fisher-darex** | 3 (+ jp) | 56.1 | **54.0** | **26.67** | 81.0 | 53.0 | 0.0 | 49.4 | **best LCB**, AIME washed out |
 | **v2h-3src-fisher-darex-aime** | 3 + AIME diff signal blended | 56.1 | 51.4 | **26.67** | **81.0** | 53.3 | **0.0** | 49.4 | **rejected** — strictly worse than v2g (-2.6 MBPP, AIME unmoved) |
+| **v2i-jv-base-task-arith** | jv as merge_base, task-vectors of cf+jp from Qwen3.5-4B | **57.3** | 52.0 | **26.67** | **83.0** | 52.5 | **3.3** | **50.0** | **competitive** — matches jv-source GSM8K exactly, AIME non-zero, HE+1.2 / HE+ +0.6 / MBPP −2.0 vs v2g |
 
 **Headline observation:** going from v2e (2 sources) to v2g (3 sources)
 won LCB (+3.4 pp) but lost AIME (3.3 → 0.0). v2h tried to recover AIME
@@ -102,8 +103,49 @@ configuration, but didn't compensate with usable AIME ability.
    fisher on the larger winning set. With 30-50 docs the signal might
    become dense enough to bias the merge meaningfully.
 
-**Verdict:** **v2g remains the published candidate** for the 3-source
-MicroCoder line. v2h is logged as a negative result.
+**Verdict (v2h):** v2g remained the better merge against v2h. v2h is
+logged as a negative result.
+
+### v2i: task-arithmetic merge (jackrong-v2 as base, deltas vs Qwen3.5-4B)
+
+After v2h's failure, we changed strategy entirely. Instead of trying to
+extract a stronger AIME signal via fisher, we used the task-arithmetic
+formulation (Ilharco et al., ICLR 2023):
+
+```
+merged = jackrong-v2 + 0.55 · DARE(cf − Qwen3.5-4B) + 0.45 · DARE(jp − Qwen3.5-4B)
+```
+
+`jackrong-v2` is the merge_base — passes through unchanged at full
+strength (no DARE drop, no fisher dilution). The cf and jp task vectors
+are computed FROM the shared common ancestor (Qwen3.5-4B) so they encode
+"add code skill" / "add python skill" cleanly, without simultaneously
+"undoing reasoning". This required an `omnimergekit.py` patch to add
+`--task-base` (commit `f6fde8d`).
+
+**Result vs v2g:**
+
+| Δ | HE | MBPP | LCB | GSM8K | MMLU-Pro | AIME | HE+ |
+|---|---|---|---|---|---|---|---|
+| v2i − v2g | +1.2 | **−2.0** | = | **+2.0** | −0.6 | **+3.3** | +0.6 |
+
+Notably, **v2i matches the jackrong-v2 source GSM8K exactly (83.0)** —
+a behavior v2g/v2h didn't achieve (both 81.0). Conciseness is also
+preserved (median chars on GSM8K: jv 229, v2i 239, v2g/v2h 259-262).
+AIME recovered 1/30 (3.33%) — small but non-zero, vs v2g/v2h's 0.0.
+LCB ceiling held at 26.67. Cost: MBPP −2.0 vs v2g.
+
+**Verdict (v2i):** Better balanced profile. The task-arithmetic
+formulation does what it promises — preserves the merge_base's behavior
+in directions orthogonal to the source task vectors. For a "code +
+reasoning balance" model card, **v2i is the better candidate.** For a
+"code-only" framing where MBPP is the headline, v2g still leads by 2 pp.
+
+**Methodology lesson:** when one source dominates a capability axis the
+others are zero on, the natural framing is task-arithmetic, not
+symmetric multi-source merging. The published v2g recipe assumed all
+three sources contributed *some* signal in every subspace; v2i drops
+that assumption for the axes where it's false.
 
 Recipes:
 - `recipes/microcoder_4b/local_4b_competence_finalize.sh` (v2g build + LCB)
