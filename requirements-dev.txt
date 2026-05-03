@@ -1,0 +1,6 @@
+# Development helpers (linters, runtime debugging) — optional.
+ruff>=0.6.0
+ipython>=8.0
+matplotlib>=3.8
+seaborn>=0.13
+jupyterlab>=4.0

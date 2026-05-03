@@ -1,0 +1,9 @@
+# Quantization deps (loaded on top of requirements.txt)
+# llama.cpp itself is NOT pip-installed — build it separately
+# (see docs/CONDA_ENVS.md → "Building llama.cpp"). The CLI binaries used:
+#   /opt/llama.cpp/build/bin/llama-quantize
+#   /opt/llama.cpp/build/bin/llama-imatrix
+#   /opt/llama.cpp/convert_hf_to_gguf.py    (Python helper shipped with llama.cpp)
+
+# Python-side GGUF inspection / metadata edit
+gguf==0.18.0

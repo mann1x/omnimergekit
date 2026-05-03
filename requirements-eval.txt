@@ -1,0 +1,14 @@
+# Eval-only deps (loaded on top of requirements.txt)
+# Includes lm-eval-harness with API extras for the `local-completions` and
+# `local-chat-completions` model backends used in our recipes.
+
+lm-eval[api]==0.4.11
+
+# Code-eval support: lm_eval HE/MBPP need both HF_ALLOW_CODE_EVAL=1 AND
+# --confirm_run_unsafe_code at invocation time. The package itself just
+# needs the tenacity backoff helper and the optional human_eval scorer.
+tenacity==9.1.4
+human-eval>=1.0.3                # optional, only for the original HumanEval scorer
+
+# LiveCodeBench scorer (vendored runner is in eval/lcb/lcb_llama_server.py)
+# pip install -e <livecodebench-repo> separately if you need the v3+ scorer

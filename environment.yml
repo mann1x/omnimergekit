@@ -1,0 +1,24 @@
+# Conda one-shot env definition for omnimergekit.
+# `conda env create -f environment.yml`
+# Then `conda activate omnimergekit`.
+#
+# All non-trivial pins live in requirements*.txt to keep `conda` happy
+# with just python + cuda toolkit. Edit those files for version updates.
+
+name: omnimergekit
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - pip
+  - cuda-toolkit=12.6   # match the system CUDA used by torch wheels and llama.cpp
+  - git
+  - cmake               # for any source-built deps
+  - pip:
+      - -r requirements.txt
+      - -r requirements-eval.txt
+      - -r requirements-quant.txt

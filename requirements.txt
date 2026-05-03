@@ -1,0 +1,32 @@
+# omnimergekit — core runtime
+# Tested on Python 3.11 + CUDA 12.x. Pinned to versions that have been validated in production.
+
+# Core ML
+torch==2.10.0
+numpy==2.2.6
+
+# HF stack
+transformers==5.5.0
+tokenizers==0.22.2
+safetensors==0.7.0
+accelerate==1.13.0
+datasets==4.3.0
+huggingface_hub>=0.27.0       # the new `hf download/upload/auth login` CLI; old `huggingface-cli` is deprecated
+hf-transfer>=0.1.8            # large-file accel uploads
+
+# Hybrid attention (Qwen3.5 / Qwen3.6 require these for >1k context fwd+bwd without OOM)
+flash-linear-attention>=0.5.0
+causal-conv1d>=1.6.0
+
+# Optional inference / quant accel
+bitsandbytes==0.49.2
+peft==0.18.1                  # for LoRA-merge utilities in scripts/merge_lora.py
+sentencepiece==0.2.1
+protobuf>=4.25
+gguf==0.18.0                  # for Python-side GGUF inspection
+
+# General utils
+tqdm==4.67.3
+requests==2.32.5
+fire>=0.5.0                   # used by some pod helpers
+PyYAML>=6.0

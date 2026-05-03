@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtualenvs / conda artifacts (we ship requirements*.txt, not state)
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Caliber autoinit
+.caliber/
+
+# Experiment outputs / heavy artifacts (keep code only)
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.parquet
+*.arrow
+*.dat
+*.imatrix
+*.cache
+*.sqlite
+*.sqlite3
+*.db
+
+# Generated figures / logs
+*.log
+*.tsv
+*.csv
+*.tar
+*.zip
+*.gz
+results_*/
+samples_*/
+eval_results/
+logs/
+runs/
+
+# imatrix.dat ARCHIVAL EXCEPTION:
+# imatrix files MUST be kept WITH their quants when published, but we don't
+# want them in this repo (which holds code, not artifacts).
