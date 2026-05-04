@@ -71,6 +71,21 @@ python quantization/quantize_gguf.py gemma-4-A4B-109e \
 
 See [`docs/METHOD_gemma4_pruning.md`](docs/METHOD_gemma4_pruning.md) for full method.
 
+## KL distillation playbook
+
+For "small student + larger teacher + small task corpus" scenarios that pair
+naturally with merge recipes (merge-then-distill is the standard order),
+see [`docs/METHOD_kl_distillation.md`](docs/METHOD_kl_distillation.md).
+It covers FKL / RKL / GKD / Hybrid losses, the on-policy vs off-policy
+trade-off, the recommended starter recipe, and the cross-tokenizer case.
+
+Findings backed by full HE-164 + MBPP-378 evals on DS-Coder-1.3B-Instruct
+(student) with DS-Coder-6.7B-Instruct (same-vocab teacher). Forward KL on
+student-sampled positions ("DistillSpec") is the recommended default —
+it beat reverse-KL (MiniLLM) by 1.8 pp and SFT by 4.3 pp HE at the same
+recipe. Cross-vocab plumbing factored into the standalone library
+[`mann1x/cross-tokenizer-distill`](https://github.com/mann1x/cross-tokenizer-distill).
+
 ## Hard-won rules
 
 These are baked into the recipe scripts. They cost real compute or a published-model rollback to learn.
