@@ -44,7 +44,7 @@ recipe, lr 5e-5, 2 epochs.
 | M3 | GKD | generalized JSD (β=0.5) | DS-Coder-6.7B (32 K, same vocab) | 55.5 | −4.3 |
 | M4 | MiniLLM | reverse KL on student-sampled positions | DS-Coder-6.7B | 54.3 | −5.5 |
 | M5 | DistillSpec | forward KL on student-sampled positions | DS-Coder-6.7B | 56.1 | −3.7 |
-| M6 | CTD on-policy FKL (cross-vocab) | FKL via VocabMapper | Qwen2.5-Coder-7B (152 K) | **38.4** | **−21.4 (FAIL)** |
+| ~~M6~~ | ~~CTD on-policy FKL (cross-vocab)~~ | ~~FKL via VocabMapper~~ | ~~Qwen2.5-Coder-7B (152 K)~~ | ~~38.4~~ | **retracted — code bug (M6b in flight)** |
 
 (M6 results land in [`cross-tokenizer-distill/docs/RESULTS.md`](https://github.com/mann1x/cross-tokenizer-distill/blob/main/docs/RESULTS.md).)
 
@@ -65,17 +65,7 @@ recipe, lr 5e-5, 2 epochs.
    error is ~11 pp; smaller-than-7-pp differences at 50 % accuracy disappear
    into noise. Use smoke only as a "did training crash" gate. Always rank on
    full HE-164.
-5. **Cross-vocab CTD with `byte_anchor` + `multi_token=distribute` on a 5×
-   vocab gap is destructive at this projection coverage** (M6: −21.4 pp HE
-   vs base, far below the −4.3 pp same-vocab GKD reached). Training was
-   healthy (loss 2.57 → 0.92, 73 % positions aligned) but 80.9 % multi-token
-   teacher mass smeared probability across many low-confidence student
-   tokens. For the v6U decision rule (`C ≤ A → fall back`), this fires:
-   prefer DS-Coder-V2-236B same-vocab teacher over a cross-vocab Qwen3-Coder
-   teacher with this projection configuration. Future CTD work to revisit:
-   `student_offset` alignment (full coverage, 1.5-2× compute) and hybrid
-   KL+SFT gated on per-position projection mass.
-6. **Same-vocab distill, same recipe, this corpus → cannot beat base on HE.**
+5. **Same-vocab distill, same recipe, this corpus → cannot beat base on HE.**
    Teacher signal regularises but does not lift the student over its
    no-FT prior. To break that ceiling we need one of: (a) cross-vocab
    stronger teacher (M6), (b) more capacity (M7: rank 64 + 4 ep), (c) more
