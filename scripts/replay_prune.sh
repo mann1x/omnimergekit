@@ -74,6 +74,23 @@ else
     exit 1
 fi
 
+# --- Step 0: dep preflight ---
+# prune_local_heal.py uses HF accelerate (device_map="auto" with offload) and
+# bitsandbytes (nf4 importance phase). Fresh pytorch pod images often ship
+# without these. Skip with SKIP_PREFLIGHT=1.
+if [[ "${SKIP_PREFLIGHT:-0}" != "1" ]]; then
+    MISSING=()
+    python -c "import accelerate" 2>/dev/null || MISSING+=(accelerate)
+    python -c "import bitsandbytes" 2>/dev/null || MISSING+=(bitsandbytes)
+    if [[ ${#MISSING[@]} -gt 0 ]]; then
+        echo "[$(date -Iseconds)] preflight: installing ${MISSING[*]} ..."
+        pip install -q "${MISSING[@]}" 2>&1 | tail -3 || {
+            echo "ERROR: pip install ${MISSING[*]} failed." >&2
+            exit 1
+        }
+    fi
+fi
+
 mkdir -p "$WORKDIR"
 CACHE_DIR="$WORKDIR/cache"
 SRC_DIR="$WORKDIR/base"
