@@ -1532,28 +1532,31 @@ def _enter_canary_runtime(args, model, canary_dev, canary_dtype, log_fn):
             if not (n in device_map or n.startswith(mapped_prefixes))
         ]
         if missing:
-            # Wrong fix (b78e16a → ed3f01d era): "place on cpu". That breaks
-            # decoder forwards like `hidden_states *= self.layer_scalar` —
-            # hidden_states lives on the parent layer's device. Right fix:
-            # walk each missing item to its longest-prefix module in
-            # device_map and inherit THAT device. Fallback to cpu only when
-            # no ancestor is mapped (rare; would mean the whole model is
-            # un-mapped which we'd never produce).
-            def _device_from_parents(name):
-                parts = name.split(".")
-                for i in range(len(parts) - 1, 0, -1):
-                    prefix = ".".join(parts[:i])
-                    if prefix in device_map:
-                        return device_map[prefix]
-                return "cpu"
+            # Subtle: parent-module device in device_map is the STORAGE device
+            # (where weights live between forwards). At forward time
+            # accelerate's offload hook moves the parent's weights to the
+            # EXECUTION device (cuda:0 here). Custom params like Gemma 4's
+            # `layer_scalar` are NOT under that hook, so they stay where
+            # placed — leading to `cuda:0 vs cpu` errors during e.g.
+            # `hidden_states *= self.layer_scalar`.
+            # Right fix: place missing items on the execution device (first
+            # cuda in device_map). They're tiny (single-float scalars per
+            # layer, total bytes negligible), so GPU placement is free.
+            exec_dev = None
+            for v in device_map.values():
+                if isinstance(v, int) or (isinstance(v, str) and v.startswith("cuda")):
+                    exec_dev = v
+                    break
+            if exec_dev is None:
+                exec_dev = "cpu"
             sample = []
             for n in missing:
-                dev = _device_from_parents(n)
-                device_map[n] = dev
+                device_map[n] = exec_dev
                 if len(sample) < 3:
-                    sample.append(f"{n}→{dev}")
+                    sample.append(f"{n}→{exec_dev}")
             log_fn(f"canary: device_map missing {len(missing)} item(s); "
-                   f"placing each on its parent module's device (e.g. {sample})")
+                   f"placing each on the execution device {exec_dev} "
+                   f"(e.g. {sample})")
         dispatch_model(model, device_map=device_map)
     else:
         log_fn(f"canary: running on CPU (dtype={canary_dtype})")
