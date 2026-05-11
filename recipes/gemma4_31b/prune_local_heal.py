@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+# ruff: noqa: E402  -- the mlx neutralization below must run before any
+#                     other transformers import; all later imports follow it
+#                     intentionally.
+from __future__ import annotations
+
+# DEFENSE-IN-DEPTH (2026-05-11): neutralize the broken-mlx import path in
+# transformers BEFORE any other import. On vast.ai pods with `mlx-lm`
+# preinstalled but no working `mlx-cuda`, transformers' `is_tensor()` is
+# called inside accelerate's `post_forward` hook on every offload layer
+# transition; it walks `_is_mlx` which does `import mlx.core` → fails →
+# silently corrupts the forward pass. The corrupted captures then poison
+# phase 0/2 of any pruning pipeline. Loop garbage (`額額額`, `France is
+# France is`) is the AR signature. Localized after 6 retries on
+# ssh3.vast.ai:10024 — see memory/feedback_pod_image_requirements.md.
+import importlib as _bootstrap_il
+try:
+    _bootstrap_gen = _bootstrap_il.import_module("transformers.utils.generic")
+    _bootstrap_gen._is_mlx_available = False
+    _bootstrap_gen._is_mlx = lambda _x: False  # type: ignore[attr-defined]
+except Exception:  # noqa: BLE001 — transformers may not be importable yet
+    pass
 """
 prune_local_heal.py — Gemma 4 31B-it attention head pruning with
                       backprop-free local healing (W_O lstsq refit).
@@ -37,7 +58,6 @@ Memory plan for solidPC RTX 3090 24GB:
   gradient_checkpointing for phase 1 backward pass
   Per-chunk size ~1024 tokens, 8 chunks total
 """
-from __future__ import annotations
 
 import argparse
 import hashlib

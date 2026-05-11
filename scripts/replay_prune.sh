@@ -89,6 +89,17 @@ if [[ "${SKIP_PREFLIGHT:-0}" != "1" ]]; then
             exit 1
         }
     fi
+    # mlx-lm 0.31.x silently breaks every accelerate post_forward hook in
+    # offload mode by making transformers' `is_tensor()` try `import mlx.core`
+    # → ModuleNotFoundError → corrupted forward → loop-garbage AR output.
+    # Localized 2026-05-11 on ssh3.vast.ai after 6 retries. Auto-purge any
+    # mlx flavor: prune_local_heal.py also monkey-patches the detector at
+    # import time as belt-and-suspenders, but uninstalling is cleaner.
+    MLX_FOUND=$(pip list 2>/dev/null | awk '/^mlx(-|$)/{print $1}' | tr '\n' ' ')
+    if [[ -n "$MLX_FOUND" ]]; then
+        echo "[$(date -Iseconds)] preflight: purging mlx pkgs: $MLX_FOUND"
+        pip uninstall -y $MLX_FOUND 2>&1 | tail -3 || true
+    fi
 fi
 
 mkdir -p "$WORKDIR"
