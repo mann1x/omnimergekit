@@ -75,6 +75,31 @@ def _maybe_align(module):
     return contextlib.nullcontext()
 
 
+def _maybe_align_tree(module):
+    """Context manager stacking _maybe_align over a module AND all its submodules.
+
+    `align_module_device(parent)` only materializes `parent`'s direct params and
+    buffers; nested submodules (e.g. q_proj/k_proj/v_proj/o_proj inside self_attn)
+    each have their own AlignDevicesHook and stay on `meta` unless their own
+    align context is entered. state_dict() recurses into all submodules, so
+    snapshotting an offloaded self_attn requires aligning the WHOLE tree.
+
+    Returns a contextlib.ExitStack that's already entered all per-submodule
+    align contexts. Use as:
+
+        with _maybe_align_tree(layer.self_attn) as stack:
+            sd = layer.self_attn.state_dict()  # all tensors materialized
+    """
+    stack = contextlib.ExitStack()
+    if _HAS_ALIGN:
+        for m in module.modules():  # includes the module itself + all descendants
+            try:
+                stack.enter_context(align_module_device(m))
+            except Exception:
+                pass
+    return stack
+
+
 def log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
@@ -2931,7 +2956,7 @@ def main():
         # Use _maybe_align to materialize accelerate-offloaded tensors before
         # .cpu() — state_dict() on an offloaded module returns meta tensors.
         if args._ckpt_dir is not None:
-            with _maybe_align(layer.self_attn):
+            with _maybe_align_tree(layer.self_attn):
                 sa_state = {
                     k: v.detach().to(dtype=v.dtype).cpu().clone()
                     for k, v in layer.self_attn.state_dict().items()
