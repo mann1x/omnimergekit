@@ -1488,6 +1488,29 @@ def _enter_canary_runtime(args, model, canary_dev, canary_dtype, log_fn):
         log_fn(f"canary: dispatching to GPU offload "
                f"(max_memory={max_memory}, dtype={canary_dtype})")
         device_map = infer_auto_device_map(model, max_memory=max_memory, dtype=canary_dtype)
+        # accelerate's infer_auto_device_map only walks the modules registered
+        # as no_split / standard transformer blocks; on Gemma 4 it misses small
+        # custom params/buffers like `layer_scalar`. Place any unmapped item
+        # on CPU so dispatch_model accepts the map.
+        def _all_param_buf_names(m, prefix=""):
+            for n, _ in m.named_parameters(recurse=False):
+                yield f"{prefix}{n}"
+            for n, _ in m.named_buffers(recurse=False):
+                yield f"{prefix}{n}"
+            for n, sub in m.named_children():
+                yield from _all_param_buf_names(sub, f"{prefix}{n}.")
+        mapped_prefixes = tuple(
+            (k + "." if k else "") for k in device_map
+        )
+        missing = [
+            n for n in _all_param_buf_names(model)
+            if not (n in device_map or n.startswith(mapped_prefixes))
+        ]
+        if missing:
+            log_fn(f"canary: device_map missing {len(missing)} item(s); "
+                   f"placing on cpu (e.g. {missing[:3]})")
+            for n in missing:
+                device_map[n] = "cpu"
         dispatch_model(model, device_map=device_map)
     else:
         log_fn(f"canary: running on CPU (dtype={canary_dtype})")
