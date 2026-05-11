@@ -3335,12 +3335,19 @@ def main():
     # itself dies/stalls (the 2026-05-11 CPU-canary-stall scenario).
     if args._ckpt_dir is not None and args.save_before_canary:
         staged = _staged_dir(args._ckpt_dir)
-        log(f"phase3c (pre-canary): saving staged BF16 to {staged}")
-        staged.mkdir(parents=True, exist_ok=True)
-        model.save_pretrained(staged, safe_serialization=True)
-        tok.save_pretrained(staged)
+        if _staged_complete(args._ckpt_dir):
+            # Already on disk from a prior run with the same fingerprint
+            # (manifest-check at top of main already validated this).
+            # Don't burn 60s re-writing 62 GB; just note it.
+            log(f"phase3c: staged BF16 already present at {staged} — reusing "
+                "(skip redundant ~60s of disk write)")
+        else:
+            log(f"phase3c (pre-canary): saving staged BF16 to {staged}")
+            staged.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(staged, safe_serialization=True)
+            tok.save_pretrained(staged)
+            log(f"phase3c: staged save complete ({staged}).")
         args._ckpt_staged_ready = True
-        log(f"phase3c: staged save complete ({staged}).")
 
     # ---- Phase 2.5 (Fix C2): AR generation coherence gate ----
     # Compare pruned-NLL of base's canary gens against base's own NLL of the
