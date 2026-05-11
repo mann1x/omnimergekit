@@ -19,13 +19,45 @@ to ollama.com are byte-identical to the HF blobs.
 For each quant tag `T` (e.g. `Q4_K_M`, `IQ3_XXS`, `CD-Q6_K`) found in the source
 HF repo:
 
-1. `ollama create $OL_TARGET:T -f Modelfile` — Modelfile uses `FROM hf.co/$HF_REPO:T`, which causes ollama to pull the GGUF blob from HF and create a manifest.
-2. `ollama push $OL_TARGET:T` — upload the manifest + blob to ollama.com under your account.
-3. `ollama rm $OL_TARGET:T` **and** `ollama rm hf.co/$HF_REPO:T` — **both** refs must be removed for ollama to GC the underlying blob. Removing only the `mannix/...` ref leaves the `hf.co/...` ref pinning the 10–20 GB blob in `/root/.ollama/models/blobs/`. This was the root cause of a 199 GB blob leak we hit on a v3 push.
+1. **`hf download $HF_REPO $FILENAME.gguf --local-dir /workspace/.../scratch`** —
+   pre-download the GGUF directly from HF, with retry/resume via `hf_transfer`.
+2. **`ollama create $OL_TARGET:T -f Modelfile`** — Modelfile uses `FROM
+   /workspace/.../scratch/$FILENAME.gguf`. **Local path, no hf.co/ pull.**
+   ollama just imports the file's bytes into its blob store and creates a
+   manifest. No network involved at this step.
+3. `ollama push $OL_TARGET:T` — upload the manifest + blob to ollama.com.
+4. `ollama rm $OL_TARGET:T` — drop the local manifest. Since we never created
+   a `hf.co/...` ref, there's no second ref to clean.
+5. Force-`rm` the captured blob digests + any `-partial-*` residue (belt +
+   suspenders — ollama's GC is unreliable on busy daemons).
+6. `rm -f` the scratch GGUF file from step 1. Disk usage returns to baseline.
+7. `sleep 5` between iterations (relieves daemon contention on rapid loops).
 
 The scripts are resumable. They list existing tags on `ollama.com/$OL_TARGET/tags`
 at startup and skip anything already published, so a re-run after a crash or a
 manual `pkill` just picks up the gaps.
+
+### Why step 1 was added (2026-05-11)
+
+Earlier versions used `FROM hf.co/$HF_REPO:T` directly, letting ollama do the
+pull internally. Two problems showed up over a 60-tag run:
+
+1. **ollama's per-create deadline is hardcoded short** — it consistently
+   reported `Error: context deadline exceeded` on ~50% of 12-25 GB blobs even
+   when raw HF bandwidth was healthy and disk had room. The retry-with-flush
+   logic at the script level didn't help because each retry hit the same
+   deadline.
+2. **Failed `ollama create` from `hf.co/` left a `hf.co/$HF_REPO:T` ref
+   behind** that pinned the partial blob and required a second `ollama rm`.
+   Forgetting one of the two `ollama rm` calls leaked the blob — see the
+   199 GB blob-leak post-mortem below.
+
+Switching to **pre-download via `hf download` + `FROM /local/path`** sidesteps
+both problems: HF bandwidth is whatever it is, ollama's deadline never starts,
+and only one ref ever exists.
+
+Trade-off: ~25 GB peak scratch space per quant. Each is deleted right after
+push, so steady-state disk is unchanged.
 
 ## Where they run
 
@@ -37,19 +69,28 @@ manual `pkill` just picks up the gaps.
 
 ## Usage
 
+Both scripts take the HF token as a **command-line argument** (`$3`). The
+old `HF_TOKEN` env var still works if you pass `-` as `$3`, but the new
+calling convention is preferred so the token doesn't end up in `ps aux`
+of a parent shell.
+
 ```bash
-# Gemma 4 example (with the custom tools template + 2nd-turn workaround):
-HF_TOKEN=$(cat ~/.cache/huggingface/token) bash ollama_push_98e.sh \
+TOKEN=$(cat ~/.cache/huggingface/token)
+
+# Gemma 4 (custom tools template + 2nd-turn workaround):
+bash ollama_push_98e.sh \
     ManniX-ITA/gemma-4-A4B-98e-v4-it-GGUF \
-    mannix/gemma4-98e-v4
+    mannix/gemma4-98e-v4 \
+    "$TOKEN"
 
-# Generic example (Qwen3.6, ollama auto-detects chatml template):
-HF_TOKEN=$(cat ~/.cache/huggingface/token) bash ollama_push_generic.sh \
+# Generic (Qwen3.6, ollama auto-detects chatml template):
+bash ollama_push_generic.sh \
     ManniX-ITA/Qwen3.6-27B-Omnimerge-v4-GGUF \
-    mannix/omnimerge-v4
+    mannix/omnimerge-v4 \
+    "$TOKEN"
 
-# Optional 3rd arg: include-pattern regex (only push matching tags)
-HF_TOKEN=... bash ollama_push_generic.sh src target '^(Q4_K_M|Q6_K|IQ4_XS)$'
+# Optional 4th arg: include-pattern regex (only push matching tags)
+bash ollama_push_generic.sh src target "$TOKEN" '^(Q4_K_M|Q6_K|IQ4_XS)$'
 ```
 
 ## Parallel pushes
