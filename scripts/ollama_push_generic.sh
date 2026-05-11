@@ -158,7 +158,7 @@ for x in d:
         continue
     base = p.rsplit('.gguf', 1)[0]
     parts = base.split('-')
-    quant_pat = re.compile(r'^(F16|Q\d+(_[KS01ML]+)?(_[KSML01]+)?|IQ\d+(_[A-Z]+)?|CD-Q\d+(_[KS]+)?(_[KSML01]+)?)\$')
+    quant_pat = re.compile(r'^(F16|Q\d+(_[KS01ML]+)?(_[KSMLX01]+)?|IQ\d+(_[A-Z]+)?|CD-Q\d+(_[KS]+)?(_[KSMLX01]+)?)\$')
     for n in (3, 2, 1):
         if n > len(parts): continue
         candidate = '-'.join(parts[-n:])
