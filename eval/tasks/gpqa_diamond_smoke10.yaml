@@ -1,0 +1,43 @@
+# Curated 10-question subset of GPQA Diamond (cot_zeroshot) for smoke evals.
+# 5 chemistry / 4 physics / 1 biology, evenly spaced across sub-domains.
+# Mirrors upstream gpqa_diamond_cot_zeroshot.yaml exactly except `task` and
+# `process_docs` (chains: filter to 10, then run upstream choice-shuffle).
+task: gpqa_diamond_smoke10
+tag: gpqa
+dataset_path: Idavidrein/gpqa
+dataset_name: gpqa_diamond
+output_type: generate_until
+process_docs: !function _subset_filter.gpqa_diamond_smoke10
+training_split: train
+validation_split: train
+test_split: null
+doc_to_text: "What is the correct answer to this question:{{Question}}\nChoices:\n(A) {{choice1}}\n(B) {{choice2}}\n(C) {{choice3}}\n(D) {{choice4}}\nLet's think step by step: "
+doc_to_target: answer
+filter_list:
+  - name: "strict-match"
+    filter:
+      - function: "regex"
+        regex_pattern: "(?<=The answer is )(.*)(?=.)"
+      - function: "take_first"
+  - name: "flexible-extract"
+    filter:
+      - function: "multi_choice_regex"
+        group_select: -1
+        ignore_case: true
+        ignore_punctuation: true
+        regex_pattern: "(\\([A-Z]\\))"
+      - function: "take_first"
+generation_kwargs:
+  until:
+    - "</s>"
+  do_sample: false
+  temperature: 0.0
+num_fewshot: 0
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+    ignore_case: true
+    ignore_punctuation: true
+metadata:
+  version: 1.0

@@ -1,0 +1,35 @@
+# Curated 20-problem subset of HumanEval for smoke evals.
+# 5 trivial / 10 medium / 5 complex by (n_asserts, sol_lines, prompt_lines).
+# Mirrors upstream humaneval.yaml exactly except for `task` name and
+# the `process_docs` filter; build_predictions filter still applies.
+task: humaneval_smoke20
+dataset_path: openai/openai_humaneval
+unsafe_code: true
+output_type: generate_until
+test_split: test
+process_docs: !function _subset_filter.humaneval_smoke20
+doc_to_text: "{{prompt}}"
+doc_to_target: "{{test}}\ncheck({{entry_point}})"
+metric_list:
+  - metric: !function _he_utils.pass_at_k
+    aggregation: mean
+    higher_is_better: true
+    k: [1]
+generation_kwargs:
+  until:
+    - "\nclass"
+    - "\ndef"
+    - "\n#"
+    - "\nif"
+    - "\nprint"
+  max_gen_toks: 1024
+  do_sample: false
+repeats: 1
+num_fewshot: 0
+filter_list:
+  - name: "create_test"
+    filter:
+      - function: "custom"
+        filter_fn: !function _he_utils.build_predictions
+metadata:
+  version: 1.0

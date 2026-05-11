@@ -1,0 +1,211 @@
+# Hugging Face → Ollama.com push runners
+
+End-to-end pipeline for re-publishing every GGUF tag from a Hugging Face GGUF
+repo to a corresponding [ollama.com](https://ollama.com) model namespace, one
+quant at a time, resumable, with strict disk discipline.
+
+Two scripts (different chat-template handling — pick by base architecture):
+
+| Script | Use it for | Chat template |
+|---|---|---|
+| `ollama_push_98e.sh` | Gemma 4 models | **custom** Gemma 4 tools template baked in (the 2nd-tool-call turn fix). Mirrors the published `mannix/gemma4-98e` recipe. |
+| `ollama_push_generic.sh` | Anything else (Qwen2/3, Llama, Mistral, etc.) | none — ollama auto-detects from the GGUF metadata's `tokenizer.chat_template`. |
+
+Both produce identical published artifacts otherwise; the GGUF bytes uploaded
+to ollama.com are byte-identical to the HF blobs.
+
+## What they do
+
+For each quant tag `T` (e.g. `Q4_K_M`, `IQ3_XXS`, `CD-Q6_K`) found in the source
+HF repo:
+
+1. `ollama create $OL_TARGET:T -f Modelfile` — Modelfile uses `FROM hf.co/$HF_REPO:T`, which causes ollama to pull the GGUF blob from HF and create a manifest.
+2. `ollama push $OL_TARGET:T` — upload the manifest + blob to ollama.com under your account.
+3. `ollama rm $OL_TARGET:T` **and** `ollama rm hf.co/$HF_REPO:T` — **both** refs must be removed for ollama to GC the underlying blob. Removing only the `mannix/...` ref leaves the `hf.co/...` ref pinning the 10–20 GB blob in `/root/.ollama/models/blobs/`. This was the root cause of a 199 GB blob leak we hit on a v3 push.
+
+The scripts are resumable. They list existing tags on `ollama.com/$OL_TARGET/tags`
+at startup and skip anything already published, so a re-run after a crash or a
+manual `pkill` just picks up the gaps.
+
+## Where they run
+
+- **vast.ai / RunPod / local box with enough bandwidth.** A 27B-A4B BF16 quant
+  ladder (~25 tags) at 200–400 MB/s sustained each way takes ~90–120 min when
+  run in parallel with a sibling push.
+- They require `ollama serve` running locally and an account signed in via
+  `ollama signin` (or the cached `~/.ollama/id_ed25519*` keypair).
+
+## Usage
+
+```bash
+# Gemma 4 example (with the custom tools template + 2nd-turn workaround):
+HF_TOKEN=$(cat ~/.cache/huggingface/token) bash ollama_push_98e.sh \
+    ManniX-ITA/gemma-4-A4B-98e-v4-it-GGUF \
+    mannix/gemma4-98e-v4
+
+# Generic example (Qwen3.6, ollama auto-detects chatml template):
+HF_TOKEN=$(cat ~/.cache/huggingface/token) bash ollama_push_generic.sh \
+    ManniX-ITA/Qwen3.6-27B-Omnimerge-v4-GGUF \
+    mannix/omnimerge-v4
+
+# Optional 3rd arg: include-pattern regex (only push matching tags)
+HF_TOKEN=... bash ollama_push_generic.sh src target '^(Q4_K_M|Q6_K|IQ4_XS)$'
+```
+
+## Parallel pushes
+
+You can run both scripts at the same time against different HF/Ollama
+namespaces. They share `ollama serve` and `/root/.ollama/models/blobs/` but the
+ollama daemon serializes blob operations internally (content-addressed store),
+and each iteration's `ollama create / push / rm / rm` sequence is independent
+per tag.
+
+**Do not** run two parallel pushes targeting the **same** ollama target —
+overlapping manifests can step on each other. Use distinct `$OL_TARGET` names.
+
+## Disk discipline (critical)
+
+The non-obvious failure mode that bit us hard on the v3 push:
+
+```
+ollama create FROM hf.co/X:T  →  creates BOTH `hf.co/X:T` AND `mannix/Y:T` refs
+ollama push   mannix/Y:T      →  uploads blob, both refs still local
+ollama rm     mannix/Y:T      →  blob NOT GC'd because hf.co/X:T still pins it
+```
+
+After 18 quants the local blob store hit 199 GB and filled the pod's overlay
+to 100 %, which then failed a `touch` of a downstream sentinel and stalled the
+entire orchestrator for 7 hours unnoticed.
+
+**The fix** (already in these scripts) is a three-layer purge every iteration:
+
+```bash
+# 1. Capture the blob digests this tag references, BEFORE removing the refs
+BLOBS=$(for MF_PATH in \
+    "/root/.ollama/models/manifests/registry.ollama.ai/${OL_TARGET}/${TAG}" \
+    "/root/.ollama/models/manifests/hf.co/${HF_REPO}/${TAG}"; do
+    [ -f "$MF_PATH" ] && grep -oE 'sha256:[0-9a-f]{64}' "$MF_PATH"
+done | sort -u)
+
+# 2. Remove BOTH refs — the hf.co/ ref keeps the blob pinned otherwise
+ollama rm "${OL_TARGET}:${TAG}"      || true
+ollama rm "hf.co/${HF_REPO}:${TAG}"  || true
+
+# 3. Belt + suspenders: force-purge the captured blobs and any -partial-* residue.
+# By here both refs are gone, so these blobs are guaranteed unreferenced.
+for B in $BLOBS; do
+    FN="/root/.ollama/models/blobs/${B/sha256:/sha256-}"
+    rm -f "$FN" "$FN-partial"* 2>/dev/null || true
+done
+
+# 4. Brief pause to relieve HF/ollama-daemon contention before the next iter
+sleep 5
+```
+
+Why all four steps:
+
+- **Step 1** must come before step 2, because once `ollama rm` deletes the
+  manifest there's no way to discover which blobs it referenced. We learned
+  this the hard way on the 2026-05-11 omnimerge push.
+- **Step 3** catches two cases the ollama daemon misses: (a) `-partial-N`
+  blobs from a `CREATE FAILED` iteration (the daemon never tracks them as
+  refs, so it never GCs them), and (b) the rare race where `ollama rm`
+  returns success but leaves the blob on disk because something else briefly
+  held an open FD. On a long push these accumulate to 10s of GB.
+- **Step 4** isn't strictly about disk — it's about ollama's internal
+  HF-pull timeout (`context deadline exceeded`). When parallel pushes
+  compete for HF bandwidth + the local daemon, a tight back-to-back
+  iteration can saturate the connection pool; a 5 s break drops the
+  failure rate to ~zero in practice.
+
+If your disk creeps up during a push, it usually means an older copy of
+either script is running. Verify with `du -sh /root/.ollama` — it should
+stay flat (< 25 GB) for a 27B model push because at any given moment only
+one quant's blob is live.
+
+### Don't run both pushes in parallel against the same daemon
+
+On 2026-05-11 we ran `ollama_push_98e.sh` (Gemma 4 v4, 31 tags) and
+`ollama_push_generic.sh` (Qwen3.6 omnimerge, 25 tags) in parallel against
+one `ollama serve`. The Gemma push consistently completed each iteration;
+the Qwen push failed ~half of them with `context deadline exceeded` on
+`ollama create`. Failure rate correlated with disk pressure: the leak from
+each Qwen failure left a `-partial` blob behind, eventually filling the
+250 GB overlay and bricking every subsequent iteration. The post-mortem
+fix is the four-layer purge above **plus** running the two pushes
+**serially** (omnimerge → v4, or v4 → omnimerge — sequence doesn't
+matter, just don't overlap them on the same daemon).
+
+## Discovery / tag derivation
+
+Both scripts derive the tag from the GGUF filename via a regex against the
+HF repo's `tree/main` API:
+
+- `ollama_push_98e.sh` expects `*-it-<TAG>.gguf` (the Gemma 4 naming).
+  E.g. `gemma-4-A4B-98e-v4-it-CD-Q6_K.gguf` → tag `CD-Q6_K`.
+- `ollama_push_generic.sh` walks the trailing dash-separated components
+  and matches against a quant-tag pattern (`F16`, `Q\d+(_[KS01ML]+)?`, `IQ\d+_*`,
+  `CD-Q\d+_*`).
+  E.g. `Qwen3.6-27B-Omnimerge-v4-Q4_K_M.gguf` → tag `Q4_K_M`.
+
+If your filenames don't match either convention, add a custom regex inline
+or rename on HF first. Both scripts log the full discovered tag list at
+startup so you can sanity-check before pushes start eating bandwidth.
+
+## Modelfile contents
+
+**Gemma 4 (`ollama_push_98e.sh`):** ships a tools-aware chat template that
+fixes a 2nd-turn-call regression in the upstream Gemma 4 ollama template, plus
+the v4 sampling defaults (`temperature 0.6 top_p 0.95 num_ctx 256000
+repeat_penalty 1.15 stop <turn|>`).
+
+**Generic (`ollama_push_generic.sh`):** no TEMPLATE / PARAMETER overrides. The
+GGUF's embedded chat template is what ollama will use. This is correct for
+Qwen3.5/3.6 (chatml) and most modern model lines whose authors set the chat
+template metadata properly.
+
+## Required environment
+
+| Var | Purpose |
+|---|---|
+| `HF_TOKEN` | Read token for the source HF GGUF repo (write token also works). |
+| (ollama account) | `ollama signin` must have been run on this host previously, or the keypair at `~/.ollama/id_ed25519*` must be the one registered with ollama.com. |
+
+## Troubleshooting
+
+- **`CREATE FAILED for X; skipping`** — the most common cause is a transient
+  download stall from HF (ollama doesn't retry inside `create`). The script
+  logs the failure and continues to the next tag; a subsequent run skips
+  already-published tags and retries the failures. If a tag fails twice in a
+  row, check the GGUF on HF: maybe it's malformed or hf.co is throttling.
+- **Disk creeping toward 100 %** — see "Disk discipline" above. Confirm with
+  `du -sh /root/.ollama`; if > 25 GB, an old un-patched copy of the script
+  is in flight, or your `ollama rm hf.co/...:TAG` line is missing.
+- **`No space left on device` on `touch`** — same root cause as above; the
+  touch failure is the first symptom because sentinels are tiny.
+- **`Unauthorized` from ollama push** — the running `ollama serve` is not
+  signed in to your account, or it's signed in to a different one. Run
+  `ollama signin` and verify the public key at `~/.ollama/id_ed25519.pub`
+  matches the one in your ollama.com account settings.
+
+## Related
+
+- `mlx_convert.sh` / `MLX_CONVERT.md` — sibling pipeline that publishes MLX
+  variants of the same source models to HF (no ollama).
+- `quantize_gguf.py` — the upstream step that *produced* the GGUF quants in
+  the HF source repo. The ollama push scripts assume that pipeline has
+  already landed all the desired tags.
+
+## Version history
+
+- **2026-05-11 (first cut)** — initial public version. Pulled out of
+  `pod2_chain_no_destroy.sh` into reusable single-purpose scripts. Added
+  double-`ollama rm` after the v3 199 GB blob-leak incident. Verified on
+  `mannix/gemma4-98e-v4` (31 tags) and `mannix/omnimerge-v4` (25 tags).
+- **2026-05-11 (hardened)** — three-layer purge (capture blobs → dual
+  `ollama rm` → force-`rm` captured blobs + `-partial-*` residue) +
+  per-iteration `sleep 5` to relieve daemon contention. Added explicit
+  warning against running both pushes in parallel against one daemon
+  (the second push starves on the daemon's HF connection pool and
+  every `CREATE FAILED` leaks a `-partial` blob, eventually filling
+  disk). Recipe is now: run them **serially**.

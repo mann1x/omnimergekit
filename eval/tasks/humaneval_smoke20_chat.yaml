@@ -1,0 +1,51 @@
+# Curated 20-problem subset of HumanEval — chat-completions variant.
+# Mirrors upstream humaneval_instruct.yaml (instruct prompt + gen_prefix + ```
+# fences). Use with eval_suite.sh chat-mode dispatch (local-chat-completions
+# + apply_chat_template). Required for IT models (Gemma 4, Qwen-Instruct, …)
+# that degenerate on raw /v1/completions for code prompts.
+task: humaneval_smoke20_chat
+dataset_path: openai/openai_humaneval
+unsafe_code: true
+output_type: generate_until
+test_split: test
+process_docs: !function _subset_filter.humaneval_smoke20
+doc_to_text: "Write a solution to the following problem and make sure that it passes the tests:\n```python\n{{ prompt }}\n```\n"
+# NOTE: upstream humaneval_instruct uses `gen_prefix` to seed the assistant
+# response with the function signature. Gemma 4 IT's chat template has
+# `enable_thinking` enabled by default and llama-server rejects assistant
+# prefill in that mode ("Assistant response prefill is incompatible with
+# enable_thinking"). We drop the prefix and rely on `build_predictions_instruct`
+# to extract code from the model's natural ```python ... ``` response.
+doc_to_target: "{{test}}\ncheck({{entry_point}})"
+metric_list:
+  - metric: !function _he_utils.pass_at_k
+    aggregation: mean
+    higher_is_better: true
+    k: [1]
+generation_kwargs:
+  max_gen_toks: 1024
+  do_sample: false
+  # No `\n```` in until — it would match the OPENING fence when the model
+  # starts the response with ```python and stop generation at one token
+  # (we don't have gen_prefix to absorb the opening). Rely on Gemma's
+  # native <end_of_turn> token (chat-completions backend stops on it
+  # automatically) plus a few cross-arch sentinels.
+  until:
+    - "<|file_separator|>"
+    - "<|im_end|>"
+    - "<end_of_turn>"
+    - "</s>"
+repeats: 1
+num_fewshot: 0
+filter_list:
+  - name: "create_test"
+    filter:
+      - function: "custom"
+        # `build_predictions_instruct` (upstream) is for `gen_prefix` mode and
+        # truncates at the prompt-docstring close when the model emits the
+        # whole function from scratch. `build_predictions_chat` (local) pulls
+        # the largest ```python``` block out of the chat response — correct
+        # for chat-completions without `gen_prefix`. See bug-126.
+        filter_fn: !function _he_utils.build_predictions_chat
+metadata:
+  version: 1.0

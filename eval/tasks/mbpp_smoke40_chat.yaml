@@ -1,0 +1,44 @@
+# Curated 40-problem subset of MBPP (full) — chat-completions variant.
+# Mirrors upstream mbpp_instruct.yaml (instruct prompt + ```python gen_prefix
+# + extract_code filter). Use with eval_suite.sh chat-mode dispatch.
+task: mbpp_smoke40_chat
+dataset_path: google-research-datasets/mbpp
+dataset_name: full
+unsafe_code: true
+output_type: generate_until
+test_split: test
+process_docs: !function _subset_filter.mbpp_smoke40
+doc_to_text: "You are an expert Python programmer, and here is your task:\n{{text}}\nYour code should pass these tests:\n{{test_list[0]}}\n{{test_list[1]}}\n{{test_list[2]}}"
+doc_to_target: "{% if is_fewshot is defined %}{{code}}\n```{% else %}{{test_list[0]}}\n{{test_list[1]}}\n{{test_list[2]}}{% endif %}"
+# gen_prefix dropped: incompatible with Gemma 4 IT enable_thinking. See
+# humaneval_smoke20_chat.yaml for full explanation.
+target_delimiter: ""
+metric_list:
+  - metric: !function _mbpp_utils.pass_at_1
+    aggregation: mean
+    higher_is_better: true
+filter_list:
+  - name: "extract_code"
+    filter:
+      - function: "custom"
+        # Upstream `build_predictions` returns prose verbatim on chat replies
+        # that explain before coding ("To solve this problem...") → exec
+        # SyntaxError → 0%. `build_predictions_chat` (local) extracts the
+        # largest ```python``` block, with a `def`-line fallback for
+        # fence-less responses. See bug-126 (HE) and bug-127 (MBPP).
+        filter_fn: !function _mbpp_utils.build_predictions_chat
+generation_kwargs:
+  max_gen_toks: 512
+  # See humaneval_smoke20_chat.yaml — `\n```` removed because it matches
+  # the opening fence and prematurely stops generation.
+  until:
+    - "<|file_separator|>"
+    - "<|im_end|>"
+    - "<end_of_turn>"
+  do_sample: false
+num_fewshot: 3
+fewshot_config:
+  sampler: first_n
+  samples: !function _mbpp_utils.list_fewshot_samples
+metadata:
+  version: 1.0

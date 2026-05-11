@@ -64,6 +64,70 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 
+# ── Structured Fisher broadcast ──────────────────────────────────────────────
+# Mirrors competence_extract.py's _structured_aggregate. Compact per-head and
+# per-neuron Fisher signals are reshaped back to per-element so the existing
+# Fisher application path (line ~383) is unchanged.
+_FISHER_RE_ATTN_QKV = re.compile(r"\.self_attn\.(q|k|v)_proj\.weight$")
+_FISHER_RE_ATTN_O = re.compile(r"\.self_attn\.o_proj\.weight$")
+_FISHER_RE_FFN_GATE_UP = re.compile(r"\.(?:mlp|mlp\.experts\.\d+)\.(gate|up)_proj\.weight$")
+_FISHER_RE_FFN_DOWN = re.compile(r"\.(?:mlp|mlp\.experts\.\d+)\.down_proj\.weight$")
+
+
+def _broadcast_structured_fisher(name: str, compact: torch.Tensor,
+                                 target_shape: Tuple[int, ...],
+                                 cfg: Dict[str, int]) -> Optional[torch.Tensor]:
+    """Broadcast a compact 1D head/neuron Fisher signal back to per-element.
+
+    Returns None if the tensor name doesn't match an attention/FFN pattern (in which
+    case the caller should leave the compact tensor alone — it likely isn't structured
+    in the first place). Returns a contiguous fp32 tensor of shape `target_shape` on
+    success; the caller is expected to re-normalize (unit-mean) since broadcast breaks
+    the unit-mean invariant when heads have unequal importance.
+    """
+    nh = cfg["num_heads"]
+    nkv = cfg["num_kv_heads"]
+    hd = cfg["head_dim"]
+    inter = cfg["intermediate_size"]
+    compact = compact.float()
+
+    m = _FISHER_RE_ATTN_QKV.search(name)
+    if m is not None:
+        which = m.group(1)
+        heads = nh if which == "q" else nkv
+        if compact.shape != (heads,):
+            return None
+        if target_shape != (heads * hd, target_shape[-1] if len(target_shape) == 2 else 0):
+            # Sanity check; cheap fall-through if shapes don't line up
+            if not (len(target_shape) == 2 and target_shape[0] == heads * hd):
+                return None
+        # [heads] → [heads*hd, hidden] = repeat each head value across hd then hidden
+        return compact.repeat_interleave(hd).unsqueeze(-1).expand(target_shape).contiguous()
+
+    if _FISHER_RE_ATTN_O.search(name) is not None:
+        if compact.shape != (nh,):
+            return None
+        if not (len(target_shape) == 2 and target_shape[1] == nh * hd):
+            return None
+        return compact.repeat_interleave(hd).unsqueeze(0).expand(target_shape).contiguous()
+
+    if _FISHER_RE_FFN_GATE_UP.search(name) is not None:
+        if compact.shape != (inter,):
+            return None
+        if not (len(target_shape) == 2 and target_shape[0] == inter):
+            return None
+        return compact.unsqueeze(1).expand(target_shape).contiguous()
+
+    if _FISHER_RE_FFN_DOWN.search(name) is not None:
+        if compact.shape != (inter,):
+            return None
+        if not (len(target_shape) == 2 and target_shape[1] == inter):
+            return None
+        return compact.unsqueeze(0).expand(target_shape).contiguous()
+
+    return None
+
+
 def load_weight_map(model_dir: Path) -> Tuple[Dict[str, str], List[str]]:
     """Return (tensor_name -> relative_shard_filename, ordered_tensor_list)."""
     idx_path = model_dir / "model.safetensors.index.json"
@@ -651,6 +715,13 @@ def main():
                     help="Comma-separated paths to Fisher score safetensors files, one per source "
                          "(omnimerge_v2 only). Pre-computed with precompute_fisher.py. Enables "
                          "per-parameter adaptive weighting instead of fixed source weights.")
+    ap.add_argument("--fisher-structured", action="store_true",
+                    help="Allow Fisher tensors to be compact 1D structured signals (per-head or "
+                         "per-neuron) emitted by `competence_extract.py --structured`. The Fisher file's "
+                         "metadata must contain 'structured_config' with num_heads/num_kv_heads/head_dim/"
+                         "intermediate_size; matching tensors are broadcast back to per-element shape "
+                         "before being applied as weights. Default off — backward-compatible. Has no "
+                         "effect on full-shape Fisher tensors.")
     ap.add_argument("--v2-features", type=str, default="obim,darex,emr",
                     help="Comma-separated list of omnimerge_v2 features to enable. "
                          "Options: obim (magnitude top-k masking), darex (DAREx rescaling), "
@@ -851,6 +922,7 @@ def main():
 
     # Load Fisher scores if provided
     fisher_handles = None
+    fisher_struct_cfgs: List[Optional[Dict[str, int]]] = []  # parallel to fisher_handles
     if args.fisher:
         fisher_paths = [Path(p.strip()) for p in args.fisher.split(",")]
         if len(fisher_paths) != len(args.source):
@@ -861,8 +933,26 @@ def main():
             if not fp.exists():
                 print(f"ERROR: Fisher file not found: {fp}", file=sys.stderr)
                 sys.exit(1)
-            fisher_handles.append(safe_open(fp, framework="pt", device="cpu"))
-            print(f"  fisher: {fp} ({len(fisher_handles[-1].keys())} tensors)", flush=True)
+            fh = safe_open(fp, framework="pt", device="cpu")
+            fisher_handles.append(fh)
+            # Read structured_config from file metadata when --fisher-structured is on.
+            cfg = None
+            if args.fisher_structured:
+                md = fh.metadata() or {}
+                raw = md.get("structured_config")
+                if raw:
+                    try:
+                        cfg = json.loads(raw)
+                    except (json.JSONDecodeError, TypeError) as e:
+                        print(f"  WARN: {fp}: could not parse structured_config "
+                              f"({type(e).__name__}: {e}); broadcast disabled for this file",
+                              file=sys.stderr)
+                else:
+                    print(f"  WARN: {fp}: --fisher-structured set but no structured_config "
+                          f"metadata found; broadcast disabled for this file", file=sys.stderr)
+            fisher_struct_cfgs.append(cfg)
+            tag = f"  structured_config={cfg}" if cfg else ""
+            print(f"  fisher: {fp} ({len(fh.keys())} tensors){tag}", flush=True)
 
     generator = torch.Generator(device="cpu")
     generator.manual_seed(args.seed)
@@ -957,11 +1047,23 @@ def main():
                 fisher_ts = None
                 if fisher_handles:
                     fisher_ts = []
-                    for fh in fisher_handles:
+                    for fh, fcfg in zip(fisher_handles, fisher_struct_cfgs):
                         keys = fh.keys()
                         # Try exact name, or common prefix mappings
                         if name in keys:
-                            fisher_ts.append(fh.get_tensor(name))
+                            t = fh.get_tensor(name)
+                            # Optional structured broadcast: if --fisher-structured was set
+                            # AND this file declared a structured_config AND the tensor is
+                            # compact 1D AND the name matches an attention/FFN pattern,
+                            # reshape it back to per-element so the existing path applies it.
+                            if (args.fisher_structured and fcfg is not None
+                                    and t.dim() == 1):
+                                bcast = _broadcast_structured_fisher(name, t, base_t.shape, fcfg)
+                                if bcast is not None:
+                                    # Restore unit-mean invariant (existing Fisher path expects it).
+                                    bcast = bcast / (bcast.float().mean() + 1e-12)
+                                    t = bcast
+                            fisher_ts.append(t)
                         else:
                             # Fisher may have model.* prefix or not
                             fisher_ts = None

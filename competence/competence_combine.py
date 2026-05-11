@@ -33,9 +33,10 @@ import json
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 
@@ -44,6 +45,17 @@ SIGNAL_SUFFIXES = {
     "grad_sq": ".grad_sq",
     "weight_taylor": ".weight_taylor",
     "act_taylor": ".act_taylor",
+    # Structured (compact 1D) aggregates emitted by `competence_extract.py --structured`.
+    # Per-head signals attach to q/k/v/o_proj weights; per-neuron signals attach to
+    # gate/up/down_proj weights (incl. MoE experts). Tensor shape: [num_heads] or
+    # [intermediate_size]. Combining is identical to per-element — the weighted-sum
+    # math is shape-agnostic.
+    "head_l1": ".head_compact_l1",
+    "head_sq": ".head_compact_sq",
+    "head_taylor": ".head_compact_taylor",
+    "neuron_l1": ".neuron_compact_l1",
+    "neuron_sq": ".neuron_compact_sq",
+    "neuron_taylor": ".neuron_compact_taylor",
 }
 
 
@@ -165,8 +177,22 @@ def main():
         # Load + extract + normalize each task's signal
         per_task_norm: Dict[str, Dict[str, torch.Tensor]] = {}
         ref_keys = None
+        structured_cfg: Optional[str] = None  # JSON string of any input's structured_config
         for task, _, path in entries:
             print(f"   load {path.name} ({path.stat().st_size/1e9:.2f} GB)")
+            # Probe metadata for structured_config; refuse to combine across mismatched configs.
+            with safe_open(str(path), framework="pt") as f:
+                md = f.metadata() or {}
+            this_cfg = md.get("structured_config")
+            if this_cfg is not None:
+                if structured_cfg is None:
+                    structured_cfg = this_cfg
+                elif structured_cfg != this_cfg:
+                    print(f"ERROR: structured_config mismatch across inputs for source={src}",
+                          file=sys.stderr)
+                    print(f"   prior   : {structured_cfg}", file=sys.stderr)
+                    print(f"   in {path.name}: {this_cfg}", file=sys.stderr)
+                    sys.exit(2)
             ts = load_file(str(path))
             sig = extract_signal(ts, args.signal)
             del ts
@@ -216,6 +242,8 @@ def main():
             "weights": json.dumps(weights),
             "raw_rate": str(args.raw_rate),
         }
+        if structured_cfg is not None:
+            metadata["structured_config"] = structured_cfg
         save_file(combined, str(out_path), metadata=metadata)
         print(f"   wrote {out_path} ({len(combined)} tensors, "
               f"{out_path.stat().st_size/1e9:.2f} GB)")

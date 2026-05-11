@@ -26,7 +26,10 @@ Usage:
 import argparse
 import gc
 import glob
+import hashlib
 import json
+import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -35,6 +38,160 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 from safetensors.torch import save_file
+
+
+# ── Structured aggregation patterns ──────────────────────────────────────────
+# Match attention/FFN linear weights across Llama/Qwen/Gemma/Mistral families
+# (including MoE expert layers). Used by the --structured export path to fold
+# per-element importance into per-head / per-neuron compact 1D signals.
+_RE_ATTN_QKV = re.compile(r"\.self_attn\.(q|k|v)_proj\.weight$")
+_RE_ATTN_O = re.compile(r"\.self_attn\.o_proj\.weight$")
+_RE_FFN_GATE_UP = re.compile(r"\.(?:mlp|mlp\.experts\.\d+)\.(gate|up)_proj\.weight$")
+_RE_FFN_DOWN = re.compile(r"\.(?:mlp|mlp\.experts\.\d+)\.down_proj\.weight$")
+
+
+def _structured_aggregate(name: str, t: torch.Tensor,
+                          cfg: Dict[str, int]) -> Optional[Tuple[str, torch.Tensor]]:
+    """Reduce a full-shape per-element accumulator to a compact 1D structured signal.
+
+    Returns (signal_class, compact_tensor) where signal_class is "head" or "neuron",
+    or None if the tensor name doesn't match any structured pattern (e.g., layernorm,
+    embed, lm_head). compact_tensor is fp32 on CPU.
+
+    Naming convention: caller appends `.{signal_class}_compact_<accumulator>` suffix.
+    """
+    nh = cfg["num_heads"]
+    nkv = cfg["num_kv_heads"]
+    hd = cfg["head_dim"]
+    inter = cfg["intermediate_size"]
+    t = t.float()
+
+    m = _RE_ATTN_QKV.search(name)
+    if m is not None:
+        which = m.group(1)
+        heads = nh if which == "q" else nkv
+        # [heads*head_dim, hidden] → [heads, head_dim, hidden] → sum over (head_dim, hidden)
+        if t.shape[0] != heads * hd:
+            return None  # unexpected shape (e.g. tied weights or fused projection)
+        return ("head", t.reshape(heads, hd, t.shape[1]).sum(dim=(1, 2)))
+
+    if _RE_ATTN_O.search(name) is not None:
+        # [hidden, heads*head_dim] → [hidden, heads, head_dim] → sum over (hidden, head_dim)
+        if t.shape[1] != nh * hd:
+            return None
+        return ("head", t.reshape(t.shape[0], nh, hd).sum(dim=(0, 2)))
+
+    if _RE_FFN_GATE_UP.search(name) is not None:
+        # [intermediate, hidden] → sum over hidden
+        if t.shape[0] != inter:
+            return None
+        return ("neuron", t.sum(dim=1))
+
+    if _RE_FFN_DOWN.search(name) is not None:
+        # [hidden, intermediate] → sum over hidden
+        if t.shape[1] != inter:
+            return None
+        return ("neuron", t.sum(dim=0))
+
+    return None
+
+
+SIDECAR_VERSION = 1
+
+
+def _compute_config_hash(model_path: str, samples_path: str, max_samples: int,
+                         max_len: int, chunk_len: int, skip_grad_patterns: str,
+                         with_act_taylor: bool, task: Optional[str],
+                         prompt_key: str, completion_key: str,
+                         pass_key: str, pass_value: Any,
+                         keep_doc_ids: Optional[set]) -> str:
+    """Hash the inputs that materially shape the accumulators. Resume refuses on mismatch.
+
+    Sample order in the JSONL drives accumulator state, so identical inputs MUST hash
+    identically — order the keys and string-cast values for stable digest.
+    """
+    h = hashlib.sha256()
+    parts = [
+        ("model_path", model_path),
+        ("samples_path", samples_path),
+        ("max_samples", str(max_samples)),
+        ("max_len", str(max_len)),
+        ("chunk_len", str(chunk_len)),
+        ("skip_grad_patterns", skip_grad_patterns or ""),
+        ("with_act_taylor", "1" if with_act_taylor else "0"),
+        ("task", task or "custom"),
+        ("prompt_key", prompt_key),
+        ("completion_key", completion_key),
+        ("pass_key", pass_key),
+        ("pass_value", str(pass_value)),
+        ("keep_doc_ids", ",".join(sorted(keep_doc_ids)) if keep_doc_ids else ""),
+    ]
+    for k, v in parts:
+        h.update(k.encode())
+        h.update(b"\x00")
+        h.update(v.encode())
+        h.update(b"\x01")
+    return h.hexdigest()
+
+
+def _sidecar_path(output_path: Path) -> Path:
+    return output_path.with_suffix(output_path.suffix + ".ckpt.pt")
+
+
+def _save_sidecar(sidecar: Path, extractor: "HookedExtractor", next_idx: int,
+                  passing_count: int, config_hash: str, t0_wall: float,
+                  ckpt_dtype: torch.dtype) -> None:
+    """Atomic-write the sidecar via temp file + rename so OOM mid-write can't corrupt it."""
+    state = {
+        "version": SIDECAR_VERSION,
+        "config_hash": config_hash,
+        "n_samples_done": extractor._n_samples,
+        "next_sample_idx": next_idx,
+        "passing_count": passing_count,
+        "acc_grad_l1": {k: v.to(ckpt_dtype) for k, v in extractor.acc_grad_l1.items()},
+        "acc_grad_sq": {k: v.to(ckpt_dtype) for k, v in extractor.acc_grad_sq.items()},
+        "acc_weight_taylor": {k: v.to(ckpt_dtype) for k, v in extractor.acc_weight_taylor.items()},
+        "acc_act_taylor": {k: v.to(ckpt_dtype) for k, v in extractor.acc_act_taylor.items()},
+        "wall_time_sec": time.time() - t0_wall,
+        "saved_at": time.time(),
+    }
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
+    torch.save(state, str(tmp))
+    os.replace(str(tmp), str(sidecar))
+
+
+def _load_sidecar_or_refuse(sidecar: Path, config_hash: str,
+                            passing_count: int) -> Optional[Dict[str, Any]]:
+    """Load sidecar if compatible. Returns dict or None.
+
+    None means: no sidecar OR mismatched config (caller must decide whether to refuse).
+    Caller distinguishes the cases by checking sidecar.exists() before calling.
+    """
+    if not sidecar.exists():
+        return None
+    try:
+        state = torch.load(str(sidecar), map_location="cpu", weights_only=False)
+    except Exception as e:
+        print(f"  WARN: sidecar at {sidecar} unreadable ({type(e).__name__}: {e}); ignoring",
+              file=sys.stderr)
+        return None
+    if state.get("version") != SIDECAR_VERSION:
+        print(f"  WARN: sidecar version {state.get('version')} != {SIDECAR_VERSION}; ignoring",
+              file=sys.stderr)
+        return None
+    if state.get("config_hash") != config_hash:
+        print("  REFUSE-RESUME: sidecar config_hash mismatch", file=sys.stderr)
+        print(f"    sidecar : {state.get('config_hash')}", file=sys.stderr)
+        print(f"    current : {config_hash}", file=sys.stderr)
+        print(f"    Delete {sidecar} or restart without --resume.", file=sys.stderr)
+        return "REFUSE"  # type: ignore  # signal to caller via sentinel
+    if state.get("passing_count") != passing_count:
+        print(f"  REFUSE-RESUME: passing_count mismatch "
+              f"(sidecar={state.get('passing_count')} current={passing_count})",
+              file=sys.stderr)
+        return "REFUSE"  # type: ignore
+    return state
 
 
 TASK_PRESETS = {
@@ -190,7 +347,37 @@ class HookedExtractor:
             h.remove()
         self._fwd_handles.clear()
 
-    def export(self, out_dtype: torch.dtype = torch.float16) -> Dict[str, torch.Tensor]:
+    def load_state(self, state: Dict[str, Any]) -> None:
+        """Restore accumulators from a sidecar dict (see _save_sidecar).
+
+        Caller is responsible for config-compatibility checks. We copy in fp32 to
+        match the in-memory accumulator dtype, regardless of the sidecar's dtype.
+        Missing keys are tolerated (e.g., act_taylor when --with-act-taylor was off);
+        extra keys in the sidecar that aren't in the current model are warned-and-skipped.
+        """
+        def _restore(target: Dict[str, torch.Tensor], src: Dict[str, torch.Tensor]) -> None:
+            extra = set(src.keys()) - set(target.keys())
+            if extra:
+                print(f"  WARN: sidecar has {len(extra)} keys not in current model — skipping",
+                      file=sys.stderr)
+            for k in target.keys():
+                if k in src:
+                    target[k] = src[k].to(torch.float32)
+
+        _restore(self.acc_grad_l1, state.get("acc_grad_l1") or {})
+        _restore(self.acc_grad_sq, state.get("acc_grad_sq") or {})
+        _restore(self.acc_weight_taylor, state.get("acc_weight_taylor") or {})
+        # act_taylor is populated lazily; restore directly without target-key gating
+        for k, v in (state.get("acc_act_taylor") or {}).items():
+            self.acc_act_taylor[k] = v.to(torch.float32)
+        self._n_samples = int(state.get("n_samples_done", 0))
+
+    def export(self, out_dtype: torch.dtype = torch.float16,
+               structured_config: Optional[Dict[str, int]] = None) -> Dict[str, torch.Tensor]:
+        """Export per-element signals; if structured_config is given, also emit
+        per-head / per-neuron compact 1D aggregates with `.head_compact_*` /
+        `.neuron_compact_*` suffixes.
+        """
         out: Dict[str, torch.Tensor] = {}
         n = max(self._n_samples, 1)
         for name, t in self.acc_grad_l1.items():
@@ -201,6 +388,31 @@ class HookedExtractor:
             out[f"{name}.weight_taylor"] = (t / n).to(out_dtype)
         for name, t in self.acc_act_taylor.items():
             out[f"{name}.act_taylor"] = (t / n).to(out_dtype)
+
+        if structured_config is not None:
+            # Aggregate each accumulator into compact head/neuron 1D signals.
+            # Iterate by accumulator-suffix: primary (no suffix), grad_sq, weight_taylor.
+            # act_taylor is already 1D (per-input-channel) and not structurally aggregated.
+            sources = [
+                ("l1", self.acc_grad_l1),
+                ("sq", self.acc_grad_sq),
+                ("taylor", self.acc_weight_taylor),
+            ]
+            n_head = n_neuron = 0
+            for suffix_tag, acc in sources:
+                for name, t in acc.items():
+                    res = _structured_aggregate(name, t / n, structured_config)
+                    if res is None:
+                        continue
+                    sig_class, compact = res
+                    out[f"{name}.{sig_class}_compact_{suffix_tag}"] = compact.to(out_dtype)
+                    if suffix_tag == "l1":  # count once per tensor
+                        if sig_class == "head":
+                            n_head += 1
+                        else:
+                            n_neuron += 1
+            print(f"  structured: {n_head} head-aggregated tensors, "
+                  f"{n_neuron} neuron-aggregated tensors")
         return out
 
 
@@ -261,6 +473,28 @@ def main():
     ap.add_argument("--save-dtype", default="float16", choices=["float16", "bfloat16", "float32"],
                     help="Output safetensors dtype. fp16 halves disk vs fp32 with negligible loss for "
                          "use as merge importance signal. fp32 only if you need exact accumulator values.")
+    ap.add_argument("--resume", action="store_true",
+                    help="Resume from a sidecar checkpoint at <output>.ckpt.pt if it exists and the "
+                         "config_hash matches. Without this flag, an existing sidecar is renamed to "
+                         "<output>.ckpt.pt.stale rather than silently overwritten.")
+    ap.add_argument("--ckpt-every", type=int, default=10,
+                    help="Save sidecar every N completed samples. Default 10. Set 0 to disable "
+                         "sample-cadence checkpointing (still respects --ckpt-time-sec).")
+    ap.add_argument("--ckpt-time-sec", type=int, default=300,
+                    help="Save sidecar at least every N seconds (whichever fires first vs --ckpt-every). "
+                         "Default 300. Set 0 to disable time-cadence checkpointing.")
+    ap.add_argument("--ckpt-dtype", default="float16", choices=["float16", "float32"],
+                    help="Sidecar accumulator dtype. fp16 halves disk; fp32 if you need exact restore "
+                         "(rarely matters since we re-normalize in combine).")
+    ap.add_argument("--structured", action="store_true",
+                    help="At export time, additionally emit compact 1D per-head and per-neuron "
+                         "aggregates of each weight-level accumulator. Adds keys with suffixes "
+                         ".head_compact_l1/.head_compact_sq/.head_compact_taylor for q/k/v/o_proj "
+                         "and .neuron_compact_l1/.neuron_compact_sq/.neuron_compact_taylor for "
+                         "gate/up/down_proj (incl. MoE expert layers). The per-element tensors are "
+                         "still saved as before; structured signals are additive. Embeds a "
+                         "'structured_config' JSON in the safetensors file metadata so consumers "
+                         "(combine, omnimergekit) can reshape correctly without re-loading the model.")
     args = ap.parse_args()
 
     # Resolve preset / overrides
@@ -351,12 +585,44 @@ def main():
     extractor = HookedExtractor(model, device, with_act_taylor=args.with_act_taylor)
     print(f"  param tensors tracked: {len(extractor.acc_grad_l1)}")
 
+    # ── Resume sidecar handling ────────────────────────────────────────────────
+    config_hash = _compute_config_hash(
+        model_path=str(args.model), samples_path=str(samples_file),
+        max_samples=args.max_samples, max_len=args.max_len, chunk_len=args.chunk_len,
+        skip_grad_patterns=args.skip_grad_patterns, with_act_taylor=args.with_act_taylor,
+        task=args.task, prompt_key=preset["prompt_key"], completion_key=preset["completion_key"],
+        pass_key=preset["pass_key"], pass_value=preset["pass_value"], keep_doc_ids=keep_ids,
+    )
+    sidecar = _sidecar_path(args.output)
+    resume_skip = 0
+    if args.resume:
+        loaded = _load_sidecar_or_refuse(sidecar, config_hash, len(passing))
+        if loaded == "REFUSE":
+            sys.exit(2)
+        if loaded is not None:
+            extractor.load_state(loaded)
+            resume_skip = int(loaded.get("next_sample_idx", 0))
+            print(f"  RESUMED from {sidecar.name}: n_samples_done={extractor._n_samples} "
+                  f"next_sample_idx={resume_skip}/{len(passing)}")
+        else:
+            print(f"  --resume set but no compatible sidecar at {sidecar} — starting fresh")
+    elif sidecar.exists():
+        stale = sidecar.with_suffix(sidecar.suffix + ".stale")
+        sidecar.replace(stale)
+        print(f"  no --resume; existing sidecar moved to {stale.name}")
+    ckpt_dtype_t = {"float16": torch.float16, "float32": torch.float32}[args.ckpt_dtype]
+
     t0 = time.time()
     n_used = 0
+    last_save_idx = resume_skip
+    last_save_time = t0
     chunk_len = args.chunk_len if args.chunk_len > 0 else args.max_len
     if args.chunk_len > 0:
         print(f"  chunked grad accumulation: chunk_len={args.chunk_len}, hard cap max_len={args.max_len}")
-    for i, (prompt, comp) in enumerate(passing):
+    if resume_skip >= len(passing):
+        print(f"  sidecar already covers all {len(passing)} samples — skipping loop, exporting only")
+    iter_start = min(resume_skip, len(passing))
+    for i, (prompt, comp) in enumerate(passing[iter_start:], start=iter_start):
         prompt_ids = tok(prompt, return_tensors="pt", add_special_tokens=False).input_ids[0]
         comp_ids = tok(comp, return_tensors="pt", add_special_tokens=False).input_ids[0]
         full = torch.cat([prompt_ids, comp_ids], dim=0)
@@ -417,6 +683,22 @@ def main():
                 for p in model.parameters():
                     p.grad = None
 
+            # Sidecar checkpoint cadence (sample-based or wall-clock based, whichever fires first)
+            samples_since_save = (i + 1) - last_save_idx
+            elapsed_since_save = time.time() - last_save_time
+            should_save = (
+                (args.ckpt_every > 0 and samples_since_save >= args.ckpt_every) or
+                (args.ckpt_time_sec > 0 and elapsed_since_save >= args.ckpt_time_sec)
+            )
+            if should_save and chunks_used > 0:
+                _save_sidecar(sidecar, extractor, next_idx=i + 1,
+                              passing_count=len(passing), config_hash=config_hash,
+                              t0_wall=t0, ckpt_dtype=ckpt_dtype_t)
+                last_save_idx = i + 1
+                last_save_time = time.time()
+                print(f"  ckpt: saved sidecar at sample {i+1}/{len(passing)} "
+                      f"({sidecar.stat().st_size/1e9:.2f} GB)", flush=True)
+
             if (i+1) % 5 == 0 or i == 0:
                 el = time.time() - t0
                 tag = f"chunks={chunks_used}/{n_chunks}" if args.chunk_len > 0 else f"loss={last_loss:.4f}"
@@ -448,7 +730,29 @@ def main():
         sys.exit(1)
 
     save_dtype_t = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[args.save_dtype]
-    out_tensors = extractor.export(out_dtype=save_dtype_t)
+    structured_cfg: Optional[Dict[str, int]] = None
+    if args.structured:
+        # Pull shape numbers from the loaded model config. text_config nested form
+        # (e.g. Gemma 4) is checked first; fall back to top-level for plain models.
+        cfg_obj = getattr(model, "config", None)
+        text_cfg = getattr(cfg_obj, "text_config", None) or cfg_obj
+        try:
+            n_heads = int(getattr(text_cfg, "num_attention_heads"))
+            n_kv = int(getattr(text_cfg, "num_key_value_heads", n_heads))
+            hd = int(getattr(text_cfg, "head_dim",
+                             getattr(text_cfg, "hidden_size") // n_heads))
+            inter = int(getattr(text_cfg, "intermediate_size"))
+            structured_cfg = {
+                "num_heads": n_heads, "num_kv_heads": n_kv,
+                "head_dim": hd, "intermediate_size": inter,
+            }
+            print(f"  structured_config: {structured_cfg}")
+        except (AttributeError, TypeError) as e:
+            print(f"  WARN: --structured requested but config probe failed ({type(e).__name__}: {e}); "
+                  f"continuing without structured aggregates", file=sys.stderr)
+            structured_cfg = None
+
+    out_tensors = extractor.export(out_dtype=save_dtype_t, structured_config=structured_cfg)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     metadata = {
         "model": str(args.model),
@@ -461,9 +765,20 @@ def main():
         "max_samples": str(args.max_samples),
         "extra": args.meta,
     }
+    if structured_cfg is not None:
+        metadata["structured_config"] = json.dumps(structured_cfg, sort_keys=True)
     save_file(out_tensors, str(args.output), metadata=metadata)
     print(f"  wrote {args.output} ({len(out_tensors)} tensors, "
           f"{args.output.stat().st_size/1e9:.2f} GB)")
+
+    # Clean finish — discard the sidecar so a subsequent --resume on this output
+    # won't pick up a stale partial accumulator.
+    if sidecar.exists():
+        try:
+            sidecar.unlink()
+            print(f"  cleaned sidecar {sidecar.name}")
+        except OSError as e:
+            print(f"  WARN: could not unlink sidecar {sidecar}: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
