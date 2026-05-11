@@ -2928,9 +2928,16 @@ def main():
         # Snapshot self_attn state_dict() — captures BOTH the in-place q/k/v_proj
         # prune from prune_q_heads_inplace AND the o_proj kept-cols overwrite from
         # the heal. On resume we load_state_dict() to reconstruct the layer.
+        # Use _maybe_align to materialize accelerate-offloaded tensors before
+        # .cpu() — state_dict() on an offloaded module returns meta tensors.
         if args._ckpt_dir is not None:
+            with _maybe_align(layer.self_attn):
+                sa_state = {
+                    k: v.detach().to(dtype=v.dtype).cpu().clone()
+                    for k, v in layer.self_attn.state_dict().items()
+                }
             _atomic_torch_save({
-                "self_attn": {k: v.cpu() for k, v in layer.self_attn.state_dict().items()},
+                "self_attn": sa_state,
                 "stats": stats,
                 "keep_q": keep_q_per_layer[L],
                 "keep_kv": keep_kv_per_layer[L],
