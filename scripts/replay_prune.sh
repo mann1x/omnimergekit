@@ -97,6 +97,7 @@ WANT_FILES=(
     gemma4_31b_imp_full_nf4.pt
     gemma4_31b_canary_baseline_n50.pt
     prune_manifest.json
+    calibration_datav5.txt
 )
 if [[ "$CACHE_SRC" == *:* ]]; then
     # rsync syntax (host:path)
@@ -123,6 +124,28 @@ if [[ ! -s "$CACHE_DIR/gemma4_31b_imp_full_nf4.pt" ]]; then
     echo "       Expected at $CACHE_SRC/gemma4_31b_imp_full_nf4.pt" >&2
     exit 1
 fi
+# Required: calibration corpus (prune_local_heal.py refuses to start without it
+# on 31B — corpus is too large to embed and changes determinism).
+CALIB_FILE="${CALIB_FILE:-$CACHE_DIR/calibration_datav5.txt}"
+if [[ ! -s "$CALIB_FILE" ]]; then
+    # Try the recipe's local sibling on this host as a last-resort fallback.
+    for FALLBACK in \
+        /workspace/omnimergekit/scripts/calibration_datav5.txt \
+        /shared/dev/omnimergekit/scripts/calibration_datav5.txt \
+        "$(dirname "$RECIPE")/../../scripts/calibration_datav5.txt"; do
+        if [[ -s "$FALLBACK" ]]; then
+            cp -v "$FALLBACK" "$CACHE_DIR/calibration_datav5.txt"
+            CALIB_FILE="$CACHE_DIR/calibration_datav5.txt"
+            break
+        fi
+    done
+fi
+if [[ ! -s "$CALIB_FILE" ]]; then
+    echo "ERROR: calibration corpus not found. prune_local_heal.py --calib-file is mandatory." >&2
+    echo "       Pass calibration_datav5.txt in the cache source dir, or set CALIB_FILE=<path>." >&2
+    exit 1
+fi
+echo "  calib file: $CALIB_FILE ($(wc -c < "$CALIB_FILE") bytes)"
 # Optional: canary baseline. Recipe will recapture it (~17 min) if missing.
 HAVE_CANARY=""
 if [[ -s "$CACHE_DIR/gemma4_31b_canary_baseline_n50.pt" ]]; then
@@ -148,6 +171,7 @@ rm -rf "$OUT_DIR"
 PRUNE_ARGS=(
     --model-path "$SRC_DIR"
     --output     "$OUT_DIR"
+    --calib-file "$CALIB_FILE"
     --prune-frac "$PRUNE_FRAC"
     --placement  auto
     --gpu-mem    "$GPU_MEM"
