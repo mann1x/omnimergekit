@@ -1532,16 +1532,18 @@ def _enter_canary_runtime(args, model, canary_dev, canary_dtype, log_fn):
             if not (n in device_map or n.startswith(mapped_prefixes))
         ]
         if missing:
-            # Subtle: parent-module device in device_map is the STORAGE device
-            # (where weights live between forwards). At forward time
-            # accelerate's offload hook moves the parent's weights to the
-            # EXECUTION device (cuda:0 here). Custom params like Gemma 4's
-            # `layer_scalar` are NOT under that hook, so they stay where
-            # placed — leading to `cuda:0 vs cpu` errors during e.g.
-            # `hidden_states *= self.layer_scalar`.
-            # Right fix: place missing items on the execution device (first
-            # cuda in device_map). They're tiny (single-float scalars per
-            # layer, total bytes negligible), so GPU placement is free.
+            # Subtle: dispatch_model's device_map entries for bare params (not
+            # whole submodules) only satisfy the check_device_map validator;
+            # they do NOT physically place the param. The param keeps whatever
+            # device it had from the prior model.to() — and phase3a put the
+            # whole model on cpu, so adding a `param_name → 0` entry alone
+            # leaves the tensor stranded on cpu while hidden_states is on
+            # cuda:0 → same `cuda:0 vs cpu` crash.
+            #
+            # Right fix: PHYSICALLY move each missing param to the execution
+            # device with set_module_tensor_to_device (accelerate's safe
+            # rebind), AND add the device_map entry so the validator passes.
+            from accelerate.utils import set_module_tensor_to_device
             exec_dev = None
             for v in device_map.values():
                 if isinstance(v, int) or (isinstance(v, str) and v.startswith("cuda")):
@@ -1551,11 +1553,15 @@ def _enter_canary_runtime(args, model, canary_dev, canary_dtype, log_fn):
                 exec_dev = "cpu"
             sample = []
             for n in missing:
+                try:
+                    set_module_tensor_to_device(model, n, exec_dev)
+                except Exception as _e:
+                    log_fn(f"  warn: set_module_tensor_to_device({n!r}) failed: {_e!r}")
                 device_map[n] = exec_dev
                 if len(sample) < 3:
                     sample.append(f"{n}→{exec_dev}")
             log_fn(f"canary: device_map missing {len(missing)} item(s); "
-                   f"placing each on the execution device {exec_dev} "
+                   f"physically moved + mapped to execution device {exec_dev} "
                    f"(e.g. {sample})")
         dispatch_model(model, device_map=device_map)
     else:
