@@ -40,6 +40,7 @@ Memory plan for solidPC RTX 3090 24GB:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -152,9 +153,114 @@ def layer_attn_geom(model, idx: int) -> tuple[int, int, int, str]:
     return head_dim, n_q, n_kv, lt
 
 
+# ---------- checkpoint helpers (resumable Phase 0' / Phase 2 / pre-canary) ----------
+#
+# Three save points, all opt-in via --checkpoint-dir:
+#   (A) phase0/  — per-layer o_proj output + decoder residual + (opt) mlp targets
+#                  captured during phase0_capture(). Disk: ~340 MB/layer × 60 ≈ 20 GB.
+#                  Enabled only with --checkpoint-phase0 (large disk).
+#   (B) phase2/  — per-layer self_attn state_dict + heal stats + keep indices
+#                  after each layer's prune_q + heal completes. Disk: ~300 MB/layer
+#                  bf16 × 60 ≈ 18 GB. Enabled by default when --checkpoint-dir is set.
+#   (C) staged/  — full BF16 model.save_pretrained() AFTER phase3b reshape but BEFORE
+#                  the AR canary. Disk: ~62 GB. Enabled with --save-before-canary.
+#                  Resume detects this and skips straight to phase 2.5; saves the
+#                  ~1-2 h of phase 0+2 work when the canary itself stalls/dies.
+#
+# Manifest (manifest.json) carries a fingerprint hashed from the run's load-bearing
+# args + calib-file contents + drop selection. Mismatch ⇒ refuse resume (loud fail,
+# never silent corruption). Atomic writes: tmp file → os.replace.
+
+_CHECKPOINT_VERSION = "1.0"
+
+
+def _ckpt_fingerprint(args) -> str:
+    """SHA-256 hash of the load-bearing run config — used to reject stale resume dirs.
+
+    Inputs hashed (any change invalidates the checkpoint):
+      - model path string + the load-bearing CLI args below
+      - SHA-256 of the calib file contents (--calib-file)
+      - SHA-256 of the importance cache contents (--imp-cache) when present —
+        this makes the head selection deterministic, so phase-2 checkpoints
+        are reusable across replays of the SAME published variant.
+
+    NOT hashed:
+      - paths to --output / --checkpoint-dir / --canary-baseline-cache
+      - GPU mem budgets (placement-only knobs that don't change weights)
+      - canary thresholds (gate config; doesn't affect saved weights)
+    """
+    h = hashlib.sha256()
+    h.update(f"v={_CHECKPOINT_VERSION}\n".encode())
+    for k in ("model_path", "prune_frac", "ridge", "chunk_tokens", "calib_tokens",
+              "heal", "prune_mode", "phase1_mode", "phase1_nf4_chunk_tokens",
+              "ffn_prune_frac", "ffn_block_size", "ffn_heal"):
+        v = getattr(args, k, None)
+        h.update(f"{k}={v}\n".encode())
+    for name, path_attr in (("calib", "calib_file"), ("imp", "imp_cache")):
+        p_str = getattr(args, path_attr, None)
+        if p_str and Path(p_str).exists():
+            with open(p_str, "rb") as f:
+                h.update(f"{name}:".encode())
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+        else:
+            h.update(f"{name}:none\n".encode())
+    return h.hexdigest()[:16]
+
+
+def _read_manifest(ckpt_dir: Path) -> dict | None:
+    mf = ckpt_dir / "manifest.json"
+    if not mf.exists():
+        return None
+    try:
+        return json.loads(mf.read_text())
+    except Exception:
+        return None
+
+
+def _write_manifest(ckpt_dir: Path, manifest: dict) -> None:
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    tmp = ckpt_dir / "manifest.json.tmp"
+    tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    tmp.replace(ckpt_dir / "manifest.json")
+
+
+def _atomic_torch_save(obj, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    torch.save(obj, tmp)
+    tmp.replace(dst)
+
+
+def _phase0_layer_path(ckpt_dir: Path, L: int) -> Path:
+    return ckpt_dir / "phase0" / f"layer_{L:03d}.pt"
+
+
+def _phase2_layer_path(ckpt_dir: Path, L: int) -> Path:
+    return ckpt_dir / "phase2" / f"layer_{L:03d}.pt"
+
+
+def _staged_dir(ckpt_dir: Path) -> Path:
+    return ckpt_dir / "staged"
+
+
+def _staged_complete(ckpt_dir: Path) -> bool:
+    """True iff staged/ has a complete safetensors model (config + ≥1 shard)."""
+    s = _staged_dir(ckpt_dir)
+    if not (s / "config.json").exists():
+        return False
+    if not any(s.glob("*.safetensors")):
+        return False
+    # save_pretrained writes a sentinel index for sharded models; for single-shard
+    # models, the presence of model.safetensors + config.json is enough.
+    return True
+
+
 # ---------- phase 0: capture targets ----------
 
-def phase0_capture(model, calib_chunks, capture_mlp: bool = False):
+def phase0_capture(model, calib_chunks, capture_mlp: bool = False,
+                    ckpt_dir: Path | None = None, ckpt_phase0: bool = False,
+                    resume_layers: set[int] | None = None):
     """
     Forward the un-modified model, capturing per-layer artifacts:
       - o_proj OUTPUT (decoder layer's attention contribution)   → phase 2 attn healing target
@@ -205,6 +311,35 @@ def phase0_capture(model, calib_chunks, capture_mlp: bool = False):
     mlp_targets = {L: torch.cat(parts, dim=1) for L, parts in chunk_mlp_outputs.items()} if capture_mlp else {}
     extra = f" + {len(mlp_targets)} down_proj targets" if capture_mlp else ""
     log(f"phase0: captured {len(o_targets)} o_proj targets and {len(h_targets)} residual-stream targets{extra} (CPU fp32)")
+
+    # Merge in any resumed-from-disk layers — overwrite the fresh capture with
+    # the saved values so we use one authoritative copy.
+    if resume_layers and ckpt_dir is not None:
+        loaded = 0
+        for L in resume_layers:
+            p = _phase0_layer_path(ckpt_dir, L)
+            if not p.exists():
+                continue
+            d = torch.load(p, map_location="cpu", weights_only=True)
+            if d.get("o") is not None:
+                o_targets[L] = d["o"]
+            if d.get("h") is not None:
+                h_targets[L] = d["h"]
+            if capture_mlp and d.get("mlp") is not None:
+                mlp_targets[L] = d["mlp"]
+            loaded += 1
+        if loaded:
+            log(f"phase0: resumed {loaded} layer(s) from {ckpt_dir / 'phase0'}")
+
+    # Save per-layer captures (opt-in; ~340 MB/layer × 60 ≈ 20 GB on 31B).
+    if ckpt_phase0 and ckpt_dir is not None:
+        for L in o_targets:
+            obj = {"o": o_targets[L], "h": h_targets.get(L)}
+            if capture_mlp:
+                obj["mlp"] = mlp_targets.get(L)
+            _atomic_torch_save(obj, _phase0_layer_path(ckpt_dir, L))
+        log(f"phase0: wrote {len(o_targets)} per-layer checkpoints to {ckpt_dir / 'phase0'}")
+
     return o_targets, h_targets, mlp_targets
 
 
@@ -2116,6 +2251,32 @@ def main():
     ap.add_argument("--canary-cpu-mem", default=None,
                     help="CPU memory budget for canary offload (e.g. '200GiB'). "
                          "Defaults to --cpu-mem.")
+    # ---- Resumable checkpoints (opt-in; covers phase0 + phase2 + pre-canary) ----
+    # Burned a couple of hours on 2026-05-11 redoing 30+ min of phase 0' capture
+    # and 30+ min of phase 2 lstsq heal after the AR canary stalled on a
+    # single-threaded BF16 CPU forward. With --checkpoint-dir + --save-before-canary
+    # the same restart becomes ~1 min (load staged BF16, re-run canary on GPU).
+    ap.add_argument("--checkpoint-dir", default=None,
+                    help="Directory for resumable checkpoints. Disabled when unset. "
+                         "Contains manifest.json (run fingerprint), phase2/layer_NN.pt "
+                         "(default ON), optional phase0/layer_NN.pt (--checkpoint-phase0), "
+                         "and optional staged/ (--save-before-canary).")
+    ap.add_argument("--checkpoint-phase0", action="store_true",
+                    help="Also checkpoint per-layer Phase 0 captures (o_proj outputs + "
+                         "residual stream). ~20 GB disk for 31B but lets the whole calib "
+                         "forward be skipped on restart. Off by default — usually the "
+                         "staged/ + phase2/ checkpoints are enough.")
+    ap.add_argument("--save-before-canary", action="store_true",
+                    help="Save the full BF16 model under <checkpoint-dir>/staged/ AFTER "
+                         "phase3b reshape but BEFORE the AR canary check. On a fresh "
+                         "restart with the same checkpoint-dir, load() jumps directly to "
+                         "phase 2.5 — bypassing phase 0/2 entirely. Disk: ~62 GB for 31B.")
+    ap.add_argument("--resume", choices=["auto", "fresh", "force"], default="auto",
+                    help="auto: reuse checkpoint dir if fingerprint matches the current "
+                         "run config (default). fresh: ignore any existing checkpoint dir "
+                         "(forces recompute; old checkpoint is left in place). force: "
+                         "reuse checkpoint dir without fingerprint check (debug only — "
+                         "you certify the saved data matches your current config).")
     # T13: LoRA-as-correction heal (alternative to lstsq).
     # T7.7: ar-lstsq — same lstsq math but with AR-distributed (X, Y) target pair.
     # T7.8: noheal — pure mask, no o_proj refit (informed by T13b/T7.6/T7.7 finding
@@ -2182,6 +2343,65 @@ def main():
     ap.add_argument("--wandb-tags", default=None,
                     help="Comma-separated W&B tags, e.g. 'gemma4,head-prune,T7.4'.")
     args = ap.parse_args()
+
+    # ---- Resume state (populated below if --checkpoint-dir set) ----
+    # Attached to `args` so downstream code can introspect without threading
+    # a new positional parameter through every callee.
+    args._ckpt_dir = None        # Path | None
+    args._ckpt_fp = None         # current-run fingerprint
+    args._ckpt_phase0_layers = set()  # which phase0 layers are already on disk
+    args._ckpt_phase2_layers = set()  # which phase2 layers are already on disk
+    args._ckpt_staged_ready = False   # whether staged/ has a complete BF16 model
+
+    if args.checkpoint_dir:
+        cdir = Path(args.checkpoint_dir)
+        fp_now = _ckpt_fingerprint(args)
+        manifest = _read_manifest(cdir) if args.resume != "fresh" else None
+        if args.resume == "fresh" and cdir.exists():
+            log(f"checkpoint: --resume fresh — ignoring existing dir {cdir} "
+                "(left in place; rm manually if you want disk back)")
+        if manifest is not None:
+            saved_fp = manifest.get("fingerprint", "")
+            if args.resume == "force":
+                log(f"checkpoint: --resume force — reusing {cdir} without "
+                    f"fingerprint check (saved={saved_fp} current={fp_now}). "
+                    "Caller certifies the saved data matches the current config.")
+            elif saved_fp != fp_now:
+                log(f"checkpoint: fingerprint mismatch (saved={saved_fp} "
+                    f"current={fp_now}) — REFUSING TO RESUME. Either pass "
+                    "--resume fresh to start over, or pass --resume force if "
+                    "you know the saved data is still valid for this run.")
+                sys.exit(2)
+            else:
+                log(f"checkpoint: resuming from {cdir} (fp={fp_now})")
+            # Inventory what's already on disk
+            p0_dir = cdir / "phase0"
+            if p0_dir.exists():
+                args._ckpt_phase0_layers = {
+                    int(p.stem.split("_")[1]) for p in p0_dir.glob("layer_*.pt")
+                }
+            p2_dir = cdir / "phase2"
+            if p2_dir.exists():
+                args._ckpt_phase2_layers = {
+                    int(p.stem.split("_")[1]) for p in p2_dir.glob("layer_*.pt")
+                }
+            args._ckpt_staged_ready = _staged_complete(cdir)
+            log(f"checkpoint: phase0_layers={len(args._ckpt_phase0_layers)} "
+                f"phase2_layers={len(args._ckpt_phase2_layers)} "
+                f"staged_ready={args._ckpt_staged_ready}")
+        else:
+            log(f"checkpoint: starting fresh in {cdir} (fp={fp_now})")
+        args._ckpt_dir = cdir
+        args._ckpt_fp = fp_now
+        # Write/refresh the manifest so subsequent saves can update it.
+        _write_manifest(cdir, {
+            "version": _CHECKPOINT_VERSION,
+            "fingerprint": fp_now,
+            "model_path": str(args.model_path),
+            "prune_frac": args.prune_frac,
+            "heal": args.heal,
+        })
+
     # Parse --prune-layers into a set or None for 'all'.
     if args.prune_layers == "all":
         args._prune_layer_set = None
@@ -2250,6 +2470,19 @@ def main():
 
     tok = AutoTokenizer.from_pretrained(args.model_path)
 
+    # NOTE on staged/ usage (v1 scope):
+    #   --save-before-canary writes <ckpt>/staged/ with the full post-heal BF16
+    #   model so a canary stall/crash never costs the phase 0/2 work. Auto-resume
+    #   FROM staged (skipping phase 0/1/2/3 wholesale) is v2 work — for now, on
+    #   a crash after phase 3, manually copy staged/ to the final output dir or
+    #   point a follow-up tool at it. The per-layer phase0 + phase2 checkpoints
+    #   handle the more common mid-phase crashes.
+    args._skip_to_canary = False
+    if args._ckpt_dir is not None and args._ckpt_staged_ready:
+        log(f"checkpoint: staged/ is on disk at {_staged_dir(args._ckpt_dir)}. "
+            "Auto-resume from staged is not wired in v1 — proceeding with full "
+            "phase 0/1/2/3 (per-layer checkpoints will accelerate where they exist).")
+
     # Build calibration BEFORE loading any model — the calibration is just
     # tokenized text, doesn't need the model.
     calib_total = args.smoke_tokens if args.smoke else args.calib_tokens
@@ -2294,6 +2527,9 @@ def main():
     _capture_mlp = args.ffn_prune_frac > 0 and args.ffn_heal != "noheal"
     o_targets, h_targets, mlp_targets = phase0_capture(
         model, calib_chunks, capture_mlp=_capture_mlp,
+        ckpt_dir=args._ckpt_dir,
+        ckpt_phase0=args.checkpoint_phase0,
+        resume_layers=args._ckpt_phase0_layers,
     )
     p2_chunks = calib_chunks[: max(1, args.phase2_max_chunks)]
     p2_tokens = sum(c.shape[1] for c in p2_chunks)
@@ -2509,6 +2745,28 @@ def main():
         if n_drop <= 0:
             break
 
+        # Phase 2 resume: if a per-layer checkpoint exists, load its self_attn
+        # state (which encodes the in-place prune + heal) and skip recompute.
+        # Bypasses prune_q_heads_inplace + capture_proj_input_at_layer + lstsq.
+        if (args._ckpt_dir is not None
+                and L in args._ckpt_phase2_layers
+                and args.heal != "ar-lstsq"):
+            try:
+                d = torch.load(_phase2_layer_path(args._ckpt_dir, L),
+                               map_location="cpu", weights_only=True)
+                layer.self_attn.load_state_dict(d["self_attn"], strict=True)
+                refit_stats[L] = d["stats"]
+                keep_q_per_layer[L] = d["keep_q"]
+                keep_kv_per_layer[L] = d["keep_kv"]
+                pruned_layers.append((L, d["lt"]))
+                targets.pop(L, None)
+                log(f"  L{L}: phase2 RESUMED from checkpoint "
+                    f"(kept={d['stats'].get('kept')}/{d['stats'].get('in')} "
+                    f"rel_resid={d['stats'].get('rel_resid')})")
+                continue
+            except Exception as _e:
+                log(f"  L{L}: phase2 checkpoint load failed: {_e!r} — recomputing")
+
         head_dim, _, n_kv_layer, lt = layer_attn_geom(model, L)
         imp = importance[L]
 
@@ -2643,6 +2901,21 @@ def main():
         refit_stats[L] = stats
         keep_q_per_layer[L] = sorted(int(i) for i in keep_idx)
         keep_kv_per_layer[L] = sorted(int(i) for i in keep_kv)
+        # Per-layer phase 2 checkpoint (default on whenever --checkpoint-dir is set).
+        # Snapshot self_attn state_dict() — captures BOTH the in-place q/k/v_proj
+        # prune from prune_q_heads_inplace AND the o_proj kept-cols overwrite from
+        # the heal. On resume we load_state_dict() to reconstruct the layer.
+        if args._ckpt_dir is not None:
+            _atomic_torch_save({
+                "self_attn": {k: v.cpu() for k, v in layer.self_attn.state_dict().items()},
+                "stats": stats,
+                "keep_q": keep_q_per_layer[L],
+                "keep_kv": keep_kv_per_layer[L],
+                "drop_idx": drop_idx,
+                "drop_kv_idx": drop_kv_idx,
+                "lt": lt,
+                "L": L,
+            }, _phase2_layer_path(args._ckpt_dir, L))
 
     # ---- T7.7: AR-distributed lstsq deferred heal ----
     # All layers in `ar_deferred` are currently masked. Sample greedy rollouts
@@ -2981,6 +3254,20 @@ def main():
         log(f"config updated: num_attention_heads {old_n_q} → {target_n_q_keep}, "
             f"num_key_value_heads {old_n_kv} → {target_n_kv_keep_sliding}, "
             f"num_global_key_value_heads {cfg.num_global_key_value_heads} (unchanged)")
+
+    # ---- Pre-canary staged BF16 save (covers the canary-stall recovery case) ----
+    # All the slow work (phase 0', phase 2 heal, phase 3 reshape) is now in `model`.
+    # Persisting BF16/CPU here means a future restart can load from `staged/` and
+    # jump straight to phase 2.5 — saving ~1-2 hours on 31B if the canary
+    # itself dies/stalls (the 2026-05-11 CPU-canary-stall scenario).
+    if args._ckpt_dir is not None and args.save_before_canary:
+        staged = _staged_dir(args._ckpt_dir)
+        log(f"phase3c (pre-canary): saving staged BF16 to {staged}")
+        staged.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(staged, safe_serialization=True)
+        tok.save_pretrained(staged)
+        args._ckpt_staged_ready = True
+        log(f"phase3c: staged save complete ({staged}).")
 
     # ---- Phase 2.5 (Fix C2): AR generation coherence gate ----
     # Compare pruned-NLL of base's canary gens against base's own NLL of the
