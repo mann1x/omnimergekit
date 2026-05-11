@@ -1231,6 +1231,154 @@ def _gen_shape_diagnostic(
     }
 
 
+def _resolve_canary_runtime(args, model, log_fn):
+    """Decide (canary_device, canary_dtype) from CLI knobs + system state.
+
+    `canary_device`: 'gpu' | 'cpu'.  'gpu' implies accelerate offload via
+       dispatch_model with a max_memory map honoring `--canary-gpu-mem-frac`
+       (or the explicit `--canary-gpu-mem-gib`).
+    `canary_dtype`: torch.bfloat16 | torch.float16 | torch.float32.
+       The model is currently in its native save dtype (BF16 for Gemma 4);
+       this function may pick a wider dtype for CPU forwards because BF16
+       CPU matmul in torch<2.6 is single-thread, while FP32 is multi-thread.
+    """
+    import psutil  # stdlib-adjacent; in base pytorch image
+    cuda_ok = torch.cuda.is_available() and torch.cuda.device_count() > 0
+
+    # device
+    if args.canary_device == "auto":
+        canary_dev = "gpu" if cuda_ok else "cpu"
+    elif args.canary_device == "gpu":
+        if not cuda_ok:
+            raise RuntimeError("--canary-device gpu requested but no CUDA device available")
+        canary_dev = "gpu"
+    else:
+        canary_dev = "cpu"
+
+    # dtype
+    DT_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+    native_dtype = next(model.parameters()).dtype
+    if args.canary_dtype != "auto":
+        canary_dtype = DT_MAP[args.canary_dtype]
+    else:
+        if canary_dev == "gpu":
+            canary_dtype = native_dtype  # no upcast cost on GPU, native bf16 is fast
+        else:
+            # CPU: prefer FP32 if RAM allows. n_params × 4B for FP32 + headroom.
+            n_params = sum(p.numel() for p in model.parameters())
+            fp32_need = n_params * 4
+            # Need both the current copy (bf16, 2 bytes) AND the new fp32 view
+            # alive at the same time during in-place .to(dtype). Budget for both.
+            ram_need = fp32_need + n_params * 2
+            ram_have = psutil.virtual_memory().available
+            if ram_have >= int(ram_need * 1.1):
+                canary_dtype = torch.float32
+                log_fn(f"canary dtype=auto → fp32 on CPU "
+                       f"(avail={ram_have/1e9:.1f} GB ≥ need≈{ram_need/1e9:.1f} GB)")
+            else:
+                canary_dtype = native_dtype
+                log_fn(f"canary dtype=auto → bf16 on CPU "
+                       f"(avail={ram_have/1e9:.1f} GB < need≈{ram_need/1e9:.1f} GB for fp32 cast; "
+                       f"single-thread bf16 CPU matmul — consider more RAM or --canary-device gpu)")
+    return canary_dev, canary_dtype
+
+
+def _enter_canary_runtime(args, model, canary_dev, canary_dtype, log_fn):
+    """Move model to (canary_dev, canary_dtype). Returns a `restore()` callable.
+
+    Pairs with _resolve_canary_runtime(). MUST always be followed by restore()
+    in a finally block — saved-weights dtype/placement must match what the
+    safetensors writer expects (bf16/CPU), not whatever the canary used.
+    """
+    orig_dtype = next(model.parameters()).dtype
+    if canary_dtype is not None and canary_dtype != orig_dtype:
+        log_fn(f"canary: casting model {orig_dtype} → {canary_dtype} (in place)")
+        model.to(dtype=canary_dtype)
+
+    if canary_dev == "gpu":
+        from accelerate import dispatch_model, infer_auto_device_map
+        total_vram = torch.cuda.get_device_properties(0).total_memory  # bytes
+        cfg = model.config
+        text_cfg = getattr(cfg, "text_config", cfg)
+        # Canary forward uses BOTH a teacher-forced pass over input+gen AND a
+        # generate() call. Peak per-device budget must hold:
+        #   - resident layer weights (driven by max_memory)
+        #   - full-prompt KV cache for the longest single canary prompt
+        #   - one layer's worth of activations (attention scores + residual)
+        # plus CUDA context overhead. We compute the non-weight floor from
+        # config + canary seq length and subtract it from the frac-budget.
+        # If the user passed --canary-gpu-mem-gib explicitly, that overrides
+        # everything below.
+        def _attr(name, default):
+            for c in (text_cfg, cfg):
+                if hasattr(c, name):
+                    return getattr(c, name)
+            return default
+        num_layers = _attr("num_hidden_layers", 60)
+        num_kv = _attr("num_key_value_heads", _attr("num_attention_heads", 32))
+        num_q  = _attr("num_attention_heads", 32)
+        head_dim = _attr("head_dim", _attr("hidden_size", 5376) // max(num_q, 1))
+        hidden   = _attr("hidden_size", 5376)
+        # Canary sequence length: longest_prompt + n_gen + headroom.
+        # The longest canary prompt is short (~80 tokens, hardcoded in
+        # capture_canary_baseline) but be permissive in case the prompt set
+        # grows. Use a 256-token floor on prompt length.
+        canary_seq_max = max(256, args.canary_n_gen + 256)
+        dtype_bytes = (2 if canary_dtype in (torch.bfloat16, torch.float16) else 4)
+        # KV cache size, bytes (both K and V):
+        kv_bytes = 2 * num_layers * num_kv * head_dim * canary_seq_max * dtype_bytes
+        # Activation peak: attention scores (heads × seq²) for one layer
+        # + residual + intermediate. Hold-out one layer's worth, doubled.
+        act_bytes = 2 * (num_q * (canary_seq_max ** 2) * dtype_bytes
+                         + canary_seq_max * hidden * dtype_bytes * 4)
+        # CUDA context + cuBLAS workspace + accelerate overhead floor.
+        cuda_overhead = 512 * (1 << 20)  # 512 MiB
+
+        if args.canary_gpu_mem_gib is not None:
+            gpu_budget_bytes = int(args.canary_gpu_mem_gib * (1 << 30))
+            calc_note = f"explicit --canary-gpu-mem-gib={args.canary_gpu_mem_gib}"
+        else:
+            frac_cap   = int(total_vram * float(args.canary_gpu_mem_frac))
+            reserve    = kv_bytes + act_bytes + cuda_overhead
+            smart_cap  = max(int(0.50 * total_vram), total_vram - reserve)
+            gpu_budget_bytes = min(frac_cap, smart_cap)
+            calc_note = (f"frac={args.canary_gpu_mem_frac:.2f} → frac_cap={frac_cap/(1<<30):.2f}GiB; "
+                         f"kv={kv_bytes/(1<<20):.0f}MiB act={act_bytes/(1<<20):.0f}MiB "
+                         f"ctx={cuda_overhead/(1<<20):.0f}MiB → smart_cap={smart_cap/(1<<30):.2f}GiB; "
+                         f"chose min")
+        gpu_gib = gpu_budget_bytes / (1 << 30)
+        cpu_mem = args.canary_cpu_mem or args.cpu_mem
+        max_memory = {0: f"{gpu_gib:.2f}GiB", "cpu": cpu_mem}
+        log_fn(f"canary: budgeting GPU={gpu_gib:.2f}/{total_vram/(1<<30):.2f}GiB ({calc_note})")
+        log_fn(f"canary: dispatching to GPU offload "
+               f"(max_memory={max_memory}, dtype={canary_dtype})")
+        device_map = infer_auto_device_map(model, max_memory=max_memory, dtype=canary_dtype)
+        dispatch_model(model, device_map=device_map)
+    else:
+        log_fn(f"canary: running on CPU (dtype={canary_dtype})")
+        model.to("cpu")
+        # Recover CPU multi-thread for forwards even though MKL BF16 won't use
+        # it — FP32 paths will, and other paths (RoPE, RMSNorm, softmax) do.
+        try:
+            n = os.cpu_count() or 1
+            torch.set_num_threads(min(n, 64))
+        except Exception:
+            pass
+
+    def _restore():
+        try:
+            from accelerate.hooks import remove_hook_from_submodules
+            remove_hook_from_submodules(model)
+        except Exception:
+            pass
+        if canary_dtype is not None and canary_dtype != orig_dtype:
+            log_fn(f"canary: casting model back to {orig_dtype} for save")
+            model.to(dtype=orig_dtype)
+        model.to("cpu")
+        torch.cuda.empty_cache()
+    return _restore
+
+
 @torch.no_grad()
 def gen_canary_check(
     model,
@@ -1937,6 +2085,37 @@ def main():
                          "First run captures+writes; subsequent runs with same prompts/n_gen "
                          "load and skip the ~17min capture under accelerate offload on 31B. "
                          "Cache is auto-invalidated if prompts or n_gen differ.")
+    # Phase 2.5 runtime: where & in what dtype the AR canary runs. The recipe
+    # materializes the full BF16 model on CPU before save (phase3a), and prior
+    # to this flag the canary inherited that placement — meaning a 31B model
+    # doing greedy decode strictly single-thread on CPU due to torch<2.6 BF16
+    # CPU matmul falling back to a single MKL thread. On ssh3.vast.ai:10024
+    # 2026-05-11 this turned a 30-90s GPU canary into ~25 minutes of wallclock
+    # at 100% on one core out of 128. These knobs separate canary placement
+    # from save placement.
+    ap.add_argument("--canary-device", choices=["auto", "gpu", "cpu"], default="auto",
+                    help="Where to run the Phase-2.5 AR canary forward + greedy decode. "
+                         "'auto' = GPU with accelerate offload if CUDA is available, else CPU. "
+                         "'gpu' = force GPU offload (errors if unavailable). "
+                         "'cpu' = force CPU (always works; slow on BF16 with torch<2.6 — "
+                         "consider --canary-dtype fp32 to recover multi-thread CPU matmul).")
+    ap.add_argument("--canary-dtype", choices=["auto", "bf16", "fp16", "fp32"], default="auto",
+                    help="Dtype the canary forward uses. 'auto' picks BF16 on GPU (native) and "
+                         "FP32 on CPU if free RAM ≥ 2.2× model size (FP32 CPU matmul is fully "
+                         "multi-threaded in torch, BF16 is not until 2.6), falling back to BF16 "
+                         "when CPU RAM is tight. Manual override for big-model-tight-RAM cases. "
+                         "Cast is reverted to the saved model's native dtype before save.")
+    ap.add_argument("--canary-gpu-mem-frac", type=float, default=0.85,
+                    help="When --canary-device=gpu (or auto-picks gpu), fraction of total VRAM "
+                         "to budget for the canary offload device_map. Defaults to 0.85 "
+                         "(conservative; leaves room for activations + KV cache).")
+    ap.add_argument("--canary-gpu-mem-gib", type=float, default=None,
+                    help="Explicit GPU budget (GiB) for canary offload — overrides "
+                         "--canary-gpu-mem-frac. Use when 0.85×VRAM autocalc is wrong for "
+                         "your model (e.g. 31B on 24 GiB needs explicit 20 GiB to leave KV room).")
+    ap.add_argument("--canary-cpu-mem", default=None,
+                    help="CPU memory budget for canary offload (e.g. '200GiB'). "
+                         "Defaults to --cpu-mem.")
     # T13: LoRA-as-correction heal (alternative to lstsq).
     # T7.7: ar-lstsq — same lstsq math but with AR-distributed (X, Y) target pair.
     # T7.8: noheal — pure mask, no o_proj refit (informed by T13b/T7.6/T7.7 finding
@@ -1960,7 +2139,7 @@ def main():
                     help="(T7.7) Number of calib chunks to use as rollout prefixes for ar-lstsq.")
     ap.add_argument("--ar-rollout-gen", type=int, default=128,
                     help="(T7.7) max_new_tokens for each ar-lstsq rollout. Cap at 32-64 if the "
-                         "student loops fast; 128 works at L4-L7 12.5%.")
+                         "student loops fast; 128 works at L4-L7 12.5%%.")
     ap.add_argument("--ar-rollout-prefix", type=int, default=64,
                     help="(T7.7) Prefix length sliced from each calib chunk before generation. "
                          "Total seq length per sample = prefix + ar-rollout-gen.")
@@ -2812,12 +2991,24 @@ def main():
     if canary_baseline:
         log(f"phase2.5: AR canary check (drift threshold={args.canary_ratio_threshold:.2f}× "
             f"+ shape: n_tokens≥5, rep<0.40, nonp<0.30)")
-        canary_result = gen_canary_check(
-            model, canary_baseline,
-            tokenizer=tok,
-            n_gen=args.canary_n_gen,
-            ratio_threshold=args.canary_ratio_threshold,
+        # Resolve canary runtime (device + dtype) per CLI knobs. This is
+        # decoupled from the save placement (BF16/CPU) — phase3a already did
+        # the save-side move; canary may legitimately re-disperse to GPU offload
+        # or upcast to FP32 to recover multi-thread CPU matmul. Always
+        # reverted before save_pretrained() further below.
+        _can_dev, _can_dtype = _resolve_canary_runtime(args, model, log)
+        _restore_after_canary = _enter_canary_runtime(
+            args, model, _can_dev, _can_dtype, log
         )
+        try:
+            canary_result = gen_canary_check(
+                model, canary_baseline,
+                tokenizer=tok,
+                n_gen=args.canary_n_gen,
+                ratio_threshold=args.canary_ratio_threshold,
+            )
+        finally:
+            _restore_after_canary()
         for p in canary_result["per_prompt"]:
             sh = p["shape"]
             fails = ",".join(k for k, v in p["fails"].items() if v) or "OK"
