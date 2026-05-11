@@ -1532,10 +1532,28 @@ def _enter_canary_runtime(args, model, canary_dev, canary_dtype, log_fn):
             if not (n in device_map or n.startswith(mapped_prefixes))
         ]
         if missing:
-            log_fn(f"canary: device_map missing {len(missing)} item(s); "
-                   f"placing on cpu (e.g. {missing[:3]})")
+            # Wrong fix (b78e16a → ed3f01d era): "place on cpu". That breaks
+            # decoder forwards like `hidden_states *= self.layer_scalar` —
+            # hidden_states lives on the parent layer's device. Right fix:
+            # walk each missing item to its longest-prefix module in
+            # device_map and inherit THAT device. Fallback to cpu only when
+            # no ancestor is mapped (rare; would mean the whole model is
+            # un-mapped which we'd never produce).
+            def _device_from_parents(name):
+                parts = name.split(".")
+                for i in range(len(parts) - 1, 0, -1):
+                    prefix = ".".join(parts[:i])
+                    if prefix in device_map:
+                        return device_map[prefix]
+                return "cpu"
+            sample = []
             for n in missing:
-                device_map[n] = "cpu"
+                dev = _device_from_parents(n)
+                device_map[n] = dev
+                if len(sample) < 3:
+                    sample.append(f"{n}→{dev}")
+            log_fn(f"canary: device_map missing {len(missing)} item(s); "
+                   f"placing each on its parent module's device (e.g. {sample})")
         dispatch_model(model, device_map=device_map)
     else:
         log_fn(f"canary: running on CPU (dtype={canary_dtype})")
