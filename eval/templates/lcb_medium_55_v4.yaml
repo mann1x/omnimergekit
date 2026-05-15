@@ -1,0 +1,52 @@
+# LiveCodeBench-medium "full pool" subset — variant: v4 / 98e pruned models.
+#
+# Rationale (2026-05-13):
+#   The canonical no-parser recipe (used by lcb_medium_55.yaml) scores 128e
+#   50/55 = 90.91% but breaks on v4 (98e pruned). v4 enters rumination loops
+#   on hard problems (e.g. lcb/leetcode/3566 → 53k chars, finish=length,
+#   63 duplicate ```python fences) without a thinking-budget forcing
+#   function. Direct comparison on 3566:
+#
+#     v4 Q6_K (llama.cpp, no parser):           PASS, 1247 chars, 4.7s
+#     v4 NVFP4A16 (vLLM, no parser):            FAIL, 53556 chars, length-cap, rumination
+#     v4 NVFP4A16 (vLLM, parser+budget=12288):  PASS (per prior 36/55 = 65.45% run)
+#
+# So vLLM-NVFP4A16 on v4 needs parser=gemma4 + enable_thinking=true +
+# thinking_token_budget=12288 to behave like the llama.cpp Q6_K baseline.
+# 128e, in contrast, regresses with that recipe (50/55 → ~25% rumination)
+# because its higher capacity makes the explicit thinking branch over-cook
+# the output. Recipe is therefore ASYMMETRIC per variant.
+#
+# This template is selected by eval_suite_vllm.sh when --variant=v4 (or any
+# pruned variant); 128e keeps lcb_medium_55.yaml.
+name: lcb_medium_55_v4
+backend: lcb_custom
+task: livecodebench
+n: 55
+selection:
+  type: filter
+  difficulty: medium
+  min_date: "2024-10-01"
+  testtype: functional
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288   # forcing-function: prevents v4 rumination loops
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 1200
+scoring:
+  scorer: lcb_helpers
+  validated_against: lcb_runner.evaluation.testing_util.grade_call_based
+  validation_date: "2026-05-13"
+  validation_n_samples: 0          # to be filled after this run completes
+backend_args:
+  apply_chat_template: true
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+  num_concurrent: 2
+cache:
+  sqlite_prefix: lcb_med_55_v4
+reports:
+  token_stats: true

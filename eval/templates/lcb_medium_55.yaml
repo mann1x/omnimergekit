@@ -1,0 +1,51 @@
+# LiveCodeBench-medium "full pool" subset:
+#   difficulty=medium, contest_date >= 2024-10-01, testtype=functional.
+# Yields exactly 55 problems against the current livecodebench/code_generation_lite
+# dataset (test*.jsonl shards) — the same set MicroCoder reports.
+name: lcb_medium_55
+backend: lcb_custom
+task: livecodebench
+n: 55
+selection:
+  type: filter
+  difficulty: medium
+  min_date: "2024-10-01"
+  testtype: functional
+generation:
+  max_gen_toks: 16384
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  # NVFP4A16 Gemma 4 on a 3090 sustains ~22 tok/s. max_gen_toks/throughput
+  # ≈ 745 s worst case; padded to 1200 s to absorb prefill + jitter. The
+  # 600 s default in lcb_llama_server.py caused 3 ReadTimeouts in a 23/55
+  # in-flight run on 2026-05-12. Raise if a slower backend keeps capping.
+  http_timeout: 1200
+scoring:
+  scorer: lcb_helpers
+  validated_against: lcb_runner.evaluation.testing_util.grade_call_based
+  validation_date: "2026-05-12"
+  validation_n_samples: 13
+  validation_agreement: "13/13"
+backend_args:
+  apply_chat_template: true
+  # NO reasoning parser, NO enable_thinking. The model reasons INLINE as
+  # compact prose and emits a single clean ```python``` block. This matches
+  # the canonical 2026-05-12 run that scored 128e 50/55 = 90.91%.
+  #
+  # 2026-05-13: a prior template revision enabled parser=gemma4 +
+  # enable_thinking=true + thinking_token_budget=12288 for fingerprint
+  # grouping with the math benches. That produced rumination loops on LCB
+  # (30-50k chars, 99 duplicate code fences, finish_reason=length) and
+  # collapsed 128e to ~25%. Do NOT re-enable parser on LCB.
+  #
+  # enable_thinking: false is set explicitly so this template's fingerprint
+  # matches arc_challenge_full (parser='', enable_thinking=false), keeping
+  # the suite at 2 fingerprint groups (math-set + non-reasoning-set).
+  vllm_default_chat_template_kwargs: {enable_thinking: false}
+  num_concurrent: 2
+cache:
+  sqlite_prefix: lcb_med_55
+reports:
+  token_stats: true

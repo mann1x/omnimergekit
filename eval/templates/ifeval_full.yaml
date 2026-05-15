@@ -1,0 +1,37 @@
+# IFEval — full 541 prompts. Measures instruction-following compliance via
+# rule-based verifiers (no model judge). Reports prompt-level + instruction-
+# level strict/loose accuracy; canonical card metric is `prompt_level_strict_acc`.
+name: ifeval_full
+backend: lm-eval
+task: ifeval
+n: 541
+selection:
+  type: filter
+  all: true
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288    # 2026-05-12: clip Gemma 4 reasoning loops; see EVAL_PROTOCOL §3
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: prompt_level_strict_acc
+  filter: none
+  validated_against: google/ifeval
+  validation_date: "2026-05-12"
+sanity:
+  # IFEval prompts legitimately produce short answers (one-sentence replies,
+  # "Yes."/"No.", JSON snippets, etc.). The default p10>=60 threshold flags
+  # benign cases. Relax to a minimal non-empty threshold for this bench.
+  min_p10_chars: 5
+backend_args:
+  apply_chat_template: true
+  num_fewshot: 0
+  batch_size: 1
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: ifeval_full
+reports:
+  token_stats: true

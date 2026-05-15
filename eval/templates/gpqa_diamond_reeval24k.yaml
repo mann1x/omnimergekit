@@ -1,0 +1,33 @@
+# GPQA Diamond — full 198-question set. Matches the canonical eval used for
+# 109e/98e/v3 GPQA numbers. Uses GPQA chain-of-thought zero-shot, deepseek
+# reasoning format (when supported by backend).
+name: gpqa_diamond_reeval24k
+backend: lm-eval
+task: gpqa_diamond_reeval24k
+n: 198
+selection:
+  type: filter
+  all: true
+generation:
+  max_gen_toks: 49152       # re-eval: bumped from 16384 to fit thinking@24k + answer headroom
+  thinking_token_budget: 24576    # re-eval: bumped from 12288 for fair retry of length-capped problems
+  temperature: 0.6                # canonical GPQA sampler
+  top_p: 0.95
+  top_k: 20
+  do_sample: true
+scoring:
+  metric: exact_match
+  filter: flexible-extract
+  validated_against: idavidrein/gpqa
+  validation_date: "2026-05-12"
+backend_args:
+  lm_eval_include_path: lm_eval_tasks  # recursive — discovers reeval24k/
+  apply_chat_template: true
+  num_fewshot: 0
+  batch_size: 1
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: gpqa_diamond_reeval24k
+reports:
+  token_stats: true

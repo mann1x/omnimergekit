@@ -1,0 +1,45 @@
+# GSM8K — 100 deterministic indices, evenly spaced across the 1319-row test
+# split. Stride = 13 (1319/100 ≈ 13.19) so the picks cover the test set
+# uniformly without bias to early/late ids.
+#
+# Indices: 0, 13, 26, ..., 1287 → exactly 100 picks, no duplicates, last <1319.
+# Frozen — do not regenerate at runtime so eval is bit-exactly reproducible
+# even if upstream re-shuffles.
+name: gsm8k_100
+backend: lm-eval
+task: gsm8k
+n: 100
+selection:
+  type: indices
+  indices: [0, 13, 26, 39, 52, 65, 78, 91, 104, 117,
+            130, 143, 156, 169, 182, 195, 208, 221, 234, 247,
+            260, 273, 286, 299, 312, 325, 338, 351, 364, 377,
+            390, 403, 416, 429, 442, 455, 468, 481, 494, 507,
+            520, 533, 546, 559, 572, 585, 598, 611, 624, 637,
+            650, 663, 676, 689, 702, 715, 728, 741, 754, 767,
+            780, 793, 806, 819, 832, 845, 858, 871, 884, 897,
+            910, 923, 936, 949, 962, 975, 988, 1001, 1014, 1027,
+            1040, 1053, 1066, 1079, 1092, 1105, 1118, 1131, 1144, 1157,
+            1170, 1183, 1196, 1209, 1222, 1235, 1248, 1261, 1274, 1287]
+generation:
+  max_gen_toks: 16384       # bumped 2026-05-12: reasoning models (Gemma 4) need headroom; cap is upper bound, not target
+  thinking_token_budget: 12288    # 2026-05-12: clip Gemma 4 reasoning loops; see EVAL_PROTOCOL §3
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: exact_match
+  filter: flexible-extract
+  validated_against: openai/grade-school-math
+  validation_date: "2026-05-12"
+backend_args:
+  apply_chat_template: true
+  num_fewshot: 5
+  batch_size: 1
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: gsm8k_100
+reports:
+  token_stats: true

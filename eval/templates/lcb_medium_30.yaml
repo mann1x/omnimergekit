@@ -1,0 +1,38 @@
+# LiveCodeBench-medium 30-problem subset: first 30 of LCB-medium-55 in
+# the natural order produced by load_lcb() (test.jsonl..test6.jsonl, post
+# 2024-10-01, functional). MicroCoder's headline LCB-30 number is this set.
+#
+# This template uses indices-mode against the LCB-55 base set rather than
+# raw dataset indices, because LCB packs problems across shards. The
+# `selection.indices` here are interpreted by lcb_helpers.load_lcb after the
+# filter is applied (0..54 in load order).
+name: lcb_medium_30
+backend: lcb_custom
+task: livecodebench
+n: 30
+selection:
+  type: filter
+  difficulty: medium
+  min_date: "2024-10-01"
+  testtype: functional
+  # Post-filter slice, deterministic by load order.
+  post_filter_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+                        10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                        20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
+generation:
+  max_gen_toks: 16384
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 1200
+scoring:
+  scorer: lcb_helpers
+  validated_against: lcb_runner.evaluation.testing_util.grade_call_based
+  validation_date: "2026-05-12"
+backend_args:
+  apply_chat_template: true
+cache:
+  sqlite_prefix: lcb_med_30
+reports:
+  token_stats: true

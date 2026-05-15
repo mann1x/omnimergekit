@@ -1,0 +1,42 @@
+# ARC-Challenge — full 1172 test items, chat-completions variant.
+# Chat path is required for instruction-tuned models (raw completions can
+# emit explanatory prose ahead of the letter answer and break the regex).
+name: arc_challenge_full
+backend: lm-eval
+task: arc_challenge_full_chat   # chat-aware shadow; see lm_eval_tasks/arc_challenge_chat/
+n: 1172
+selection:
+  type: filter
+  all: true
+generation:
+  max_gen_toks: 16384         # MCQ → model usually emits a short letter; cap unused but per spec
+  thinking_token_budget: 12288    # 2026-05-12: clip Gemma 4 reasoning loops; see EVAL_PROTOCOL §3
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: exact_match
+  filter: flexible-extract
+  validated_against: allenai/ai2_arc
+  validation_date: "2026-05-12"
+sanity:
+  # ARC-Challenge answers are a single letter (or letter + brief justification).
+  # Default p10>=60 threshold is too strict for this bench.
+  min_p10_chars: 1
+backend_args:
+  apply_chat_template: true
+  num_fewshot: 0
+  batch_size: 1
+  # ARC-Challenge is MCQ: model needs to emit a single letter as the final
+  # answer. With enable_thinking=true the model reasons silently in the
+  # channel and the chat-completions `content` field ends up empty (resps
+  # are all-blank → exact_match=0). Validated empirically on 128e 2026-05-12.
+  # Run without parser/thinking so the answer goes straight into `content`.
+  vllm_reasoning_parser: ""
+  vllm_default_chat_template_kwargs: {enable_thinking: false}
+  lm_eval_include_path: lm_eval_tasks/arc_challenge_chat
+cache:
+  sqlite_prefix: arc_challenge_full
+reports:
+  token_stats: true

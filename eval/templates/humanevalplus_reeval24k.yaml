@@ -1,0 +1,36 @@
+# HumanEvalPlus — full 164 problems with the enriched/stricter test suite
+# from evalplus. Counts vs HumanEval as a tighter check.
+name: humanevalplus_reeval24k
+backend: lm-eval
+# `humaneval_plus_chat` is our chat-completions friendly override (lives under
+# eval/lm_eval_tasks/humaneval_chat/) — see utils_chat.py for rationale.
+# Same fix as humaneval_chat but on the evalplus stricter test suite
+# (dataset: evalplus/humanevalplus).
+task: humanevalplus_reeval24k
+n: 164
+selection:
+  type: filter
+  all: true
+generation:
+  max_gen_toks: 49152       # re-eval: bumped from 16384 to fit thinking@24k + answer headroom
+  thinking_token_budget: 24576    # re-eval: bumped from 12288 for fair retry of length-capped problems
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: pass_at_1
+  validated_against: evalplus/humanevalplus
+  validation_date: "2026-05-12"
+backend_args:
+  lm_eval_include_path: lm_eval_tasks  # recursive — picks up reeval24k/ + any sibling shadow
+  apply_chat_template: true
+  num_fewshot: 0
+  batch_size: 1
+  confirm_run_unsafe_code: true
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: humanevalplus_reeval24k
+reports:
+  token_stats: true

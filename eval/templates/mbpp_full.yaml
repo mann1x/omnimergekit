@@ -1,0 +1,28 @@
+# MBPP — full 500-problem test split. Matches the published Gemma 4 31B he1
+# model card baseline (Q6_K llama.cpp 85.00%).
+name: mbpp_full
+backend: lm-eval
+task: mbpp
+n: 500
+selection:
+  type: filter   # full split — no per-row filtering
+  all: true
+generation:
+  max_gen_toks: 16384       # bumped 2026-05-12: reasoning models (Gemma 4) need headroom; cap is upper bound, not target
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: pass_at_1
+  validated_against: google-research/mbpp
+  validation_date: "2026-05-12"
+backend_args:
+  apply_chat_template: true
+  num_fewshot: 3                  # MBPP convention is 3-shot
+  batch_size: 1
+  confirm_run_unsafe_code: true
+cache:
+  sqlite_prefix: mbpp_full
+reports:
+  token_stats: true
