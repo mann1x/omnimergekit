@@ -27,6 +27,6 @@ gguf==0.18.0                  # for Python-side GGUF inspection
 
 # General utils
 tqdm==4.67.3
-requests==2.32.5
+requests>=2.33.0              # >=2.33.0 closes CVE-2026-25645 (extract_zipped_paths temp-file reuse); omk doesn't call that function but pin keeps dependabot quiet
 fire>=0.5.0                   # used by some pod helpers
 PyYAML>=6.0
