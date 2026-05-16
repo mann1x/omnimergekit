@@ -1,9 +1,9 @@
 # Auto-extracted LCB helpers from Mythic-RDT/humaneval_smoke.py
 from __future__ import annotations
-import json, re, sys, time, signal, multiprocessing as mp
-from dataclasses import dataclass, asdict
-from pathlib import Path
-from huggingface_hub import hf_hub_download
+
+import json
+import multiprocessing as mp
+import re
 
 FENCED_BLOCK_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 
@@ -106,17 +106,40 @@ def load_lcb(limit: int, difficulty: str = "medium",
     return out
 
 def clean_lcb_completion(completion: str, starter_code: str) -> str:
-    """Extract the Solution class from a fenced block; fall back to raw."""
-    m = FENCED_BLOCK_RE.search(completion)
-    if m:
-        return m.group(1)
-    # No fence found; strip trailing fence if partial, return as-is.
+    """Extract the Solution class — official LCB semantics: last fence pair.
+
+    Official LCB (lcb_runner/utils/extraction_utils.py:extract_code) splits by
+    line, locates all lines containing ```, and returns the slice between the
+    LAST TWO fence-containing lines. We do the same to avoid penalizing
+    models (Gemma 4 in particular) that emit a first-attempt then a corrected
+    rewrite — first-fence-wins systematically picks the wrong block.
+    """
+    lines = completion.split("\n")
+    idx = [i for i, line in enumerate(lines) if "```" in line]
+    if len(idx) >= 2:
+        return "\n".join(lines[idx[-2] + 1 : idx[-1]])
+    # No fence pair found; strip trailing partial fence and return as-is.
     return TRAILING_FENCE_RE.sub("", completion)
+
+def _parse_io(s: str):
+    """Parse an LCB input/output string with official LCB semantics:
+    json.loads first (handles JSON true/false/null and lists/dicts/numbers),
+    fall back to ast.literal_eval for legacy Python-literal-encoded values,
+    and finally return the raw string when neither parses."""
+    import ast as _ast
+    try:
+        return json.loads(s)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    try:
+        return _ast.literal_eval(s)
+    except (ValueError, SyntaxError):
+        return s
+
 
 def _score_lcb_worker(code: str, tests: list, method_name: str, q):
     """Run inside child process. Imports are inside the function so they
     survive the fork in subprocesses without re-importing module globals."""
-    import ast as _ast
     try:
         # Pre-populate namespace with common typing + stdlib symbols so
         # starter_code with `List[int]`, `Optional[str]`, etc. exec()s without
@@ -140,36 +163,32 @@ def _score_lcb_worker(code: str, tests: list, method_name: str, q):
         for i, t in enumerate(tests):
             inp_str = (t.get("input") or "").strip()
             exp_str = (t.get("output") or "").strip()
-            # LCB encodes input as Python literals. Two formats observed:
-            #   - Single-line: the WHOLE string is one arg literal (e.g.
-            #     "[1,2,3]" means one List[int] arg, NOT three int args).
-            #   - Multi-line: each line is one positional arg literal.
+            # LCB encodes IO as JSON (official semantics: json.loads). Two
+            # input formats observed:
+            #   - Single-line: the WHOLE string is one arg (e.g. "[1,2,3]"
+            #     means one List[int] arg).
+            #   - Multi-line: each line is one positional arg.
             if "\n" in inp_str:
                 args = []
                 for line in inp_str.splitlines():
                     line = line.strip()
                     if not line:
                         continue
-                    try:
-                        args.append(_ast.literal_eval(line))
-                    except (ValueError, SyntaxError):
-                        args.append(line)
+                    args.append(_parse_io(line))
                 args = tuple(args)
             else:
-                try:
-                    args = (_ast.literal_eval(inp_str),)
-                except (ValueError, SyntaxError):
-                    args = (inp_str,)
-            try:
-                expected = _ast.literal_eval(exp_str)
-            except (ValueError, SyntaxError):
-                expected = exp_str
+                args = (_parse_io(inp_str),)
+            expected = _parse_io(exp_str)
             sol = Solution()
             method = getattr(sol, method_name, None)
             if method is None:
                 q.put(("fail", f"Solution has no method `{method_name}`"))
                 return
             result = method(*args)
+            # Tuple→list coercion (official LCB: "don't penalize models for
+            # returning tuples where the ground truth is a list").
+            if isinstance(result, tuple):
+                result = list(result)
             if result != expected:
                 q.put(("fail",
                        f"test {i}: got {result!r} expected {expected!r}"))

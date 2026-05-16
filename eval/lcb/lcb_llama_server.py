@@ -55,12 +55,22 @@ except ImportError:
 
 
 def chat_complete(base_url: str, model: str, prompt: str, max_tokens: int,
-                  timeout: float = 600.0) -> dict:
+                  timeout: float = 600.0,
+                  thinking_budget: int | None = None,
+                  enable_thinking: bool | None = None) -> dict:
     """Returns dict {text, prompt_tokens, completion_tokens, finish_reason}.
 
     `finish_reason="length"` is the cap-hit fingerprint — that response was
     truncated mid-generation and is unlikely to score correctly. The caller
     should propagate this so audits can distinguish capability from truncation.
+
+    When `thinking_budget` is set and the vLLM server is configured with
+    `--reasoning-parser gemma4` (or similar), vLLM force-transitions the
+    model from thinking to answer phase at that token count. Without this,
+    Gemma 4 instruct can think for the full `max_tokens` window and never
+    emit a parseable answer (parser sees an unclosed thinking block and
+    drops both content+reasoning → 75% empty FAIL rate observed
+    2026-05-13 on 128e LCB-55).
     """
     payload = {
         "model": model,
@@ -70,6 +80,17 @@ def chat_complete(base_url: str, model: str, prompt: str, max_tokens: int,
         "max_tokens": max_tokens,
         "stream": False,
     }
+    # vLLM /v1/chat/completions accepts extra SamplingParams as TOP-LEVEL
+    # JSON fields (matching how the OpenAI Python SDK auto-forwards unknown
+    # kwargs via extra_body — they end up at the JSON root). Match that
+    # contract: thinking_token_budget at root, enable_thinking inside
+    # chat_template_kwargs (it's a template flag, not a sampling param).
+    if enable_thinking is not None:
+        payload["chat_template_kwargs"] = {
+            "enable_thinking": bool(enable_thinking),
+        }
+    if thinking_budget is not None and thinking_budget > 0:
+        payload["thinking_token_budget"] = int(thinking_budget)
     r = requests.post(f"{base_url}/v1/chat/completions",
                       json=payload, timeout=timeout)
     r.raise_for_status()
@@ -81,7 +102,11 @@ def chat_complete(base_url: str, model: str, prompt: str, max_tokens: int,
     # whichever is non-empty; if both are populated, concatenate them so
     # clean_lcb_completion can extract a fenced code block from either.
     content = msg.get("content") or ""
-    reasoning = msg.get("reasoning_content") or ""
+    # vLLM emits the reasoning trace under `reasoning` (newer builds) or
+    # `reasoning_content` (older / llama-server / some configs). Read both
+    # and prefer whichever is non-empty. Validated 2026-05-13 on vLLM 0.1.dev16519
+    # with --reasoning-parser gemma4 → field name is `reasoning`.
+    reasoning = msg.get("reasoning") or msg.get("reasoning_content") or ""
     if content and reasoning:
         text = reasoning + "\n" + content
     else:
@@ -136,6 +161,27 @@ def main():
                          "Re-runs skip problems already cached here.")
     ap.add_argument("--no-resume", action="store_true",
                     help="Ignore existing cache; regenerate every problem.")
+    ap.add_argument("--thinking-budget", type=int, default=0,
+                    help="vLLM thinking_token_budget cap (0=disabled). Mandatory "
+                         "for Gemma 4 + --reasoning-parser gemma4 — without it "
+                         "the model can think past max_tokens and the parser "
+                         "drops both content+reasoning (empty FAIL).")
+    ap.add_argument("--enable-thinking", default="",
+                    help="Forward chat_template_kwargs.enable_thinking "
+                         "('true'/'false'/empty for unset).")
+    ap.add_argument("--early-abort-after", type=int, default=5,
+                    help="In-flight sanity: after this many fresh problems "
+                         "(uncached), abort if pass rate is 0 AND >=80%% "
+                         "have chars=0 (empty response) OR finish_reason=length. "
+                         "Saves hours when thinking budget / parser is misconfigured. "
+                         "Set 0 to disable.")
+    ap.add_argument("--http-timeout", type=float, default=900.0,
+                    help="Per-request HTTP read timeout (seconds). vLLM "
+                         "NVFP4A16 Gemma 4 generates at ~22 tok/s on a "
+                         "3090 — with max_tokens=16384 a single long "
+                         "reasoning trace can take ~760s. Was 600 (too "
+                         "tight for the slow quant); now 900 default. "
+                         "Set higher when seeing recurring ReadTimeouts.")
     args = ap.parse_args()
 
     out_path = Path(args.output)
@@ -159,6 +205,12 @@ def main():
     n_pass = 0
     per_problem = []
     t0 = time.time()
+    # In-flight sanity counters — fresh = uncached problems generated this run.
+    fresh_total = 0
+    fresh_pass = 0
+    fresh_empty = 0
+    fresh_lenhit = 0
+    early_abort = False
 
     for i, prob in enumerate(problems):
         tid = prob["task_id"]
@@ -187,8 +239,16 @@ def main():
         prompt_tokens = completion_tokens = None
         finish_reason = None
         try:
+            et = None
+            if args.enable_thinking.lower() in ("true", "1", "yes"):
+                et = True
+            elif args.enable_thinking.lower() in ("false", "0", "no"):
+                et = False
             resp = chat_complete(args.base_url, args.name, prompt,
-                                 args.max_tokens)
+                                 args.max_tokens,
+                                 timeout=args.http_timeout,
+                                 thinking_budget=args.thinking_budget or None,
+                                 enable_thinking=et)
             completion = resp["text"]
             prompt_tokens = resp["prompt_tokens"]
             completion_tokens = resp["completion_tokens"]
@@ -239,6 +299,31 @@ def main():
               f"chars={len(completion)}  running={n_pass}/{i+1}",
               flush=True)
 
+        # In-flight sanity: count this fresh (uncached) problem's outcome.
+        # When `fresh_total` reaches `--early-abort-after`, abort if the
+        # signature looks like an infra failure (all empty / all length-cap)
+        # rather than letting the chain burn hours on a broken config.
+        fresh_total += 1
+        if passed:
+            fresh_pass += 1
+        if len(completion) == 0:
+            fresh_empty += 1
+        if finish_reason == "length":
+            fresh_lenhit += 1
+        if (args.early_abort_after and fresh_total >= args.early_abort_after
+                and fresh_pass == 0
+                and (fresh_empty / fresh_total >= 0.8
+                     or fresh_lenhit / fresh_total >= 0.8)):
+            print(f"\n[lcb] EARLY ABORT after {fresh_total} fresh problems:\n"
+                  f"  pass=0   empty={fresh_empty}/{fresh_total}"
+                  f"   length_cap={fresh_lenhit}/{fresh_total}\n"
+                  f"  → likely infra/parser/budget bug, not a model bug.\n"
+                  f"  Check: --thinking-budget, --enable-thinking,\n"
+                  f"  vLLM --reasoning-parser, response field name (reasoning\n"
+                  f"  vs reasoning_content).", flush=True)
+            early_abort = True
+            break
+
     cache_fp.close()
 
     pass_at_1 = n_pass / len(problems)
@@ -260,6 +345,10 @@ def main():
             "per_problem": per_problem,
         }, f, indent=2)
     print(f"[lcb] wrote {out_path}  (cache: {cache_path})")
+    # Distinct exit code for early abort so omk_eval / the chain script can
+    # surface it as "infra failure" (vs "model failure") in summaries.
+    if early_abort:
+        sys.exit(60)
 
 
 if __name__ == "__main__":

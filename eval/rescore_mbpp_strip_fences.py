@@ -67,7 +67,8 @@ def run_program(program: str, timeout: float) -> tuple[bool, str]:
     p.start()
     p.join(timeout=timeout)
     if p.is_alive():
-        p.terminate(); p.join(1.0)
+        p.terminate()
+        p.join(1.0)
         if p.is_alive():
             p.kill()
         return False, "timeout"
@@ -102,7 +103,7 @@ def main() -> int:
         print(f"ERR samples missing: {args.samples}", file=sys.stderr)
         return 2
 
-    rows = [json.loads(l) for l in args.samples.open()]
+    rows = [json.loads(line) for line in args.samples.open()]
     if args.limit:
         rows = rows[: args.limit]
     total = len(rows)
