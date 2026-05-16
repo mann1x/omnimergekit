@@ -1,0 +1,48 @@
+# LCB-medium 5-problem longer smoke. Filter selects first 5 medium
+# problems since 2024-10-01 (deterministic by date). The 5 problems
+# this resolves to — lcb/leetcode/{3579, 3566, 3502, 3593, 3629} —
+# are ALL 128e-NVFP4A16 PASS (verified against
+# eval_results_vllm_suite/128e/lcb_medium_55/128e_nvfp4a16/lcb_result.samples.jsonl
+# 2026-05-16; 128e LCB-55 = 49/55, first 128e-FAIL is task_id 3607
+# which appears at position 6+ by date).
+#
+# Smoke property: every problem is a verified-pass for unpruned
+# baseline, so a variant FAIL is signal (pruning damage), not noise
+# (universally-hard problem). The shim does not expose a --task-ids
+# flag, so this template depends on the date-order accident; the
+# guarantee will need re-verification if LCB-medium contest_date
+# ordering changes upstream.
+#
+# Sits between lcb_medium_1_smoke (canary) and lcb_medium_30 / 55
+# (full). Same parser+thinking_budget+http_timeout recipe as
+# lcb_medium_55_v4 (validated for Gemma 4 pruned variants).
+name: lcb_medium_5
+backend: lcb_custom
+task: livecodebench
+n: 5
+selection:
+  type: filter
+  difficulty: medium
+  min_date: "2024-10-01"
+  testtype: functional
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 1200
+scoring:
+  scorer: lcb_helpers
+  validated_against: lcb_runner.evaluation.testing_util.grade_call_based
+  validation_date: "2026-05-16"
+backend_args:
+  apply_chat_template: true
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+  num_concurrent: 1
+cache:
+  sqlite_prefix: lcb_med_5
+reports:
+  token_stats: true

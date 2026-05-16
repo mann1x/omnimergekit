@@ -1,0 +1,54 @@
+# GSM8K longer-smoke filtered to 128e-NVFP4A16 BOTH-filters PASS subset.
+# Subset of the canonical gsm8k_100 stride-13 indices, with the 5 indices
+# where 128e failed on either strict-match or flexible-extract removed:
+# excluded test-split indices [156, 195, 312, 546, 676] (5 indices).
+#
+# Result: 95 questions, every one a verified 128e PASS on the current
+# vLLM recipe (parser=gemma4 + thinking_budget=12288 + apply_chat_template).
+# A variant FAIL on any of these is signal (pruning damage), not noise
+# (universally-hard problem).
+#
+# Selection date: 2026-05-16 against
+# eval_results_vllm_suite/128e/gsm8k_100/128e_nvfp4a16/lm_eval_out/128e_nvfp4a16/samples_gsm8k_2026-05-13T19-03-14.763265.jsonl
+# (95/100 BOTH-pass on canonical stride-13 sample).
+#
+# Used by v5fixed sweep T18 candidate longer-smoke validation. Sits
+# between gsm8k_30 (smoke) and gsm8k_100 (full longer-smoke).
+name: gsm8k_v128pass
+backend: lm-eval
+task: gsm8k
+n: 95
+selection:
+  type: indices
+  indices: [0, 13, 26, 39, 52, 65, 78, 91, 104, 117,
+            130, 143, 169, 182, 208, 221, 234, 247, 260, 273,
+            286, 299, 325, 338, 351, 364, 377, 390, 403, 416,
+            429, 442, 455, 468, 481, 494, 507, 520, 533, 559,
+            572, 585, 598, 611, 624, 637, 650, 663, 689, 702,
+            715, 728, 741, 754, 767, 780, 793, 806, 819, 832,
+            845, 858, 871, 884, 897, 910, 923, 936, 949, 962,
+            975, 988, 1001, 1014, 1027, 1040, 1053, 1066, 1079, 1092,
+            1105, 1118, 1131, 1144, 1157, 1170, 1183, 1196, 1209, 1222,
+            1235, 1248, 1261, 1274, 1287]
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: exact_match
+  filter: flexible-extract
+  validated_against: openai/grade-school-math
+  validation_date: "2026-05-12"
+backend_args:
+  apply_chat_template: true
+  num_fewshot: 5
+  batch_size: 1
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: gsm8k_v128pass
+reports:
+  token_stats: true
