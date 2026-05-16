@@ -208,8 +208,9 @@ def layer_attn_geom(model, idx: int) -> tuple[int, int, int, str]:
 #                  after each layer's prune_q + heal completes. Disk: ~300 MB/layer
 #                  bf16 × 60 ≈ 18 GB. Enabled by default when --checkpoint-dir is set.
 #   (C) staged/  — full BF16 model.save_pretrained() AFTER phase3b reshape but BEFORE
-#                  the AR canary. Disk: ~62 GB. Enabled with --save-before-canary.
-#                  Resume detects this and skips straight to phase 2.5; saves the
+#                  the AR canary. Disk: ~62 GB. ALWAYS ON when --checkpoint-dir is set
+#                  (which is mandatory since 2026-05-15) — there is no flag to disable
+#                  it. Resume detects this and skips straight to phase 2.5; saves the
 #                  ~1-2 h of phase 0+2 work when the canary itself stalls/dies.
 #
 # Manifest (manifest.json) carries a fingerprint hashed from the run's load-bearing
@@ -1472,6 +1473,79 @@ def _resolve_canary_runtime(args, model, log_fn):
     return canary_dev, canary_dtype
 
 
+def _resolve_canary_quant(args, model, log_fn) -> str:
+    """Decide whether to load a bnb 4-bit nf4 copy for the canary.
+
+    Returns 'nf4' or 'none'. 'auto' (default) picks 'nf4' when the BF16
+    model is too big to fit in VRAM with reasonable headroom (>0.85 × total
+    device memory), which is the regime where accelerate offload effectively
+    runs canary at CPU speed (he1v2 / pod 36755693 / 2026-05-15 incident).
+    """
+    if args.canary_quant == "none":
+        return "none"
+    cuda_ok = torch.cuda.is_available() and torch.cuda.device_count() > 0
+    if args.canary_quant == "nf4":
+        if not cuda_ok:
+            raise RuntimeError("--canary-quant nf4 requires a CUDA device")
+        return "nf4"
+    # auto: estimate model size and compare to VRAM budget
+    if not cuda_ok:
+        log_fn("canary-quant=auto → none (no CUDA → bnb 4-bit unavailable)")
+        return "none"
+    n_params = sum(p.numel() for p in model.parameters())
+    # In-memory dtype may differ from save dtype; assume bf16 floor (2 bytes/param)
+    bf16_bytes = n_params * 2
+    total_vram = torch.cuda.get_device_properties(0).total_memory
+    budget = total_vram * 0.85
+    if bf16_bytes > budget:
+        log_fn(f"canary-quant=auto → nf4 "
+               f"(bf16 {bf16_bytes/1e9:.1f} GB > 0.85×VRAM {budget/1e9:.1f} GB)")
+        return "nf4"
+    log_fn(f"canary-quant=auto → none "
+           f"(bf16 {bf16_bytes/1e9:.1f} GB ≤ 0.85×VRAM {budget/1e9:.1f} GB; native dtype fits)")
+    return "none"
+
+
+def _load_canary_view_bnb_nf4(model_path: str, log_fn):
+    """Load a fresh bnb 4-bit nf4 copy from disk for canary use.
+
+    The caller is responsible for `del model; torch.cuda.empty_cache()` after.
+    Returns (model, tokenizer). Compute dtype = bf16 (Gemma 4 native).
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+    )
+    log_fn(f"canary: bnb-nf4 loading {model_path} (compute=bf16, full-GPU)")
+    t0 = time.time()
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        quantization_config=bnb_config,
+        device_map="cuda:0",
+        trust_remote_code=True,
+    )
+    model.eval()
+    tok = AutoTokenizer.from_pretrained(model_path)
+    log_fn(f"canary: bnb-nf4 ready in {time.time()-t0:.0f}s "
+           f"(VRAM={torch.cuda.memory_allocated()/1e9:.1f} GB)")
+    return model, tok
+
+
+def _drop_canary_view_bnb(model, log_fn):
+    """Free the bnb canary copy + CUDA cache. Idempotent."""
+    try:
+        del model
+    except Exception:
+        pass
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        log_fn(f"canary: dropped bnb view "
+               f"(VRAM={torch.cuda.memory_allocated()/1e9:.1f} GB)")
+
+
 def _enter_canary_runtime(args, model, canary_dev, canary_dtype, log_fn):
     """Move model to (canary_dev, canary_dtype). Returns a `restore()` callable.
 
@@ -2371,26 +2445,66 @@ def main():
     ap.add_argument("--canary-cpu-mem", default=None,
                     help="CPU memory budget for canary offload (e.g. '200GiB'). "
                          "Defaults to --cpu-mem.")
-    # ---- Resumable checkpoints (opt-in; covers phase0 + phase2 + pre-canary) ----
+    # ---- Canary quantization (2026-05-15) ----
+    # he1v2 baseline canary on pod 36755693 took ~35 min per prompt (3 prompts ×
+    # 50 tok) because auto-picked GPU+accelerate offload was effectively CPU
+    # speed (31B BF16 = 62 GB, 3090 = 24 GB → only ~38% of layers on GPU, the
+    # rest streamed from CPU RAM). bnb 4-bit nf4 quantizes the canary model to
+    # ~16 GiB so the whole network fits on a single 24 GB GPU, restoring
+    # ~30 tok/s. The bnb-loaded copy is a SEPARATE model object loaded from
+    # disk (args.model_path for baseline, staged/ dir for post-heal); the
+    # in-memory BF16 model used for phase 2 lstsq + final save is untouched.
+    ap.add_argument("--canary-quant", choices=["auto", "none", "nf4"], default="auto",
+                    help="Quantization for the canary forward, NOT for the saved "
+                         "weights. 'auto' (default) picks 'nf4' when the BF16 "
+                         "model is too big for VRAM (>0.85 × total), else 'none'. "
+                         "'none' = native BF16/FP16/FP32 (fast only on GPUs that "
+                         "fit the model). 'nf4' = bnb 4-bit on GPU; requires "
+                         "bitsandbytes>=0.46.1 and a CUDA device.")
+    # ---- Resumable checkpoints (MANDATORY since 2026-05-15) ----
     # Burned a couple of hours on 2026-05-11 redoing 30+ min of phase 0' capture
     # and 30+ min of phase 2 lstsq heal after the AR canary stalled on a
-    # single-threaded BF16 CPU forward. With --checkpoint-dir + --save-before-canary
-    # the same restart becomes ~1 min (load staged BF16, re-run canary on GPU).
-    ap.add_argument("--checkpoint-dir", default=None,
-                    help="Directory for resumable checkpoints. Disabled when unset. "
-                         "Contains manifest.json (run fingerprint), phase2/layer_NN.pt "
-                         "(default ON), optional phase0/layer_NN.pt (--checkpoint-phase0), "
-                         "and optional staged/ (--save-before-canary).")
+    # single-threaded BF16 CPU forward.
+    # Burned ANOTHER ~5 h on 2026-05-15 (pod 36755693 / he1-v2 rebuild) when a
+    # caller script omitted --checkpoint-dir. The canary-quant nf4 patch landed
+    # mid-run; killing+restarting would have lost all 5h of phase0+phase1 work
+    # because no checkpoint existed → forced to wait out the slow canary.
+    # → --checkpoint-dir is now REQUIRED. The script refuses to start without it.
+    ap.add_argument("--checkpoint-dir", required=True,
+                    help="REQUIRED. Directory for resumable checkpoints. Contains "
+                         "manifest.json (run fingerprint), phase2/layer_NN.pt "
+                         "(default ON), and optional phase0/layer_NN.pt "
+                         "(--checkpoint-phase0). The 18 GB disk cost on 31B is "
+                         "trivial; recoverability is essential.")
     ap.add_argument("--checkpoint-phase0", action="store_true",
                     help="Also checkpoint per-layer Phase 0 captures (o_proj outputs + "
                          "residual stream). ~20 GB disk for 31B but lets the whole calib "
-                         "forward be skipped on restart. Off by default — usually the "
-                         "staged/ + phase2/ checkpoints are enough.")
-    ap.add_argument("--save-before-canary", action="store_true",
-                    help="Save the full BF16 model under <checkpoint-dir>/staged/ AFTER "
-                         "phase3b reshape but BEFORE the AR canary check. On a fresh "
-                         "restart with the same checkpoint-dir, load() jumps directly to "
-                         "phase 2.5 — bypassing phase 0/2 entirely. Disk: ~62 GB for 31B.")
+                         "forward be skipped on restart. Off by default — usually "
+                         "phase2/ checkpoints are enough.")
+    # ─────────────────────────────────────────────────────────────────────────
+    # DO NOT REINTRODUCE --save-before-canary AS A FLAG. It was REMOVED 2026-05-15.
+    #
+    # The BEHAVIOR (staged BF16 save before the canary) is now ALWAYS ON whenever
+    # --checkpoint-dir is set. Since --checkpoint-dir is now MANDATORY (required=True
+    # above), the staged save effectively always runs. It is not optional and there
+    # is no knob to disable it.
+    #
+    # Why the flag existed: the AR canary used to run BF16-on-CPU at ~0.5 tok/s,
+    # so a 31B + 3-prompt × 50-tok canary stalled the pipeline for ~4 h. Saving
+    # the healed BF16 to <ckpt>/staged/ BEFORE the canary let a future restart
+    # bypass phase 0/2 and re-run only the canary. Disk cost: ~62 GB per run.
+    #
+    # Why the flag is gone (but the behavior stays): on 2026-05-15 a he1-v2 rebuild
+    # on pod 36755693 ran without --save-before-canary, and when a canary-speed
+    # patch landed mid-run we couldn't apply it without losing ~5 h of phase 0+2
+    # work. The flag turned out to be a footgun — there is no scenario where you
+    # want to ship a multi-hour pipeline WITHOUT staged recoverability. The disk
+    # cost (~62 GB) is trivial next to the recompute cost it prevents.
+    #
+    # If anyone ever proposes re-adding this flag (in either direction —
+    # opt-in OR opt-out), point them at this comment and at
+    # `memory/feedback_always_checkpoint_long_runs.md`.
+    # ─────────────────────────────────────────────────────────────────────────
     ap.add_argument("--resume", choices=["auto", "fresh", "force"], default="auto",
                     help="auto: reuse checkpoint dir if fingerprint matches the current "
                          "run config (default). fresh: ignore any existing checkpoint dir "
@@ -2591,10 +2705,11 @@ def main():
     tok = AutoTokenizer.from_pretrained(args.model_path)
 
     # NOTE on staged/ usage (v1 scope):
-    #   --save-before-canary writes <ckpt>/staged/ with the full post-heal BF16
-    #   model so a canary stall/crash never costs the phase 0/2 work. Auto-resume
-    #   FROM staged (skipping phase 0/1/2/3 wholesale) is v2 work — for now, on
-    #   a crash after phase 3, manually copy staged/ to the final output dir or
+    #   The staged BF16 save (always on when --checkpoint-dir is set, which is
+    #   mandatory) writes <ckpt>/staged/ with the full post-heal BF16 model so
+    #   a canary stall/crash never costs the phase 0/2 work. Auto-resume FROM
+    #   staged (skipping phase 0/1/2/3 wholesale) is v2 work — for now, on a
+    #   crash after phase 3, manually copy staged/ to the final output dir or
     #   point a follow-up tool at it. The per-layer phase0 + phase2 checkpoints
     #   handle the more common mid-phase crashes.
     args._skip_to_canary = False
@@ -2693,9 +2808,24 @@ def main():
             try:
                 log(f"phase0+: capturing AR canary baseline ({len(CANARY_PROMPTS)} prompts × "
                     f"{args.canary_n_gen} gen tokens) on unpruned model")
-                canary_baseline = capture_canary_baseline(
-                    model, tok, CANARY_PROMPTS, n_gen=args.canary_n_gen
-                )
+                # Decide whether to bnb-4bit-load a separate copy from disk.
+                # Default 'auto' picks nf4 when bf16 won't fit in VRAM —
+                # restores ~30 tok/s on 31B 3090 vs ~0.5 tok/s for CPU bf16.
+                _canary_quant = _resolve_canary_quant(args, model, log)
+                if _canary_quant == "nf4":
+                    _bnb_model, _bnb_tok = _load_canary_view_bnb_nf4(
+                        str(args.model_path), log)
+                    try:
+                        canary_baseline = capture_canary_baseline(
+                            _bnb_model, _bnb_tok, CANARY_PROMPTS,
+                            n_gen=args.canary_n_gen
+                        )
+                    finally:
+                        _drop_canary_view_bnb(_bnb_model, log)
+                else:
+                    canary_baseline = capture_canary_baseline(
+                        model, tok, CANARY_PROMPTS, n_gen=args.canary_n_gen
+                    )
             except Exception as e:
                 log(f"warn: canary baseline capture failed: {e!r} — gate will be skipped")
                 canary_baseline = None
@@ -3387,7 +3517,9 @@ def main():
     # Persisting BF16/CPU here means a future restart can load from `staged/` and
     # jump straight to phase 2.5 — saving ~1-2 hours on 31B if the canary
     # itself dies/stalls (the 2026-05-11 CPU-canary-stall scenario).
-    if args._ckpt_dir is not None and args.save_before_canary:
+    # Always-on staged BF16 save (--save-before-canary was removed 2026-05-15;
+    # behavior is unconditional when --checkpoint-dir is set, which is mandatory).
+    if args._ckpt_dir is not None:
         staged = _staged_dir(args._ckpt_dir)
         if _staged_complete(args._ckpt_dir):
             # Already on disk from a prior run with the same fingerprint
@@ -3398,7 +3530,8 @@ def main():
         else:
             log(f"phase3c (pre-canary): saving staged BF16 to {staged}")
             staged.mkdir(parents=True, exist_ok=True)
-            model.save_pretrained(staged, safe_serialization=True)
+            # see he1v2 SIGKILL note at the final save_pretrained below
+            model.save_pretrained(staged, safe_serialization=True, max_shard_size="10GB")
             tok.save_pretrained(staged)
             log(f"phase3c: staged save complete ({staged}).")
         args._ckpt_staged_ready = True
@@ -3417,19 +3550,55 @@ def main():
         # the save-side move; canary may legitimately re-disperse to GPU offload
         # or upcast to FP32 to recover multi-thread CPU matmul. Always
         # reverted before save_pretrained() further below.
-        _can_dev, _can_dtype = _resolve_canary_runtime(args, model, log)
-        _restore_after_canary = _enter_canary_runtime(
-            args, model, _can_dev, _can_dtype, log
-        )
-        try:
-            canary_result = gen_canary_check(
-                model, canary_baseline,
-                tokenizer=tok,
-                n_gen=args.canary_n_gen,
-                ratio_threshold=args.canary_ratio_threshold,
+        _canary_quant = _resolve_canary_quant(args, model, log)
+        if _canary_quant == "nf4":
+            # bnb-4bit path: stage the healed model to a tmp dir, bnb-load,
+            # run gen_canary_check, drop. Bypasses _enter_canary_runtime
+            # entirely (no offload, no fp32 cast). Requires staged dir on
+            # disk so we can re-load — reuses <ckpt>/staged/ (always-on when
+            # --checkpoint-dir is set) if it's complete, else writes a
+            # transient copy.
+            from tempfile import TemporaryDirectory
+            staged_path = None
+            tmp_ctx = None
+            if args._ckpt_dir is not None and _staged_complete(args._ckpt_dir):
+                staged_path = _staged_dir(args._ckpt_dir)
+                log(f"phase2.5 canary-quant=nf4: reusing staged BF16 at {staged_path}")
+            else:
+                tmp_ctx = TemporaryDirectory(prefix="canary_stage_", dir=str(Path(args.output).parent))
+                staged_path = Path(tmp_ctx.name)
+                log(f"phase2.5 canary-quant=nf4: staging healed BF16 to {staged_path} "
+                    f"(transient, ~{sum(p.numel() for p in model.parameters())*2/1e9:.0f} GB)")
+                # see he1v2 SIGKILL note at the final save_pretrained below
+                model.save_pretrained(staged_path, safe_serialization=True, max_shard_size="10GB")
+                tok.save_pretrained(staged_path)
+            _bnb_model, _bnb_tok = _load_canary_view_bnb_nf4(str(staged_path), log)
+            try:
+                canary_result = gen_canary_check(
+                    _bnb_model, canary_baseline,
+                    tokenizer=_bnb_tok,
+                    n_gen=args.canary_n_gen,
+                    ratio_threshold=args.canary_ratio_threshold,
+                )
+            finally:
+                _drop_canary_view_bnb(_bnb_model, log)
+                if tmp_ctx is not None:
+                    tmp_ctx.cleanup()
+                    log("phase2.5 canary-quant=nf4: cleaned up transient stage")
+        else:
+            _can_dev, _can_dtype = _resolve_canary_runtime(args, model, log)
+            _restore_after_canary = _enter_canary_runtime(
+                args, model, _can_dev, _can_dtype, log
             )
-        finally:
-            _restore_after_canary()
+            try:
+                canary_result = gen_canary_check(
+                    model, canary_baseline,
+                    tokenizer=tok,
+                    n_gen=args.canary_n_gen,
+                    ratio_threshold=args.canary_ratio_threshold,
+                )
+            finally:
+                _restore_after_canary()
         for p in canary_result["per_prompt"]:
             sh = p["shape"]
             fails = ",".join(k for k, v in p["fails"].items() if v) or "OK"
@@ -3453,7 +3622,12 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     log(f"saving to {out_dir}")
-    model.save_pretrained(out_dir, safe_serialization=True)
+    # max_shard_size="10GB" fix (he1v2 SIGKILL 2026-05-15): default 50GB gather
+    # OOM'd a 62-GB pod cgroup at "Writing model shards: 0%" with offloaded
+    # modules. 10GB shards = peak gather ≤10GB into RAM; still safely under
+    # any common container limit. 5 shards × 10GB ≈ 50GB on-disk, llama.cpp
+    # consumes safetensors shard layout transparently.
+    model.save_pretrained(out_dir, safe_serialization=True, max_shard_size="10GB")
     tok.save_pretrained(out_dir)
 
     rel_resid_values = [

@@ -1,0 +1,45 @@
+# Auto-inlined from `include:` by scripts/inline_reeval24k_yamls.py
+# Parent: /shared/dev/omnimergekit/eval/lm_eval_tasks/humaneval_chat/humaneval_chat.yaml
+# Child override applied: task=humaneval_reeval24k
+task: humaneval_reeval24k
+dataset_path: openai/openai_humaneval
+unsafe_code: true
+output_type: generate_until
+test_split: test
+doc_to_text: 'Write a complete Python function that solves the following problem.
+  Output ONLY the function code inside a single ```python ... ``` markdown block.
+
+
+  ```python
+
+  {{ prompt }}
+
+  ```'
+doc_to_target: '{{test}}
+
+  check({{entry_point}})'
+generation_kwargs:
+  until:
+  - '
+
+    ```'
+  - </s>
+  - <|endoftext|>
+  max_gen_toks: 4096
+  do_sample: false
+metric_list:
+- metric: !function utils_chat__humaneval_reeval24k.pass_at_k
+  aggregation: mean
+  higher_is_better: true
+  k:
+  - 1
+repeats: 1
+num_fewshot: 0
+filter_list:
+- name: extract_chat
+  filter:
+  - function: custom
+    filter_fn: !function utils_chat__humaneval_reeval24k.build_predictions_chat
+metadata:
+  version: 1.0
+process_docs: !function utils_reeval.humaneval_reeval24k_subset

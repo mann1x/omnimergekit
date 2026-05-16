@@ -1,0 +1,35 @@
+# GSM8K smoke variant — first 30 deterministic indices from gsm8k_100.
+# Same selection / scoring / backend args as gsm8k_100 (verified 2026-05-15).
+# Used for fail-fast math-collapse detection during recipe A/B
+# (v5 hybrid recook).
+name: gsm8k_30
+backend: lm-eval
+task: gsm8k
+n: 30
+selection:
+  type: indices
+  indices: [0, 13, 26, 39, 52, 65, 78, 91, 104, 117,
+            130, 143, 156, 169, 182, 195, 208, 221, 234, 247,
+            260, 273, 286, 299, 312, 325, 338, 351, 364, 377]
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: exact_match
+  filter: flexible-extract
+  validated_against: openai/grade-school-math
+  validation_date: "2026-05-15"
+backend_args:
+  apply_chat_template: true
+  num_fewshot: 5
+  batch_size: 1
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: gsm8k_30
+reports:
+  token_stats: true

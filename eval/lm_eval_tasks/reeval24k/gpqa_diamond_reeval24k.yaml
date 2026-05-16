@@ -1,0 +1,54 @@
+# Auto-inlined from `include:` by scripts/inline_reeval24k_yamls.py
+# Parent: /shared/dev/lightseek/.venv/lib/python3.10/site-packages/lm_eval/tasks/gpqa/cot_zeroshot/gpqa_diamond_cot_zeroshot.yaml
+# Child override applied: task=gpqa_diamond_reeval24k
+dataset_path: Idavidrein/gpqa
+tag: gpqa
+output_type: generate_until
+process_docs: !function utils_reeval.gpqa_diamond_reeval24k_subset
+training_split: train
+validation_split: train
+test_split: null
+doc_to_text: 'What is the correct answer to this question:{{Question}}
+
+  Choices:
+
+  (A) {{choice1}}
+
+  (B) {{choice2}}
+
+  (C) {{choice3}}
+
+  (D) {{choice4}}
+
+  Let''s think step by step: '
+doc_to_target: answer
+filter_list:
+- name: strict-match
+  filter:
+  - function: regex
+    regex_pattern: (?<=The answer is )(.*)(?=.)
+  - function: take_first
+- name: flexible-extract
+  filter:
+  - function: multi_choice_regex
+    group_select: -1
+    ignore_case: true
+    ignore_punctuation: true
+    regex_pattern: (\([A-Z]\))
+  - function: take_first
+generation_kwargs:
+  until:
+  - </s>
+  do_sample: false
+  temperature: 0.0
+num_fewshot: 0
+metric_list:
+- metric: exact_match
+  aggregation: mean
+  higher_is_better: true
+  ignore_case: true
+  ignore_punctuation: true
+metadata:
+  version: 1.0
+dataset_name: gpqa_diamond
+task: gpqa_diamond_reeval24k

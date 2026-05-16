@@ -1,0 +1,36 @@
+# HumanEval 1-problem smoke (problem 32 = `poly`, find polynomial roots).
+# Used as a fast code-canary inside the v5fixed sweep: confirms the model
+# emits CODE (not bullet plans / silent-empty / token-loops) on a
+# discriminative problem. Pass/fail is a signal, not a benchmark.
+# Companion of gsm8k_30 + lcb_medium_1_smoke.
+name: humaneval_1_smoke
+backend: lm-eval
+task: humaneval_chat
+n: 1
+selection:
+  type: indices
+  indices: [32]
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: pass_at_1
+  filter: build_predictions
+  validated_against: openai/human-eval
+  validation_date: "2026-05-16"
+backend_args:
+  lm_eval_include_path: lm_eval_tasks/humaneval_chat
+  apply_chat_template: true
+  num_fewshot: 0
+  batch_size: 1
+  confirm_run_unsafe_code: true
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: humaneval_1_smoke
+reports:
+  token_stats: true

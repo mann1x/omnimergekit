@@ -1,0 +1,35 @@
+# LCB-medium 1-problem smoke. Filter-based selection truncated to n=1 (first
+# matching problem from medium pool since 2024-10-01). Used as a fast LCB
+# canary inside the v5fixed sweep alongside gsm8k_30 + humaneval_1_smoke.
+# Same parser+thinking_budget recipe as lcb_medium_55_v4 (validated for v4
+# pruned variants).
+name: lcb_medium_1_smoke
+backend: lcb_custom
+task: livecodebench
+n: 1
+selection:
+  type: filter
+  difficulty: medium
+  min_date: "2024-10-01"
+  testtype: functional
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 1200
+scoring:
+  scorer: lcb_helpers
+  validated_against: lcb_runner.evaluation.testing_util.grade_call_based
+  validation_date: "2026-05-16"
+backend_args:
+  apply_chat_template: true
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+  num_concurrent: 1
+cache:
+  sqlite_prefix: lcb_med_1_smoke
+reports:
+  token_stats: true

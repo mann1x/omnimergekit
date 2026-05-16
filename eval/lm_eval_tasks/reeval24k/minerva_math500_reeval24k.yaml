@@ -1,0 +1,33 @@
+# Auto-inlined from `include:` by scripts/inline_reeval24k_yamls.py
+# Parent: /shared/dev/lightseek/.venv/lib/python3.10/site-packages/lm_eval/tasks/minerva_math/minerva_math500.yaml
+# Child override applied: task=minerva_math500_reeval24k
+tag:
+- math_word_problems
+task: minerva_math500_reeval24k
+dataset_path: HuggingFaceH4/MATH-500
+process_docs: !function utils_reeval.math500_100_reeval24k_subset
+dataset_name: default
+output_type: generate_until
+training_split: null
+test_split: test
+doc_to_text: !function utils__minerva_math500_reeval24k.doc_to_text
+process_results: !function utils__minerva_math500_reeval24k.process_results
+doc_to_target: '{{answer if few_shot is undefined else solution}}'
+generation_kwargs:
+  until:
+  - 'Problem:'
+  do_sample: false
+  temperature: 0
+metric_list:
+- metric: exact_match
+  aggregation: mean
+  higher_is_better: true
+- metric: math_verify
+  aggregation: mean
+  higher_is_better: true
+num_fewshot: 4
+metadata:
+  version: 3.0
+fewshot_config:
+  sampler: first_n
+  samples: !function utils__minerva_math500_reeval24k.list_fewshot_samples

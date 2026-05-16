@@ -550,7 +550,12 @@ def dispatch_lcb(template: dict, model_tag: str, base_url: str,
         "--http-timeout", str(g.get("http_timeout", 900.0)),
         "--difficulty", sel.get("difficulty", "medium"),
         "--min-date", sel.get("min_date", "2024-10-01"),
-        "--limit", str(template["n"] + 50),  # filter cap
+        # For smoke runs (n<=10) honor template `n` exactly; for full runs pad
+        # by 50 so the shim's post-filter pool has enough candidates to yield n.
+        # Bug 2026-05-16: lcb_medium_1_smoke (n=1) was emitting --limit 51
+        # → 51 problems evaluated instead of 1. Sweep wall-time blew up ~10x.
+        "--limit", str(int(template["n"]) if int(template["n"]) <= 10
+                       else int(template["n"]) + 50),
         "--output", str(out_dir / "lcb_result.json"),
     ]
     # MANDATORY for Gemma 4 thinking-on: forward thinking_token_budget +

@@ -1,8 +1,34 @@
 # Eval-only deps (loaded on top of requirements.txt)
 # Includes lm-eval-harness with API extras for the `local-completions` and
 # `local-chat-completions` model backends used in our recipes.
+#
+# Install:  pip install -r requirements-eval.txt
+# Pin lm-eval to 0.4.11 — 0.4.12 needs Py3.13 (TypedDict.extra_items),
+# 0.4.9 broke on transformers 5.x rename. See
+# memory/feedback_pod_lmeval_py311.md.
 
-lm-eval[api]==0.4.11
+lm-eval[api,math,ifeval]==0.4.11
+
+# `math` extra installs sympy + math-verify + antlr4-python3-runtime==4.11
+# required by minerva_math / math500 / aime templates. Without them the
+# task class fails to import at lm-eval startup with ModuleNotFoundError
+# even before any model is hit. Pin antlr4 explicitly because pip resolvers
+# occasionally pull a newer incompatible runtime.
+antlr4-python3-runtime==4.11.0
+sympy>=1.13
+math-verify>=0.9.0
+
+# `ifeval` extra is supposed to pull these but pip resolution flakes on some
+# manylinux wheels for nltk on Py3.11, leaving lm-eval to import-time fail on
+# ifeval templates with `ModuleNotFoundError: langdetect`. Pin explicitly so
+# every fresh pod gets a clean ifeval load.
+# Caught on pod 36755693 (2026-05-14): reeval24k ifeval_reeval24k crashed at
+# `from lm_eval.tasks.ifeval import instructions_registry` because langdetect
+# was absent. ifeval template ran 0 samples; lm-eval still wrote a 0-row
+# results.json. See memory/feedback_lm_eval_pod_deps.md.
+langdetect>=1.0.9
+immutabledict>=4.2.0
+nltk>=3.9.1
 
 # Code-eval support: lm_eval HE/MBPP need both HF_ALLOW_CODE_EVAL=1 AND
 # --confirm_run_unsafe_code at invocation time. The package itself just
@@ -12,3 +38,8 @@ human-eval>=1.0.3                # optional, only for the original HumanEval sco
 
 # LiveCodeBench scorer (vendored runner is in eval/lcb/lcb_llama_server.py)
 # pip install -e <livecodebench-repo> separately if you need the v3+ scorer
+
+# Suite orchestrator (scripts/eval_suite_vllm.sh) needs PyYAML to compute
+# per-template vLLM-config fingerprints. Inherited from requirements.txt
+# (transformers pulls PyYAML transitively) — listed here for clarity.
+pyyaml>=6.0
