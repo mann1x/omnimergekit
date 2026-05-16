@@ -1,0 +1,48 @@
+# HumanEval 20-problem longer smoke. Stratified-stride selection from
+# the 128e-NVFP4A16 PASS set (163/164 on full HE-164 with parser=gemma4
+# + budget=12288 — only HE/38 failed). Stride ≈ 164/20 = 8.15, picks
+# evenly across the difficulty span instead of biasing to the easy
+# first-20 indices. Smoke property: every selected problem is a
+# verified-pass for unpruned baseline, so a variant FAIL is signal
+# (pruning damage), not noise (universally-hard problem).
+#
+# Selection date: 2026-05-16 (against 128e_nvfp4a16 HE-164 run
+# samples_humaneval_chat_2026-05-13T19-04-30.620727.jsonl, pre-HE-filter-fix).
+# Pre-fix filter PASS is a strict subset of post-fix PASS, so picks
+# are still guaranteed-passable by 128e.
+#
+# Same parser+thinking_budget recipe as humaneval_full (validated for
+# Gemma 4 chat). Sits between humaneval_1_smoke (canary) and
+# humaneval_full (164q).
+name: humaneval_20
+backend: lm-eval
+task: humaneval_chat
+n: 20
+selection:
+  type: indices
+  indices: [0, 8, 16, 24, 33, 42, 50, 58, 66, 74,
+            83, 91, 99, 107, 115, 123, 131, 140, 148, 156]
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: pass_at_1
+  filter: build_predictions
+  validated_against: openai/human-eval
+  validation_date: "2026-05-16"
+backend_args:
+  lm_eval_include_path: lm_eval_tasks/humaneval_chat
+  apply_chat_template: true
+  num_fewshot: 0
+  batch_size: 1
+  confirm_run_unsafe_code: true
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: humaneval_20
+reports:
+  token_stats: true
