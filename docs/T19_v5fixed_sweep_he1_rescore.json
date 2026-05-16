@@ -1,0 +1,58 @@
+{
+  "A2_lp4_uni": {
+    "n": 1,
+    "pass_at_1_new": 0.0,
+    "pass_at_1_old_avg": 0.0,
+    "n_nonempty_pred": 1,
+    "n_pred_with_def": 1,
+    "raw_len_avg": 23427.0
+  },
+  "A3_top3mean_uni": {
+    "n": 1,
+    "pass_at_1_new": 0.0,
+    "pass_at_1_old_avg": 0.0,
+    "n_nonempty_pred": 1,
+    "n_pred_with_def": 1,
+    "raw_len_avg": 3693.0
+  },
+  "A4_softmax_t4_uni": {
+    "n": 1,
+    "pass_at_1_new": 1.0,
+    "pass_at_1_old_avg": 0.0,
+    "n_nonempty_pred": 1,
+    "n_pred_with_def": 1,
+    "raw_len_avg": 8429.0
+  },
+  "A5_second_uni": {
+    "n": 1,
+    "pass_at_1_new": 0.0,
+    "pass_at_1_old_avg": 0.0,
+    "n_nonempty_pred": 1,
+    "n_pred_with_def": 1,
+    "raw_len_avg": 2855.0
+  },
+  "B1_max_genheavy": {
+    "n": 1,
+    "pass_at_1_new": 0.0,
+    "pass_at_1_old_avg": 0.0,
+    "n_nonempty_pred": 1,
+    "n_pred_with_def": 1,
+    "raw_len_avg": 8401.0
+  },
+  "B2_max_mathcode": {
+    "n": 1,
+    "pass_at_1_new": 0.0,
+    "pass_at_1_old_avg": 0.0,
+    "n_nonempty_pred": 1,
+    "n_pred_with_def": 1,
+    "raw_len_avg": 36692.0
+  },
+  "B3_max_tgtheavy": {
+    "n": 1,
+    "pass_at_1_new": 1.0,
+    "pass_at_1_old_avg": 0.0,
+    "n_nonempty_pred": 1,
+    "n_pred_with_def": 1,
+    "raw_len_avg": 3611.0
+  }
+}

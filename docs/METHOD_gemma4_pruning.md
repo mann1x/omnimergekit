@@ -1,5 +1,14 @@
 # Method: Gemma 4 MoE expert pruning
 
+> **2026-05-16 update**: this doc covers the v3 / v4 baseline (single-class
+> aggregation, max-across-classes). For the **v5-targeted** strategy
+> (multi-class with class-weights + Tier-B PASS-trace data) see
+> [`T17_v5_targeted_pruning_strategy.md`](T17_v5_targeted_pruning_strategy.md).
+> For the **T19 aggregation sweep** (13 variants × strategy × weights × protect)
+> see [`T19_v5fixed_sweep_results.md`](T19_v5fixed_sweep_results.md). For
+> **post-prune router recovery** (the rumination fix) see
+> [`T18_moe_router_recovery.md`](T18_moe_router_recovery.md).
+
 Gemma 4 26B-A4B is a 128-expert MoE with top-8 routing per token. The full
 F16 model is ~50 GB; Q4_K_M is ~13 GB — too big for 12 GB consumer GPUs.
 Pruning experts down to 109 (drop weakest 19 per layer) gets to ~12 GB at
