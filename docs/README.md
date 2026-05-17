@@ -22,6 +22,10 @@ Chronological:
 5. [`T18_moe_router_recovery.md`](T18_moe_router_recovery.md) — Step 0/1/2/3
    framework for post-prune router rumination fix. Free-knob recovery,
    EAC-MoE TopK-MSE, DiffCal differential corpus.
+6. [`T19_5_longer_smoke_results.md`](T19_5_longer_smoke_results.md) —
+   longer-smoke (gsm8k_v128pass + humaneval_20 + lcb_medium_5) on the 4
+   sweep candidates + v4 baseline anchor. Eliminates B3 and D1, lands B2
+   at v4 math parity, motivates the v5-coder track (T21).
 
 Supporting tables / data:
 
