@@ -1,0 +1,45 @@
+# LCB-medium 15-problem smoke for v5-coder T18 qualification.
+# Filter selects first 15 medium problems since 2024-10-01 by contest_date.
+# This resolves to: lcb/leetcode/{3579, 3566, 3502, 3607, 3593, 3629, 3627,
+# 3639, 3654, 3487, 3587, 3622, 3591, 3647, 3594}.
+#
+# v4 and 128e anchors (from existing lcb_medium_55 samples, both on disk):
+#   v4   LCB-15 = 12/15 (0.800)   (fails: 3607, 3487, 3647)
+#   128e LCB-15 = 13/15 (0.867)   (fails: 3607, 3622)
+#
+# Smoke property: candidate FAILs on the 12 v4-pass problems are pure
+# pruning damage. The 3 v4-fail problems (3607, 3487, 3647) are universally
+# harder.
+#
+# Used by T18 qualification of v5-coder candidates (T21). Sits between
+# lcb_medium_5 (canary) and lcb_medium_30 / 55 (full).
+name: lcb_medium_15
+backend: lcb_custom
+task: livecodebench
+n: 15
+selection:
+  type: filter
+  difficulty: medium
+  min_date: "2024-10-01"
+  testtype: functional
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 1200
+scoring:
+  scorer: lcb_helpers
+  validated_against: lcb_runner.evaluation.testing_util.grade_call_based
+  validation_date: "2026-05-17"
+backend_args:
+  apply_chat_template: true
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+  num_concurrent: 1
+cache:
+  sqlite_prefix: lcb_med_15
+reports:
+  token_stats: true

@@ -9,7 +9,13 @@ cd /srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models
 CANDIDATES=(
     "C1_max_codetb"
 )
-TEMPLATES=("gsm8k_v128pass" "humaneval_20" "lcb_medium_5")
+# Rebalanced 2026-05-17 (smoke for T18 qualification, not full validation):
+# - gsm8k_30 — math sanity, confirms math hasn't collapsed
+# - humaneval_30 — stride from HE-164, v4/128e anchors precomputed at 29/30
+# - lcb_medium_15 — first 15 by date, v4 anchor 12/15, 128e 13/15
+# Total wall ~1h30m-2h. Anchor scores extracted from existing v4 + 128e
+# samples files; no fresh baseline runs needed.
+TEMPLATES=("gsm8k_30" "humaneval_30" "lcb_medium_15")
 
 SRC_HF="google/gemma-4-26B-A4B-it"
 RESULTS="eval_results_vllm_suite/v5fixed_t18_longer_smoke/v5coder"

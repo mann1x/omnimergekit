@@ -1,0 +1,47 @@
+# HumanEval 30-problem smoke for v5-coder T18 qualification.
+# Stride-from-HE-164 picks (every ~5-6 indices spanning the full set):
+# [0, 5, 11, 16, 22, 27, 33, 38, 44, 49, 55, 60, 66, 71, 77, 82, 87, 93,
+#  98, 104, 109, 115, 120, 126, 131, 137, 142, 148, 153, 159].
+#
+# v4 and 128e anchors (existing samples on disk, no fresh runs needed):
+#   v4   HE-30 = 29/30 (0.967)   (only fails at HE/38 — the one HE-164 fail)
+#   128e HE-30 = 29/30 (0.967)   (same — both miss HE/38)
+#
+# Smoke property: candidate variant FAILs on indices [0,5,11,16,...]
+# (excluding HE/38) are pure pruning damage relative to v4 baseline.
+# HE/38 is universally-hard for both pruned variants + 128e itself.
+#
+# Used by T18 qualification of v5-coder candidates (T21).
+name: humaneval_30
+backend: lm-eval
+task: humaneval_chat
+n: 30
+selection:
+  type: indices
+  indices: [0, 5, 11, 16, 22, 27, 33, 38, 44, 49,
+            55, 60, 66, 71, 77, 82, 87, 93, 98, 104,
+            109, 115, 120, 126, 131, 137, 142, 148, 153, 159]
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: pass_at_1
+  filter: build_predictions
+  validated_against: openai/human-eval
+  validation_date: "2026-05-17"
+backend_args:
+  lm_eval_include_path: lm_eval_tasks/humaneval_chat
+  apply_chat_template: true
+  num_fewshot: 0
+  batch_size: 1
+  confirm_run_unsafe_code: true
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: humaneval_30
+reports:
+  token_stats: true
