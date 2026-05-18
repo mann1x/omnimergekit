@@ -632,8 +632,10 @@ def push_to_ollama_from_local(gguf_path: Path, ollama_target: str,
     workdir.mkdir(parents=True, exist_ok=True)
     mf_path = workdir / f"Modelfile.{tag}"
 
-    # Build Modelfile
-    lines = [f"FROM {gguf_path}"]
+    # Build Modelfile — FROM must be absolute. A relative path is interpreted
+    # by `ollama create` as a registry hostname; e.g. `FROM gguf_output/foo.gguf`
+    # triggers `dial tcp: lookup gguf_output on 8.8.8.8:53: no such host`.
+    lines = [f"FROM {gguf_path.resolve()}"]
     if template_style in ("gemma4", "gemma4-a4b"):
         # Built-in Gemma 4 Go-native renderer + parser (ollama >= 0.20).
         # Same recipe ollama.com/library/gemma4:* tags use. Handles the full
@@ -955,6 +957,41 @@ def main():
             imatrix_file = compute_imatrix(tools, base_gguf, cal_data, output_dir, ngl=args.ngl)
         else:
             print("  WARNING: No calibration data found, skipping imatrix", flush=True)
+
+    # ── Step 2b: Auto-generate CD tensor-type maps from imatrix ───────────
+    # If the queue includes any CD-* quants and we have a fresh imatrix.dat, derive
+    # PER-MODEL tensor_types_CD-*.txt next to the script. This makes the CD profile
+    # variant-specific (v5 vs v5-coder differ here because layer importance shifts
+    # with expert pruning). Skips when the file already exists — safe to re-run.
+    cd_quants_in_queue = [q for q in quants if q.startswith("CD-")]
+    if cd_quants_in_queue and imatrix_file and imatrix_file.exists():
+        script_dir = Path(__file__).parent
+        gen_cd = script_dir / "generate_cd_maps_from_imatrix.py"
+        if not gen_cd.exists():
+            # also try sibling backup_models scripts dir
+            for alt in [
+                Path("/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/scripts/generate_cd_maps_from_imatrix.py"),
+                Path("/workspace/backup_models/scripts/generate_cd_maps_from_imatrix.py"),
+            ]:
+                if alt.exists():
+                    gen_cd = alt
+                    break
+        if gen_cd.exists():
+            need_gen = any(not (script_dir / f"tensor_types_{q}.txt").exists() for q in cd_quants_in_queue)
+            if need_gen:
+                print("\n=== Generating per-model CD tensor-type maps from imatrix ===", flush=True)
+                run([sys.executable, str(gen_cd),
+                     "--imatrix", str(imatrix_file),
+                     "--out-dir", str(script_dir)],
+                    desc="CD map generation", timeout=300)
+                for q in cd_quants_in_queue:
+                    f = script_dir / f"tensor_types_{q}.txt"
+                    if f.exists():
+                        print(f"  ready: {f.name}", flush=True)
+            else:
+                print("  tensor_types_CD-*.txt already present — keeping existing maps", flush=True)
+        else:
+            print("  WARNING: generate_cd_maps_from_imatrix.py not found; CD-* quants will fall back to uniform", flush=True)
 
     # ── Step 3: Quantize + Upload ────────────────────────────
     print(f"\n=== Quantizing ({len(quants)} variants) ===", flush=True)
