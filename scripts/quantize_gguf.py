@@ -885,6 +885,76 @@ def main():
 
     print(f"Quants to create: {len(quants)}", flush=True)
 
+    # ── Pre-flight: imatrix is mandatory if ANY queued tier needs it ─────
+    # Without this gate, Step 2 silently no-ops on missing prereqs and Step 3
+    # then fails per-tier with "this quantization requires an imatrix!" after
+    # a full F16 convert has already burned ~20 min. Surface the gap NOW so
+    # the operator can fix it (install llama-imatrix / provide cal data) and
+    # restart, instead of discovering it tier-by-tier.
+    def _quant_needs_imatrix(q: str) -> bool:
+        if q in IMATRIX_QUANTS:
+            return True
+        if q.startswith("IQ"):
+            return True
+        if q.startswith("CD-"):
+            tt = Path(__file__).parent / f"tensor_types_{q}.txt"
+            if tt.exists():
+                try:
+                    ttxt = tt.read_text()
+                    if "IQ" in ttxt or "Q2_K" in ttxt:
+                        return True
+                except OSError:
+                    pass
+        return False
+
+    imatrix_required_by = [q for q in quants if _quant_needs_imatrix(q)]
+    if imatrix_required_by:
+        # Locate calibration data the same way Step 2 does, so the gate sees
+        # the same world as the compute step would.
+        _cal = None
+        if args.cal_data:
+            if Path(args.cal_data).exists():
+                _cal = Path(args.cal_data)
+        else:
+            for p in [
+                Path(__file__).parent / "calibration_datav5.txt",
+                Path("./calibration_datav5.txt"),
+                Path("/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/scripts/calibration_datav5.txt"),
+            ]:
+                if p.exists():
+                    _cal = p
+                    break
+
+        gaps = []
+        if args.no_imatrix:
+            gaps.append("--no-imatrix is set")
+        if not tools.get("imatrix"):
+            gaps.append("llama-imatrix binary not found "
+                        f"(searched {tools.get('base', '?')}/build/bin and PATH)")
+        if _cal is None:
+            gaps.append("no calibration data (passed --cal-data or "
+                        "scripts/calibration_datav5.txt)")
+
+        if gaps:
+            print("", flush=True)
+            print("=" * 70, flush=True)
+            print("ERROR: imatrix is REQUIRED but cannot be computed.", flush=True)
+            print(f"  Tiers in queue that need imatrix ({len(imatrix_required_by)}):", flush=True)
+            for q in imatrix_required_by:
+                print(f"    - {q}", flush=True)
+            print("  Missing prerequisites:", flush=True)
+            for g in gaps:
+                print(f"    - {g}", flush=True)
+            print("", flush=True)
+            print("  Fix: build llama-imatrix (`cmake --build /opt/llama.cpp/build", flush=True)
+            print("       --target llama-imatrix -j`), provide calibration data via", flush=True)
+            print("       --cal-data, or drop the tiers with --exclude.", flush=True)
+            print("=" * 70, flush=True)
+            sys.exit(2)
+        else:
+            print(f"  imatrix gate: OK — {len(imatrix_required_by)} tier(s) require imatrix; "
+                  f"binary + cal data found.", flush=True)
+
     # HF repo
     hf_repo = None
     if not args.no_upload:
