@@ -96,7 +96,7 @@ components:
     git_remote: "git@github.com:mann1x/omnimergekit.git"
     subdir: "eval/"
     track: "main"
-    pinned_sha: "TBD-on-promotion"
+    pinned_sha: "da4d8703c387775b0e34a74020920d4aa293d450"
 
   templates:
     sha_check_command: "git rev-parse HEAD -- eval/templates/{}.yaml"
