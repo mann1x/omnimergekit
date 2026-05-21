@@ -14,6 +14,33 @@ file in parens). Do not re-litigate; comply.
 
 ## 1. The non-negotiables
 
+### 1.0 Canonical sampler is GREEDY — every Gemma 4 bench, every variant
+
+ALL canonical 9-bench templates (gpqa_diamond_full, gsm8k_100, math500_100, aime_30, arc_challenge_full, ifeval_100, humaneval_full, humanevalplus_full, lcb_medium_55*) **MUST** use:
+
+```yaml
+generation:
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+```
+
+This is the recipe of the v4 published model card and the v5-coder pod cohort. Apples-to-apples cross-variant comparisons (v4 vs v5 vs 128e vs 31B vs he1 etc.) **only work when every cohort uses this exact sampler**.
+
+**Why this is non-negotiable:**
+- Sampling (temp > 0) with Gemma 4 + `thinking_token_budget=12288` produces 10–40× longer reasoning chains than greedy on hard benches (GPQA p50: 617 → 24,055 chars in our 2026-05-17 incident).
+- The score itself may end up similar via flexible-extract, but token-stats columns, completion finish-reason distributions, GPQA domain breakdowns, etc. all become meaningless across cohorts.
+- A cohort that crosses the sampler boundary is unpublishable until the entire cohort is re-run on one side.
+
+**Mandatory before any canonical 9-bench launch:**
+1. `grep -E "temperature|do_sample" eval/templates/{gpqa_diamond_full,gsm8k_100,math500_100,aime_30,arc_challenge_full,ifeval_100,humaneval_full,humanevalplus_full,lcb_medium_55,lcb_medium_55_v4}.yaml` — verify every line shows `temperature: 0.0` and `do_sample: false` (or absence of `do_sample`, which defaults greedy in lm-eval).
+2. After launch, peek the first cached SQLite response at 5–10 questions in. If GPQA p50 > 5000 chars, **STOP** — sampler is wrong.
+
+**Want sampling for a separate study?** Make a **new** template file (`<bench>_sample.yaml`) and a **new** orchestrator that targets it. Never overwrite the greedy templates; never let a "new canonical" silently break cross-cohort comparison.
+
+`memory/feedback_canonical_eval_sampler_is_greedy.md`
+
 ### 1.1 NEVER skip resume / cache
 
 | Tool                              | Resume mechanism                        | Mandate |
@@ -75,6 +102,79 @@ ctx — fine for HE/MBPP/LCB chat. For GPQA's 24K gen budget, use
 `--parallel 1 -c 32768`.
 
 `memory/feedback_eval_token_cap_truncation.md` (write this if not present)
+
+### 1.4.5 ALWAYS pin the full eval stack across a cohort — vllm, lm-eval, drivers, torch, CUDA, cuDNN, templates
+
+**A "cohort" is any set of models whose scores will be compared in the same table or card** (e.g. `{128e, v4, v5, v5-coder}` for the canonical 9-bench, or `{v4 baseline, v5 α-sweep}` for a free-knob probe). Every model in the cohort MUST be evaluated with **bit-identical software** on every layer of the stack:
+
+| Layer | Pin to |
+|---|---|
+| **vllm** | EXACT git commit if source-built, EXACT version string if wheel (`vllm==0.20.2` ≠ `vllm 0.1.dev16519+g630492da3`). If you cherry-pick, every model in the cohort must be re-evaluated **after** the cherry. |
+| **lm-eval-harness** | EXACT version. `0.4.11` and `0.4.12` differ in API client retry semantics and reasoning-content fallback. |
+| **PyTorch + CUDA + cuDNN** | Same wheel build line (e.g. `torch==2.11.0+cu128`). cu128 vs cu130 = different kernels = different rounding. |
+| **NVIDIA driver** | Doesn't need to be identical across pod and solidpc, but driver-to-CUDA-runtime compatibility must hold (driver ≥ CUDA toolkit major required). |
+| **Templates** | The template YAML hash (`sha256` of the file content) must be identical across the cohort. A passing change to `thinking_token_budget` or `max_gen_toks` requires re-running the entire cohort. |
+| **Pod ↔ local stack** | Pod stacks must mirror solidpc's canonical stack as closely as possible. When the user says "match solidpc", that means same vllm commit / lm-eval version / torch wheel. Diverging means the pod's scores cannot be merged into a solidpc cohort. |
+
+**The cherry-pick trap (real, 2026-05-18 incident, cost us today):** v4 baseline IFEval-100 = 91.41% was recorded 2026-05-14 on solidpc with `vllm 0.1.dev16519+g630492da3` (pre-Fix-E). Today (2026-05-18) the same solidpc vllm-source is at HEAD `a39e23ed0` — 10+ commits ahead, including:
+- `a39e23ed0` Fix E: Gemma4 parser surfaces reasoning as content on half-open thinking
+- `8c79ad658` Revert #39917 routing replay (cherry #42434)
+- `fd7d858c8` hidden_pad/intermediate_pad from #34301
+
+Today's probe1 α=1.00 on bit-identical v4 weights produced **p50 response length = 24,467 chars vs v4 baseline's 754 chars (30× drift)**. The weights were verified bit-identical via `cmp`. The drift came from Fix E surfacing reasoning content that pre-Fix-E vllm dropped as empty. The "v4 baseline 91.41% IFEval" number is **post-Fix-E unreproducible** — comparisons against it from a Fix-E-aware vllm are meaningless.
+
+Meanwhile v5-coder (98.17% HE / 92.00% MATH / 94.00% IFEval) was scored on pod 36929284 with **stock `vllm==0.20.2` wheel** (no cherries, no Fix E). v5 was scored on solidpc source-build (cherries + Fix E). v4 was scored on solidpc source-build at an earlier commit. **All three "comparisons" are apples-to-oranges in three different ways.**
+
+**Minimum host hardware/driver floor for the canonical Gemma 4 stack (vllm 0.20.2 + torch 2.11.0+cu130):**
+
+| Component | Minimum |
+|---|---|
+| NVIDIA driver | **≥ 580.x** (CUDA 13.0 support; driver 570.x maxes at CUDA 12.8 and **cannot** load vllm 0.20.2's libcudart.so.13) |
+| cuda_max_good (vast.ai field) | **≥ 13.0** |
+| cuDNN | 9.x (canonical: 9.19.0) |
+| GPU VRAM | **≥ 24 GB** for any Gemma 4 26B-A4B NVFP4A16 eval; **≥ 48 GB** for 31B NVFP4A16 with max-model-len 65536, or BF16 surgery work |
+| Disk | ≥ 200 GB (single 26B BF16 model = 52 GB) |
+| Geolocation | **Exclude CN, HK** (Great Firewall blocks HF; mirror returns 405 on POST /api/repos) |
+
+**vllm 0.20.2 wheels are CUDA-13-only.** No cu128 build exists at `wheels.vllm.ai` or PyPI. A pod with driver 570/CUDA 12.8 (e.g. TX pod 36986767 with driver 570.181) **cannot run the canonical stack** — `import vllm._C` fails with `libcudart.so.13: cannot open shared object file`. Source-building vllm 0.20.2 against cu128 is possible but violates the cherry-pick / stack-pinning rule above. **Pick a CUDA-13 pod from the start.**
+
+**vast.ai query helper** (one-liner; emits compliant pods sorted by price):
+
+```bash
+vastai search offers 'cuda_max_good >= 13 num_gpus = 1 gpu_ram >= 24 disk_space >= 200 verified=true geolocation!=CN geolocation!=HK' -o 'dph_total' | head -30
+```
+
+For 31B / surgery work bump `gpu_ram >= 48`. For multi-GPU evals add `num_gpus >= 2`. The `cuda_max_good` field is what vast.ai exposes as the maximum CUDA toolkit the driver supports — this is the canonical compatibility gate, NOT `cuda_vers` (which is the toolkit installed in the image and is irrelevant; we control that with conda envs).
+
+`memory/reference_vastai_eval_pod_query.md`
+
+**Mandatory before any eval that will be tabulated:**
+
+1. **Print + log the full stack fingerprint:**
+   ```bash
+   python -c "
+   import vllm, lm_eval, torch, transformers, datasets
+   print('vllm', vllm.__version__, vllm.__file__)
+   print('lm_eval', lm_eval.__version__)
+   print('torch', torch.__version__, 'cuda', torch.version.cuda)
+   print('transformers', transformers.__version__)
+   print('datasets', datasets.__version__)
+   "
+   nvidia-smi --query-gpu=driver_version --format=csv,noheader
+   ```
+   Save this output to `<results_dir>/STACK.txt` for every model in the cohort. **A cohort whose entries have different STACK.txt is invalid.**
+
+2. **Template fingerprint:** `sha256sum <template>.yaml` → log to `STACK.txt`. Two cohort entries with different template hashes → invalid.
+
+3. **vllm git-commit pin for solidpc source builds:** any new model evaluated against an existing solidpc cohort MUST first verify `cd /srv/dev-disk-by-label-opt/dev/vllm-source && git rev-parse HEAD` equals the commit logged in the prior cohort entries' STACK.txt. If it differs, either re-evaluate the entire prior cohort on the new commit or roll back vllm-source to the cohort's pinned commit (`git checkout <commit>` + `pip install -e . --no-deps`).
+
+4. **Cohort = entire row of a comparison table.** Adding a new column (new model) does not let you change the stack. Adding a new bench column means re-running the existing models on that bench using the existing stack — not the freshest stack.
+
+5. **When in doubt, the pod must mirror solidpc, not vice versa.** Pod stacks drift faster (image freshness, default `+cuXXX` wheels). Solidpc's stack is the canonical anchor. If you must vary the pod stack (e.g. driver doesn't support cu130), the pod is a separate cohort — note it and don't merge the scores.
+
+**Why this is non-negotiable:** the entire point of "publishable scores" is reproducibility. A score that depends on a cherry-pick from 3 days ago that we can't reliably re-create is not publishable. We have **three** times in the last two weeks been bitten by this exact pattern.
+
+`memory/feedback_pin_eval_stack_across_cohort.md` (write this if not present)
 
 ### 1.4 LOCKED canonical settings per benchmark
 
@@ -1174,7 +1274,7 @@ Source of truth: `backup_models/scripts/pod_bootstrap_reeval.sh`. Phases:
 2. Miniconda3 install at `/workspace/miniconda` + accept Anaconda ToS for `main` + `r` channels.
 3. **vllm-source rsync + build** — patched vLLM (cherry-pick #42250 + #42434 + Fix E) lands at `/workspace/vllm-source`. **The build step is part of the vllm env install, not bootstrap** (see § 4.3).
 4. omnimergekit rsync to `/workspace/omnimergekit`.
-5. **HF auth + parallel BF16 pull with `HF_HUB_ENABLE_HF_TRANSFER=1`** — mandatory; see `feedback_hf_transfer_on_pods.md`. 5-10× speedup over single-connection HTTP.
+5. **HF auth + parallel BF16 pull with `HF_XET_HIGH_PERFORMANCE=1`** — mandatory; see `feedback_hf_transfer_on_pods.md`. 5-10× speedup over single-connection HTTP.
 6. Generate `pod_quant_and_push.sh` runner in `/workspace/scripts/`.
 
 ### 4.3 Phase 2 — conda envs (per `docs/CONDA_ENVS.md`)
@@ -1317,7 +1417,7 @@ tmux new-session -d -s reeval -- bash -lc "
     source /workspace/miniconda/etc/profile.d/conda.sh
     conda activate omnimergekit                # eval driver
     export PYTHONDONTWRITEBYTECODE=1
-    export HF_HUB_ENABLE_HF_TRANSFER=1
+    export HF_XET_HIGH_PERFORMANCE=1
     bash /workspace/scripts/pod_reeval_failures.sh \
         2>&1 | tee /workspace/logs/pod_reeval_failures.log
 "
@@ -1370,3 +1470,348 @@ nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
 If ANY of the 6 fails: STOP. Do not launch the eval — fix the
 broken step. This list exists because every entry corresponds to a
 failure we've shipped to production.
+
+## v3.2 — `--gpu-memory-utilization` is per-(model × GPU), NEVER a fixed default
+
+**MANDATORY:** every vLLM-driven eval (and every quant pipeline that boots
+vLLM) MUST set `--gpu-memory-utilization` tuned for the SPECIFIC pairing of
+{model size, GPU VRAM, max-model-len, max-num-seqs}. There is no "safe
+default" that works across GPUs. Pick a value that is **just enough** to
+hold (model + activations + KV-cache pool for the expected concurrency ×
+context); anything higher is wasted VRAM that another job could use,
+anything lower aborts vLLM with `Available KV cache memory: -X GiB` or
+`No available memory for the cache blocks`.
+
+### v3.2.1 The pathology — why a "fixed 0.92" hides bugs
+
+vLLM's `--gpu-memory-utilization X` is a **hard reservation** of
+`total_gpu_memory × X` at startup, not an upper-cap that grows as KV-cache
+fills. Once allocated, that slab is held even when the actual KV cache is
+at 2%. Two failure modes hit us in production:
+
+- **Solidpc 3090 (24 GB) regression — 2026-05-17:** patched `eval_suite_vllm.sh`
+  from 0.92 → 0.55 to mirror the 48 GB pod scripts. 0.55 × 24 GB = 13.2 GB,
+  which equals the Gemma 4 26B-A4B NVFP4A16 model size *with no room for KV
+  cache*. vLLM died at `Available KV cache memory: -0.88 GiB`. ~25 min of
+  eval lost.
+- **Pod 36929284 4090 (48 GB) inverse:** v5-coder eval booted at 0.92 ×
+  48 GB = 44 GB held, while measured KV-cache usage stayed at 1.8–2.9%
+  across an hour. That's ~30 GB of GPU left idle when a parallel NVFP4A16
+  quant could have shared the card.
+- **Pod 36949547 RTX 6000 Ada (48 GB) 31B dense — 2026-05-17:** dense 31B
+  NVFP4A16 (~21 GB) at 0.65 × 48 GB = 31.2 GB → 9.41 GB for KV cache, but
+  max-model-len=32768 needs 9.54 GB. ValueError at engine init. Bumped to
+  0.70 (33.6 GB → ~12 GB KV) and it booted.
+
+The common failure mode: copying a value that worked elsewhere instead of
+computing the budget for the current pairing.
+
+### v3.2.2 The formula — apply BEFORE every vLLM launch
+
+```
+budget_GB           = total_gpu_VRAM_GB × gpu_memory_utilization
+model_VRAM_GB       = (file size of weights on GPU; ~13 GB for Gemma 4 26B
+                       NVFP4A16, ~21 GB for Gemma 4 31B NVFP4A16,
+                       ~52 GB for Gemma 4 26B BF16)
+activation_GB       = ~1.5–2 GB constant (CUDA graphs + buffers + tiny scratch)
+kv_per_token_GB     = 2 × n_layers × hidden_dim × dtype_bytes / 1e9
+                       (Gemma 4 26B-A4B at bf16 KV cache: ~0.0005 GB/token)
+kv_required_GB      = max_num_seqs × max_model_len × kv_per_token_GB
+
+# Constraint
+budget_GB ≥ model_VRAM_GB + activation_GB + kv_required_GB
+# Solve for the minimum util that fits with ~10% slack:
+util_min            = (model_VRAM_GB + activation_GB + kv_required_GB × 1.1)
+                      / total_gpu_VRAM_GB
+```
+
+Pick `util_min` rounded up to the nearest 0.05. Always reserve ~10% slack
+in `kv_required_GB` for CUDA graph profiling overhead (see vLLM's
+own message: "the current --gpu-memory-utilization=0.5500 is equivalent
+to --gpu-memory-utilization=0.5464 without CUDA graph memory profiling").
+
+### v3.2.3 Reference table — known-good values (2026-05-17 onwards)
+
+These are launch points; always verify with v3.2.4 below before committing
+multi-hour work.
+
+| GPU            | VRAM  | Model                       | max-model-len | gpu_mem_util | Headroom for parallel work |
+|----------------|-------|-----------------------------|---------------|--------------|----------------------------|
+| RTX 3090       | 24 GB | Gemma 4 26B-A4B NVFP4A16    | 32768         | **0.90**     | ~2 GB (none — solidpc is single-job) |
+| RTX 3090       | 24 GB | Gemma 4 26B-A4B Q6_K (GGUF) | 32768         | n/a (llama.cpp) | — |
+| RTX 4090       | 48 GB | Gemma 4 26B-A4B NVFP4A16    | 32768         | **0.55**     | ~22 GB (room for NVFP4A16 quant) |
+| RTX 6000 Ada   | 48 GB | Gemma 4 31B-dense NVFP4A16  | 32768         | **0.70**     | ~14 GB (room for one small auxiliary) |
+| RTX 6000 Ada   | 48 GB | Gemma 4 31B-dense NVFP4A16  | 65536         | **0.80**     | ~10 GB (tight) |
+| A100 80GB      | 80 GB | Gemma 4 26B-A4B NVFP4A16    | 32768         | **0.35**     | ~52 GB (room for full BF16 + quant) |
+| A100 80GB      | 80 GB | Gemma 4 31B-dense NVFP4A16  | 32768         | **0.45**     | ~44 GB |
+
+Rows are **examples**, not a closed list. New pairings require a fresh
+calculation per v3.2.2.
+
+### v3.2.4 Validation step — first 60 seconds after vLLM boots
+
+Before walking away, confirm the eval actually progressed past engine init:
+
+```bash
+# 1. Engine actually started (model weights on GPU)
+nvidia-smi --query-gpu=memory.used --format=csv,noheader
+# Expect: ≥ model_VRAM_GB; if 0 MiB → engine died at init, read vllm_server.log
+
+# 2. /health responds 200 (vLLM bound port)
+curl -fs http://localhost:$PORT/health && echo OK
+
+# 3. Grep the boot log for the actual KV-cache budget vLLM picked
+grep -E "Available KV cache memory|GPU KV cache usage" $VLLM_LOG | head -3
+# Expect: positive "Available KV cache memory: N GiB" where N ≥ 1
+```
+
+If `Available KV cache memory: -X GiB` appears, vLLM aborted at
+`_check_enough_kv_cache_memory` — bump util or lower max-model-len
+**before** spending compute. If the engine boots but KV usage stays under
+10% for an hour, util is over-reserved — lower it next run to free GPU
+for parallel work.
+
+### v3.2.5 Where to commit the value
+
+- `scripts/pod_*_eval.sh` — one line per pod script; the value lives next
+  to `--max-model-len` and `--max-num-seqs` in the vLLM launch block.
+  Scripts MUST NOT share util values across different pod hardware.
+- `scripts/eval_suite_vllm.sh` (solidpc orchestrator) — value is keyed to
+  the 3090 (0.90 today); never copy from a pod script.
+- `omnimergekit/scripts/quantize_gguf.py` — uses its own `auto_ngl()`
+  for the imatrix step; not affected by this rule.
+
+### v3.2.6 Memory entry
+
+Cross-reference: [`feedback_vllm_gpu_memory_util_cap_not_reserve.md`]
+documents the failure modes above with the dated incidents. Update it
+whenever a new (model, GPU, util) pair is validated in production.
+
+## v3.3 — Stack lock + canary verification + update procedure (2026-05-21)
+
+The eval stack is no longer "whatever pip happened to install"; it is a
+versioned artifact described by `eval/stack.lock.yaml`. Cohorts must
+pin to a stack version; HF cards must cite it; stack updates must pass
+the canary regime before promotion. This section is **the procedure to
+follow** every time vLLM (or any stack component) needs to be updated.
+
+### v3.3.1 Why a locked stack exists
+
+We hit two opposite stack failures on Gemma 4 in succession:
+
+- **Fix-E dev build** (vLLM commit `630492da3` + cherry-picks + 8-line
+  parser patch): produced clean short answers on HE / IFEval (p50 ≈
+  600–700 chars) but under-counted **AIME** (~36 % real-vs-73 % on
+  128e) — the artifact was traced to extraction edge cases on a non-
+  released branch state.
+- **Stock vLLM 0.20.2 release wheel**: reveals real AIME scores
+  (~70 % for 26B-A4B class, matches 31B dense reference) but blows up
+  **HE / IFEval / HE+** response lengths 10–30× on pruned MoE
+  variants → IFEval drops to 22 %, HE drops 2–7 pp. Root cause: the
+  release was tagged **before** `#42250` (Gemma4 MoE closure capture
+  fix) was merged. Per-expert scale captured in a stale closure during
+  `functional_call` substitution → routing distribution wrong on
+  pruned MoE → model ruminates → reasoning parser sees half-open
+  thinking → content polluted.
+
+Neither stack is uniformly correct. **Both numbers from both stacks
+were partly real and partly artifact.** This is exactly the kind of
+silent contamination that motivates the locked-stack-with-canary
+regime.
+
+### v3.3.2 Stack contents (the four components)
+
+`eval/stack.lock.yaml` describes:
+
+1. **vLLM**: branch + base commit SHA + ordered list of cherry-picks.
+   For NVFP4A16 Gemma 4 MoE eval, the locked stack is built from
+   source — there is no released wheel that passes the canary today.
+2. **lm-eval**: `lm-eval[api,math,ifeval]==0.4.11` + the **Fix-A
+   `reasoning_content` fallback patch** (`openai_completions.py`).
+3. **modelopt**: pinned at `0.43.0` (`0.44.0` has two Gemma 4
+   regressions).
+4. **omnimergekit eval/**: pinned git SHA so templates are reproducible.
+
+Hardware floor is also in the lock (CUDA driver ≥ 580, cuDNN ≥ 9,
+VRAM ≥ 24 GB) — pods that don't meet it are rejected before rent.
+
+### v3.3.3 Canary regime (two layers)
+
+**Layer 1 — Structural rules** (`eval/structural_canary.py`):
+model-agnostic post-processing of any `samples_*.jsonl`. Empirically
+calibrated thresholds catch parser/scorer breakage regardless of which
+model is being evaluated. Five rules:
+
+1. `empty_content_rate` ≤ 5 % on thinking-on benches
+2. `marker_leak_in_content` == 0 (no `<|channel>`, `<bos>`, etc. in
+   content)
+3. `response_p10_chars` inside the per-bench-kind healthy band
+   (short_answer 0–2000, thinking_reasoning 200–60000)
+4. `response_p50_chars` inside the upper bound (short_answer ≤ 5000,
+   thinking_reasoning ≤ 60000) — **this is the rule that caught the
+   v6 IFEval cliff on stock 0.20.2** (observed p50 = 23 528)
+5. `response_p99_chars` ≤ 4× p50 upper bound — catches `finish_reason
+   = length` budget saturation
+
+**Layer 2 — Reference anchor** (`eval/omk_canary.py` +
+`eval/stack_anchors.yaml`): runs a fixed 30-question subset (10 GPQA +
+10 AIME + 10 IFEval, see `templates/anchor30.yaml`) against a
+**per-family anchor model** (e.g. `gemma-4-26B-A4B-it` for the
+26B-A4B family) and compares scored result to the recorded
+expectation within tolerance. This catches stack-level **scoring**
+drift the structural rules cannot see — the AIME 36-vs-73 case had
+normal response shape but wrong scores.
+
+Both layers must pass. Either alone is insufficient.
+
+### v3.3.4 Procedure to update vLLM to a newer dev build
+
+When you want to refresh the stack (new vLLM dev commits, new Gemma 4
+fix landed, etc.), follow these eight steps. **Do not skip.** Every
+prior stack disaster came from skipping one.
+
+**Step 1 — Survey the commit range.** Clone vLLM main, find the
+commit range between current stack's base SHA and the new target HEAD.
+Filter for Gemma / MoE / reasoning / parser changes:
+
+```bash
+cd /tmp && git clone --depth 500 https://github.com/vllm-project/vllm.git
+cd vllm
+git log <current_base>..<target_head> --format='%h %ai %s' \
+    | grep -iE "gemma|moe|reasoning|parser|routing|chat.template"
+```
+
+For each commit in the filter, decide: **does it touch the response
+path** (parser output, content/reasoning split, finish detection)? If
+yes, treat it as canary-relevant.
+
+**Step 2 — Verify the load-bearing fix is still present.**
+`#42250` (Gemma4 MoE routing closure captures per_expert_scale) is the
+rumination root-cause fix. Confirm it's in the target HEAD:
+
+```bash
+git log <target_head> | grep -E "42250|closure.captures|per_expert_scale"
+```
+
+If absent (e.g. tagged release before merge), abort or cherry-pick
+explicitly. Stock 0.20.2 was the exact case where this PR was missing
+and the stack failed.
+
+**Step 3 — Verify nothing regressed.** Check that prior reverts are
+still effective. For example, `#39917` (routing replay) was the
+upstream change that broke MoE; it was reverted via `#42434`. Confirm
+the revert is still effective and a sneakily-re-merged version hasn't
+shown up:
+
+```bash
+git log <target_head> | grep -E "39917|routing.replay|device.cache"
+```
+
+If `#39917` appears without an offsetting revert, do NOT use this
+HEAD as-is.
+
+**Step 4 — Check the reasoning parser file directly.**
+`vllm/reasoning/gemma4_reasoning_parser.py` is the file that owns
+content/reasoning split. Compare against the current stack:
+
+```bash
+git log <current_base>..<target_head> -- vllm/reasoning/gemma4_reasoning_parser.py
+```
+
+If the file changed upstream, **read the diff** before adopting. A
+change here can silently flip whether reasoning leaks into content.
+
+**Step 5 — Cherry-pick Fix-E parser hardening.** The 8-line fix
+(`a39e23ed0` original, currently `3d92852eb` on
+`gemma4-moe-stack-v2`) handles the half-open thinking case (no
+`<channel|>` close emitted). Apply on top of the target HEAD:
+
+```bash
+cd /srv/dev-disk-by-label-opt/dev/vllm-source
+git fetch upstream
+git checkout -B gemma4-moe-stack-vN+1 upstream/main   # bump N
+git cherry-pick a39e23ed0                              # or current SHA
+```
+
+The branch name must match `stack.lock.yaml`'s
+`components.vllm.source.branch`.
+
+**Step 6 — Build wheels.** Run
+`scripts/build_vllm_wheels.sh` (idempotent, prereqs documented in
+the script header). Produces per-arch wheels under
+`wheels/gemma4-moe-stack-vN+1/`:
+
+```bash
+bash scripts/build_vllm_wheels.sh                # all arches (sm86-sm120)
+bash scripts/build_vllm_wheels.sh sm86           # 3090 only
+bash scripts/build_vllm_wheels.sh --multi        # one fat wheel
+```
+
+**Do not build while GPU evals are in flight** — the build is CPU
+bound but pulls ~12 cores and may stall the eval orchestrator.
+
+**Step 7 — Bump `stack.lock.yaml`.** Increment `version:`. Update
+`components.vllm.source.base_sha` to the new target HEAD. Update
+`upstream_fixes_in_base` to reflect any new Gemma-4-relevant PRs
+that landed. Commit to omk.
+
+**Step 8 — Run the canary on the new stack.** Pick the anchor model
+from `stack_anchors.yaml` for the family being worked on:
+
+```bash
+python eval/omk_canary.py \
+    --stack eval/stack.lock.yaml \
+    --anchor-model google/gemma-4-26B-A4B-it-NVFP4A16 \
+    --served-name 128e_nvfp4a16 \
+    --family gemma-4-26B-A4B \
+    --out eval_results/canary/<stack_name>_<ts>/
+```
+
+- **All structural rules pass** AND
+- **All anchor scores within recorded tolerance** (currently ±20pp
+  for sub-bench n=10 entries):
+
+  → Promote. Append entry to `STACK_HISTORY.md` with date, PRs picked
+  up, canary table. Cohort runs can now reference the new version.
+
+If any rule fails, **iterate on the stack, not on the canary**.
+Adjusting tolerances to make a broken stack pass defeats the regime.
+
+### v3.3.5 What to do when a canary fails
+
+The two failure modes have different remediation paths:
+
+- **Structural canary fails** (p50/p99 explode, marker leak, etc.):
+  the parser/server is broken. Likely candidates: a vLLM commit
+  between current and target changed channel handling, or a routing
+  fix regressed. Bisect with `git bisect` between current base SHA
+  and target HEAD using a single-question response-length probe as
+  the test.
+
+- **Anchor canary fails** (structural rules pass, scores drift > tol):
+  the parser is mechanically OK but extraction is wrong. Look at
+  template `process_results` and the filter pipeline. AIME 36 vs 73
+  was this class — the `aime24_chat` shadow task fixed extraction
+  while `aime24` (non-chat) kept the bug.
+
+### v3.3.6 STACK.txt — runtime fingerprint (mandatory)
+
+Already in §1.4.5; reinforced under v3 with one addition: every
+`omk_eval.py` run writes `<result_dir>/STACK.txt` recording the
+**stack version from `stack.lock.yaml`** that produced this number.
+HF model cards cite the version in the cohort table footer. Cross-
+stack comparisons are explicitly called out as not-apples-to-apples
+in the card text.
+
+### v3.3.7 Files in this regime
+
+| File | Owns |
+|---|---|
+| `eval/stack.lock.yaml` | Versioned stack components (vLLM + cherry-picks, lm-eval + patches, modelopt, omk SHA, templates SHAs) |
+| `eval/stack_anchors.yaml` | Per-family recorded reference scores |
+| `eval/structural_canary.py` | Layer-1 rules over any `samples_*.jsonl` |
+| `eval/omk_canary.py` | Layer-2 orchestrator (run anchor → diff to expectations) |
+| `eval/templates/anchor30.yaml` | Fixed 30-question canary subset |
+| `scripts/build_vllm_wheels.sh` | Per-arch wheel builder for the locked vLLM source |
+| `scripts/install_stack.sh` | Idempotent installer (local + pod) |
+| `eval/STACK_HISTORY.md` | Append-only log of stack promotions |
