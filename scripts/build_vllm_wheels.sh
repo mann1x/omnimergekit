@@ -64,6 +64,85 @@ git checkout "$BRANCH" 2>&1 | tail -3
 SHA=$(git rev-parse --short HEAD)
 log "vllm-source branch=$BRANCH  HEAD=$SHA"
 
+# Pin compiler to conda-forge gcc-11 in the vllm env. Debian 11 system gcc
+# is 10.2, but vllm's CMake requires >=11.0; without this the build picks
+# up /usr/bin/gcc and aborts at the version check. The conda binaries are
+# installed by `conda install -n vllm -c conda-forge gcc_linux-64=11.4
+# gxx_linux-64=11 cmake ninja` (see EVAL_PROTOCOL §v3.3 step 6 prereqs).
+CONDA_GCC=/root/anaconda3/envs/vllm/bin/x86_64-conda-linux-gnu-gcc
+CONDA_GXX=/root/anaconda3/envs/vllm/bin/x86_64-conda-linux-gnu-g++
+if [[ ! -x "$CONDA_GCC" || ! -x "$CONDA_GXX" ]]; then
+    echo "ERROR: conda gcc-11 toolchain missing in vllm env" >&2
+    echo "  install: conda install -n vllm -c conda-forge gcc_linux-64=11.4 gxx_linux-64=11 cmake ninja" >&2
+    exit 3
+fi
+export CC="$CONDA_GCC"
+export CXX="$CONDA_GXX"
+# nvcc has its OWN host compiler discovery — without this it picks up
+# Debian 11's /usr/bin/gcc → gcc-10, which ICEs on CUDA-13 + cccl's heavy
+# C++20 templates (see vllm csrc/moe/permute_unpermute_kernels). CUDAHOSTCXX
+# is what CMake reads to populate CMAKE_CUDA_HOST_COMPILER, which becomes
+# nvcc's -ccbin flag. CUDA 13.2 supports gcc 11–14, conda gcc-11.4 works.
+export CUDAHOSTCXX="$CONDA_GXX"
+log "CC=$CC ($($CC -dumpversion))"
+log "CXX=$CXX ($($CXX -dumpversion))"
+log "CUDAHOSTCXX=$CUDAHOSTCXX (nvcc -ccbin will use this for host compiles)"
+
+# Put the env's bin first so CMake's discovery sees conda's cmake/ninja too.
+export PATH="/root/anaconda3/envs/vllm/bin:$PATH"
+
+# ccache — cache compiled host C/C++ AND nvcc CUDA objects across arches and
+# across reruns. Single persistent dir on backup_models so the cache survives
+# pod-to-pod transfers via rsync if we ever want to seed an A100 build.
+# Expected hit rate after the first full sm86 build: 30-60 % on subsequent
+# arches (most of vllm's C++ doesn't depend on the CUDA arch). Without this,
+# every arch re-compiles ~3500 host C++ TUs from scratch.
+if ! command -v ccache >/dev/null 2>&1; then
+    echo "ERROR: ccache not found on PATH" >&2
+    exit 4
+fi
+export CCACHE_DIR=/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/wheels/gemma4-moe-stack-v2/ccache
+mkdir -p "$CCACHE_DIR"
+# Hash by content not mtime — conda envs touch binaries during install
+export CCACHE_COMPILERCHECK=content
+# nvcc/CMake generate timestamped wrappers; relax sloppiness to land hits
+export CCACHE_SLOPPINESS=pch_defines,time_macros,include_file_mtime,include_file_ctime,locale
+ccache --max-size=25G >/dev/null
+ccache --zero-stats >/dev/null
+log "ccache $(ccache --version | head -1 | awk '{print $3}') dir=$CCACHE_DIR (max 25G)"
+
+# CMake launcher wiring — applied to every Extension/CUDA target via env
+export CMAKE_C_COMPILER_LAUNCHER=ccache
+export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+export CMAKE_CUDA_COMPILER_LAUNCHER=ccache
+# Some vllm CMake paths still respect plain VLLM_CCACHE/USE_CCACHE
+export USE_CCACHE=1
+
+# Skip FetchContent network ops by pointing every external project at the
+# already-downloaded .deps/*-src tree. First-time build downloaded these on
+# 2026-05-21; subsequent rebuilds reuse them. GitHub's pack delivery for
+# the NVIDIA/cutlass submodule under FlashMLA is rate-limited to ~1 MB/min
+# from solidpc → without these env vars an sm86 configure takes 100+ min.
+#
+# Arch impact for sm86 (3090): DeepGEMM and FlashMLA kernels only build
+# for sm90a (Hopper); qutlass only for sm100 (datacenter Blackwell). So
+# for sm86 these are source-only — we still need the dir to exist so the
+# CMake INCLUDE doesn't fail, but no kernels compile from them.
+DEPS=/srv/dev-disk-by-label-opt/dev/vllm-source/.deps
+if [[ -d "$DEPS/flashmla-src" ]]; then
+    export FLASH_MLA_SRC_DIR="$DEPS/flashmla-src"
+    export DEEPGEMM_SRC_DIR="$DEPS/deepgemm-src"
+    export QUTLASS_SRC_DIR="$DEPS/qutlass-src"
+    # NOTE: triton_kernels.cmake's env-var branch expects the DEEP python
+    # subdir (per the in-file comment "directly set to the triton_kernels
+    # python directory"). The git-fetch branch uses SOURCE_SUBDIR to scope.
+    # Pointing at the repo root triggers `find_package(MLIR)` against the
+    # full Triton CMakeLists.txt, which fails on systems without LLVM/MLIR.
+    export TRITON_KERNELS_SRC_DIR="$DEPS/triton_kernels-src/python/triton_kernels/triton_kernels"
+    export VLLM_FLASH_ATTN_SRC_DIR="$DEPS/vllm-flash-attn-src"
+    log "FetchContent local-source: FLASH_MLA / DEEPGEMM / QUTLASS / TRITON_KERNELS / VLLM_FLASH_ATTN → $DEPS/*-src"
+fi
+
 # Sanity check: Fix-E patch is present
 if ! grep -q "Fix E (parser hardening" vllm/reasoning/gemma4_reasoning_parser.py; then
     echo "ERROR: Fix-E patch not detected in $BRANCH — abort" >&2
@@ -86,15 +165,24 @@ build_one_arch() {
     export CMAKE_BUILD_TYPE=Release
 
     local t0=$(date +%s)
-    "$PY" setup.py bdist_wheel 2>&1 | tail -50
+    # NOTE: do NOT pipe through `tail` — buffer trap hides real-time errors.
+    # Full output is captured in the wrapper's log file already.
+    "$PY" setup.py bdist_wheel 2>&1
     local t1=$(date +%s)
     log "$arch built in $((t1-t0))s"
 
-    # Tag wheel with arch suffix and stash
+    # Tag wheel with arch suffix in the version local-tag (PEP 440 compatible).
+    # vLLM ships wheels named vllm-<ver>+g<sha>.cu132-cp311-cp311-linux_x86_64.whl;
+    # inserting .<arch> AFTER the .cu132 local tag keeps the platform tag clean
+    # (linux_x86_64) so pip will install — putting it after platform tag breaks
+    # PEP 425 and pip rejects with "not a supported wheel on this platform".
     local W=$(ls -t dist/*.whl | head -1)
     [[ -z "$W" ]] && { echo "no wheel produced for $arch"; return 1; }
-    local BASE=$(basename "$W" .whl)
-    local OUT="${WHEELS_DIR}/${BASE}+${arch}.whl"
+    local BASENAME=$(basename "$W")
+    # Replace "-cp311-cp311-" boundary: insert .${arch} just before it.
+    # If the existing version already ends with .cuNNN (local tag), append .<arch> to it.
+    local OUTNAME=$(echo "$BASENAME" | sed -E "s/(-cp311-cp311-linux_x86_64\.whl)$/.${arch}\1/")
+    local OUT="${WHEELS_DIR}/${OUTNAME}"
     mv "$W" "$OUT"
     log "  → $OUT  ($(du -h "$OUT" | cut -f1))"
 }
@@ -115,7 +203,9 @@ build_multi() {
     export CMAKE_BUILD_TYPE=Release
 
     local t0=$(date +%s)
-    "$PY" setup.py bdist_wheel 2>&1 | tail -50
+    # NOTE: do NOT pipe through `tail` — buffer trap hides real-time errors.
+    # Full output is captured in the wrapper's log file already.
+    "$PY" setup.py bdist_wheel 2>&1
     local t1=$(date +%s)
     log "multi-arch built in $((t1-t0))s"
 

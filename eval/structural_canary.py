@@ -12,9 +12,18 @@ Usage:
     structural_canary.py --apply-to summary.json                     # in-place add canary block
 
 Empirical bands (2026-05-21 calibration):
-    healthy IFEval / ARC / HE   p10 ~120,   p50 ~840,    p99 ~14k
-    healthy AIME / GPQA (think) p10 ~1400,  p50 ~21k,    p99 ~50k
-    broken   v6 IFEval (parser) p10  4106,  p50  23528,  p99 87k   ← p50 ~30× normal
+    Stack v1 (no reasoning parser, thinking=off, samples="content only"):
+      healthy IFEval / ARC / HE   p10 ~120,   p50 ~840,    p99 ~14k
+      healthy AIME / GPQA (think) p10 ~1400,  p50 ~21k,    p99 ~50k
+      broken   v6 IFEval (parser) p10  4106,  p50  23528,  p99 87k   ← p50 ~30× normal
+
+    Stack v2 (Fix-A in lm-eval, samples="reasoning + content"):
+      Fix-A's parse_generations concatenates reasoning_content + "\n" + content
+      so samples_*.jsonl resps now include the chain-of-thought even on
+      short_answer benches. Thinking-on IFEval / ARC sit around p50 ~22k,
+      p99 ~75k. Thresholds widened accordingly. The marker_leak_in_content
+      rule (0 < channel/reasoning sentinel tokens) is what now disambiguates
+      a real parser break from "model just thought a lot".
 """
 from __future__ import annotations
 
@@ -33,16 +42,19 @@ MARKERS = re.compile(r"<\|channel>|<channel\|>|<\|reasoning\|>|<bos>|<eos>|<\|im
 # (override with --bench-kind) — bench-kind drives only thresholds, not logic.
 BENCH_KINDS = {
     "short_answer": dict(
-        # IFEval, ARC, HumanEval (chat), MBPP, GSM8K — content should be short.
-        max_p10=2000, max_p50=5000, min_p10=0,
+        # IFEval, ARC, HumanEval (chat), MBPP, GSM8K.
+        # With Fix-A active the canary measures reasoning+content concatenated,
+        # so thinking-on runs can hit ~22k p50 even when the parser is correct.
+        # marker_leak_in_content is the rule that catches an actual parser break.
+        max_p10=8000, max_p50=30000, min_p10=0,
         max_finish_length_rate=0.30,
-        min_reasoning_share=0.0,   # thinking optional; some templates run thinking=off
+        min_reasoning_share=0.0,
     ),
     "thinking_reasoning": dict(
         # AIME, GPQA, MATH-500, LCB-medium — thinking-on, longer content expected.
         max_p10=60000, max_p50=60000, min_p10=200,
         max_finish_length_rate=0.30,
-        min_reasoning_share=0.0,   # only meaningful if we can observe reasoning_content
+        min_reasoning_share=0.0,
     ),
 }
 

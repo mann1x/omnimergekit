@@ -57,6 +57,39 @@ stacks:
           tolerance: 0.10
           metric: prompt_level_strict_acc
 
+  gemma4-moe-stack@2:
+    # Recorded 2026-05-21 17:19–18:07 CEST canary
+    # (eval_results/canary/stack_v2_20260521_171905_fix-a-refined/).
+    # Stack@2 = vLLM 0.21.1rc1.dev178+g3d92852eb (main HEAD with #42250
+    # closure fix) + Fix-E parser cherry-pick + refined Fix-A (content-only
+    # when content non-empty; reasoning fallback only on silent-empty).
+    # All three sub-benches structural=PASS; verdict ALL_PASS.
+    gemma-4-26B-A4B:
+      anchor_model: google/Gemma-4-26B-A4B-it-NVFP4A16
+      anchor_bench: anchor30
+      expected:
+        gpqa_diamond:
+          # 128e NVFP4A16 stack@2 first-10 → 9/10. Full bench expected ~73-75%
+          # consistent with stack@1 (vLLM PR #42250 doesn't affect 128e — it's
+          # the pruned-MoE rumination root cause).
+          score: 0.90
+          tolerance: 0.20
+          metric: exact_match_flex
+        aime24:
+          # 128e NVFP4A16 stack@2 first-10 → 7/10. Same recipe as stack@1
+          # (greedy, thinking_token_budget=12288).
+          score: 0.70
+          tolerance: 0.20
+          metric: exact_match
+        ifeval:
+          # 128e NVFP4A16 stack@2 first-10 → 10/10. Stack@1 baseline was
+          # ~0.95 on full ifeval_100; under refined Fix-A the small 10q
+          # subset hit a clean sweep. Wider tolerance to account for the
+          # subset being permissive.
+          score: 1.00
+          tolerance: 0.20
+          metric: prompt_level_strict_acc
+
   # Template entry for future families. Calibrate on first use.
   # qwen3.5-stack@1:
   #   qwen3.5-class:

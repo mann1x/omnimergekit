@@ -550,6 +550,7 @@ def dispatch_lcb(template: dict, model_tag: str, base_url: str,
         "--http-timeout", str(g.get("http_timeout", 900.0)),
         "--difficulty", sel.get("difficulty", "medium"),
         "--min-date", sel.get("min_date", "2024-10-01"),
+        *(["--task-ids", ",".join(sel["task_ids"])] if sel.get("task_ids") else []),
         # For smoke runs (n<=10) honor template `n` exactly; for full runs pad
         # by 50 so the shim's post-filter pool has enough candidates to yield n.
         # Bug 2026-05-16: lcb_medium_1_smoke (n=1) was emitting --limit 51
@@ -837,6 +838,14 @@ def main() -> None:
     ap.add_argument("--no-server", action="store_true",
                     help="use an already-running server on --port")
     ap.add_argument("--max-model-len", type=int, default=32768)
+    ap.add_argument("--gpu-mem-util", type=float, default=None,
+                    help="Override vLLM --gpu-memory-utilization. Takes precedence over "
+                    "template backend_args.vllm_gpu_memory_utilization.")
+    ap.add_argument("--max-num-seqs", type=int, default=None,
+                    help="Override vLLM --max-num-seqs. Reduces the cudagraph capture set "
+                    "(default captures 51 sizes 1..512, ~5 GiB graph buffer). Set to 4 to "
+                    "fit 128e (full) Gemma 4 26B-A4B NVFP4A16 + 32k KV cache on a 24 GiB "
+                    "3090. Takes precedence over template backend_args.vllm_max_num_seqs.")
     ap.add_argument("--limit", type=int, default=0,
                     help="Pass --limit N to lm-eval (smoke runs). 0 = full set.")
     args = ap.parse_args()
@@ -871,6 +880,9 @@ def main() -> None:
             server = launch_vllm(
                 args.model, args.port, quant, log_path,
                 served_name, max_model_len=args.max_model_len,
+                # gpu_memory_utilization override precedence: CLI > template > 0.92.
+                gpu_mem_util=(args.gpu_mem_util if args.gpu_mem_util is not None
+                              else float(ba.get("vllm_gpu_memory_utilization", 0.92))),
                 # Per-template override (e.g. for a bench that needs eager
                 # to dodge a graph-capture crash). Default is False = CUDA
                 # graphs ON, which the 90.91% LCB-55 result proved safe.
@@ -885,7 +897,17 @@ def main() -> None:
                 # vLLM applies these on every chat-completions call unless the
                 # request overrides them. Verified end-to-end on 2026-05-12.
                 default_chat_template_kwargs=ba.get("vllm_default_chat_template_kwargs"),
-                extra=ba.get("vllm_extra") or None,
+                # max_num_seqs precedence: CLI > template > vLLM default (~256).
+                # Folded into `extra` (no dedicated launch_vllm kwarg). Capping
+                # to e.g. 4 trims the cudagraph capture set proportionally,
+                # saving ~4-5 GiB. Required to fit full 128e 26B-A4B NVFP4A16
+                # + 32k KV cache on 24 GiB GPUs.
+                extra=(
+                    (["--max-num-seqs", str(args.max_num_seqs)] if args.max_num_seqs is not None
+                     else ["--max-num-seqs", str(ba["vllm_max_num_seqs"])]
+                     if "vllm_max_num_seqs" in ba else [])
+                    + (ba.get("vllm_extra") or [])
+                ) or None,
             )
         else:
             # Compose llama extras: bench-typed defaults + template override.

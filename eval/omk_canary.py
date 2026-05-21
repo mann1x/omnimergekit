@@ -40,17 +40,28 @@ def load_yaml(p): return yaml.safe_load(Path(p).read_text())
 
 def run_subbench(*, sub_name, parent_template, indices, model_dir, served_name,
                  out_dir: Path, backend="vllm"):
-    """Run one anchor sub-bench by invoking omk_eval.py with a parent template
-    override (--limit-indices). Writes results under out_dir/<sub_name>/."""
+    """Run one anchor sub-bench by invoking omk_eval.py with the parent template
+    truncated via --limit. omk_eval has no --limit-indices, so for first-run
+    canaries we collapse the (possibly strided) indices list to its length and
+    take first-N from the parent template; this stays deterministic and the
+    indices are recorded with the anchor for future @<version> comparisons."""
     out_dir.mkdir(parents=True, exist_ok=True)
+    n = len(indices)
     cmd = [
         sys.executable, str(OMK_EVAL),
         "--template", parent_template,
-        "--model-dir", str(model_dir),
+        "--model", str(model_dir),
         "--served-name", served_name,
         "--results-dir", str(out_dir / sub_name),
         "--backend", backend,
-        "--limit-indices", ",".join(map(str, indices)),
+        "--limit", str(n),
+        # Keep canonical 0.92 + 32k context. Cap max-num-seqs to 4 so vLLM's
+        # cudagraph capture set drops from ~51 sizes (default ~256 max_num_seqs,
+        # ~5 GiB graph buffers) down to [1, 2, 4] (~0.3 GiB). That frees enough
+        # budget for full 128e Gemma 4 26B-A4B NVFP4A16 weights (~13 GiB) +
+        # 32k KV cache (1.6 GiB) on a 24 GiB 3090. No throughput hit at the
+        # canary's batch=1 lm-eval concurrency.
+        "--max-num-seqs", "4",
     ]
     print(f"  → {' '.join(cmd)}", flush=True)
     rc = subprocess.call(cmd)
@@ -98,9 +109,16 @@ def main():
     anchors = load_yaml(args.anchors_file)
     family_block = anchors["stacks"].get(stack_key, {}).get(args.family)
     if not family_block:
-        print(f"ERROR: no anchor expectations for {stack_key} × {args.family}", file=sys.stderr)
-        print(f"  add them to {args.anchors_file} before promoting this stack", file=sys.stderr)
-        sys.exit(3)
+        if args.skip_anchor:
+            print(f"NOTE: no anchor expectations for {stack_key} × {args.family} — "
+                  f"running with --skip-anchor (anchors will be recorded from this run's scores).",
+                  file=sys.stderr)
+            family_block = {"expected": {}}
+        else:
+            print(f"ERROR: no anchor expectations for {stack_key} × {args.family}", file=sys.stderr)
+            print(f"  add them to {args.anchors_file} before promoting this stack", file=sys.stderr)
+            print("  (re-run with --skip-anchor to record them from this first run)", file=sys.stderr)
+            sys.exit(3)
 
     bench_cfg = load_yaml(args.anchor_template)
     out_root = Path(args.out)

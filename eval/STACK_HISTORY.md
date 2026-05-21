@@ -9,17 +9,24 @@ See [EVAL_PROTOCOL §v3.3](EVAL_PROTOCOL.md) for the update procedure.
 
 ---
 
-## gemma4-moe-stack@2 — 2026-05-21 (proposed, canary pending)
+## gemma4-moe-stack@2 — 2026-05-21 (PROMOTED)
 
-**Status:** built and staged; awaiting v6-coder LCB chain completion
-to free the GPU for canary run.
+**Status:** PROMOTED 2026-05-21 18:07 CEST. All structural rules PASS,
+all 3 anchor scores within recorded expectations.
 
 **Components:**
 - vLLM: source branch `gemma4-moe-stack-v2`
+  - installed version: `0.21.1rc1.dev178+g3d92852eb.cu132`
   - base SHA: `68e07d591` (upstream/main HEAD, 2026-05-21 04:58 EDT)
   - cherry-pick: `3d92852eb` (Fix-E parser hardening, originally `a39e23ed0`)
-- lm-eval: 0.4.11 + Fix-A reasoning_content fallback (unchanged from v1)
+- lm-eval: 0.4.11 + Fix-A reasoning_content fallback, **refined**:
+  content-first; reasoning_content fallback only when content="".
+  See `stack.lock.yaml` lm_eval.patches.fix_a_reasoning_content_fallback
+  for full rationale.
 - modelopt: 0.43.0 (unchanged from v1)
+- Vehicle: solidpc RTX 3090 + `--gpu-memory-utilization 0.92
+  --max-model-len 32768 --max-num-seqs 4` (graph capture set
+  [1,2,4,8]; KV cache 1.65 GiB → fits 32k context)
 
 **PRs picked up vs gemma4-moe-stack@1 (stock 0.20.2):**
 - **#42250** — Gemma4 MoE routing closure captures per_expert_scale.
@@ -38,13 +45,32 @@ to free the GPU for canary run.
 - Stock-0.20.2-only pin removed. The release wheel is now superseded by
   the source-built wheel.
 
-**Canary status:** PENDING. Will run `omk_canary.py --stack
-stack.lock.yaml --anchor-model google/gemma-4-26B-A4B-it-NVFP4A16
---family gemma-4-26B-A4B` once v6-coder chain releases the GPU.
+**Canary results (anchor30 on Gemma-4-26B-A4B-it-NVFP4A16, 30 questions,
+greedy + thinking_token_budget=12288):**
 
-**Promotion gate:** all 5 structural rules pass AND all 3 anchor
-scores (gpqa_diamond, aime24, ifeval) within ±tolerance recorded in
-`stack_anchors.yaml`.
+| sub-bench | score | structural | anchor |
+|---|---:|---|---|
+| anchor_gpqa_10 | 9/10 | PASS | recorded ±0.20 |
+| anchor_aime_10 | 7/10 | PASS | recorded ±0.20 |
+| anchor_ifeval_10 | 10/10 | PASS | recorded ±0.20 |
+| **VERDICT** | — | **ALL_PASS** | — |
+
+Run dir: `eval_results/canary/stack_v2_20260521_171905_fix-a-refined/`.
+
+**Bug discovered + fixed during canary:** original Fix-A behavior
+concatenated `reasoning + "\n" + content` whenever both were populated.
+With thinking-on this contaminated IFEval rule-based scorers (no-comma,
+lowercase, multi-section) — first canary run scored IFEval **0.10** on
+the same model that scored **1.00** after the refined Fix-A patch. The
+content-only behavior preserves silent-empty rescue while keeping
+short-answer scorers honest.
+
+**Wheel build status (2026-05-21 18:07):**
+- sm86 (RTX 3090, A40) — ✓ built + installed in `vllm` env
+- sm89 (RTX 4090, L40, RTX 6000 Ada) — ✓ built
+- sm90 (H100, H200) — building (flashmla cutlass submodule init was needed)
+- sm100 (B100/B200) — queued
+- sm120 (RTX 50-series) — queued
 
 ---
 

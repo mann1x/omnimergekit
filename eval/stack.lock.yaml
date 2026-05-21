@@ -70,11 +70,19 @@ components:
       - file: lm_eval/models/openai_completions.py
         name: fix_a_reasoning_content_fallback
         purpose: |
-          Fall back to msg.get("reasoning_content") when content="". Still
-          required even with v2 stack because some pruned variants may
-          occasionally land in the half-open path. With v2 vLLM the
-          Fix-E parser patch already mirrors to content in most cases;
-          Fix-A is the lm-eval-side safety net for the remaining edge.
+          Original (2026-05-14): vLLM <0.21 on Gemma 4 hit "silent empty"
+          where content="" and the answer lived in reasoning_content. The
+          first Fix-A concatenated reasoning + content whenever both
+          existed, which contaminated rule-based scorers (IFEval no-comma,
+          lowercase, multi-section) with the planning bullets the model
+          emits during thinking.
+          Refined (2026-05-21, stack@2): with Fix-E parser hardening in
+          vLLM main, content is now populated reliably. Behavior is now
+          content-first; reasoning_content is the fallback ONLY when
+          content is genuinely empty. Rescues silent-empty without
+          contaminating IFEval scorers. Found by stack@2 anchor canary
+          (raw IFEval 0.10 vs expected ~0.95 — all 9/10 misses due to
+          reasoning leak, not model error).
         sentinel_line: 'or msg.get("reasoning_content")'
 
   modelopt:
