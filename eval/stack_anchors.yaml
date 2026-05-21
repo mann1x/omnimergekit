@@ -1,0 +1,64 @@
+# Recorded anchor-bench expectations per (stack_version, model_family).
+#
+# Append-only. When a new stack version lands, you re-run the anchor bench
+# (10 GPQA + 10 AIME + 10 IFEval) on the canonical anchor model of each
+# family and record the score here. Subsequent runs of that stack compare
+# against the recorded value within ±tolerance.
+#
+# Anchor model selection rule: the *unmodified instruction-tuned baseline*
+# of the family. For Gemma 4 26B-A4B that's the 128e original. Pick stable
+# weights — do not anchor against an experimental variant.
+#
+# This catches stack-level scoring/generation regressions that the structural
+# canary cannot (e.g. AIME 36 vs 73 with both having normal response shape).
+
+stacks:
+  gemma4-moe-stack@1:
+    # Recorded 2026-05-21 from existing stack-pinned cohort runs on solidpc.
+    # These are NOT predictions — they are observed scores on this exact stack.
+    gemma-4-26B-A4B:
+      anchor_model: google/gemma-4-26B-A4B-it           # NVFP4A16 local dir
+      anchor_bench: anchor30
+      # First-10 indices of each parent bench (deterministic subsets, see
+      # eval/templates/anchor30.yaml). Tolerance is wide because n=10 is noisy.
+      expected:
+        gpqa_diamond:
+          # 128e on stack-pinned: 73.23% full. 10q SE ≈ ±15pp.
+          score: 0.73
+          tolerance: 0.20
+          metric: exact_match_flex
+        aime24:
+          # 128e AIME-30 full = 73.33%. 10q SE ≈ ±15pp.
+          score: 0.73
+          tolerance: 0.20
+          metric: exact_match
+        ifeval:
+          # 128e ifeval_100 full ≈ 95%. 10q SE ≈ ±10pp.
+          score: 0.95
+          tolerance: 0.15
+          metric: prompt_level_strict_acc
+
+    gemma-4-31B:
+      anchor_model: google/gemma-4-31B-it
+      anchor_bench: anchor30
+      expected:
+        gpqa_diamond:
+          score: 0.78
+          tolerance: 0.20
+          metric: exact_match_flex
+        aime24:
+          # 31B-it AIME ≈ 76.67% per he1 card cohort.
+          score: 0.77
+          tolerance: 0.20
+          metric: exact_match
+        ifeval:
+          # 31B-it ifeval ≈ 96% per he1 card cohort.
+          score: 0.96
+          tolerance: 0.10
+          metric: prompt_level_strict_acc
+
+  # Template entry for future families. Calibrate on first use.
+  # qwen3.5-stack@1:
+  #   qwen3.5-class:
+  #     anchor_model: Qwen/Qwen3.5-1B-Instruct
+  #     ...

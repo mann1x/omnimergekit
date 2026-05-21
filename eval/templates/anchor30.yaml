@@ -1,0 +1,32 @@
+# Anchor canary subset — 10 GPQA + 10 AIME + 10 IFEval = 30q, ~30 min on 3090.
+#
+# Used by omk_canary.py to validate a stack against recorded reference scores
+# in stack_anchors.yaml. The subset is fixed (deterministic indices) for bit-
+# reproducibility across stack versions.
+#
+# Each sub-bench reuses its parent template's gen_kwargs/backend_args; this
+# file only changes the selection. Selection picks the first 10 indices of
+# each parent's natural ordering so anchor scores remain comparable when
+# anyone re-runs.
+
+name: anchor30
+backend: lm-eval
+description: "Stack-canary anchor bench — 10 GPQA + 10 AIME + 10 IFEval"
+
+sub_benches:
+  - name: anchor_gpqa_10
+    parent_template: gpqa_diamond_full
+    selection: { type: indices, indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9] }
+
+  - name: anchor_aime_10
+    parent_template: aime_30
+    selection: { type: indices, indices: [0, 3, 6, 9, 12, 15, 18, 21, 24, 27] }
+
+  - name: anchor_ifeval_10
+    parent_template: ifeval_100
+    # First-10 of ifeval_100's stride-5 selection
+    selection: { type: indices, indices: [0, 5, 10, 15, 20, 25, 30, 35, 40, 45] }
+
+reports:
+  token_stats: true
+  structural_canary: true

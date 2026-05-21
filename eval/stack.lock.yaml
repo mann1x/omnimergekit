@@ -1,0 +1,82 @@
+# EVAL_PROTOCOL v3 stack lock — single source of truth for the evaluation stack.
+#
+# This file is rsynced identically to every pod. `install_stack.sh stack.lock.yaml`
+# produces the same conda envs locally and on cloud GPUs. Any cohort's STACK.txt
+# must reference {name}@{version} of this file.
+#
+# Update rules (see EVAL_PROTOCOL.md §v3.3):
+#   1. propose change in stack.lock.dev.yaml + bump version
+#   2. run `omk_canary.py --stack stack.lock.dev.yaml` on local + a pod
+#   3. all canaries pass → promote .dev → live + append to STACK_HISTORY.md
+#   4. cohort runs reference the locked stack; HF cards cite stack version
+#
+# Mid-cohort changes are FORBIDDEN — once a cohort starts, stack is frozen.
+
+name: gemma4-moe-stack
+version: 1
+created: "2026-05-21"
+applies_to:
+  # Reference models for the canary anchor — see stack_anchors.yaml
+  families:
+    - gemma-4-26B-A4B           # MoE 128-expert
+    - gemma-4-A4B-*e            # MoE pruned variants (109e, 98e, ...)
+    - gemma-4-31B               # dense
+
+components:
+  vllm:
+    pip: "vllm==0.20.2"
+    env: vllm
+    cherry_picks: []            # stock 0.20.2 — closure fixes already in release
+    note: |
+      Stock 0.20.2 reveals real AIME scores (~70% for 26B-A4B class) — earlier
+      patched dev builds under-reported. Stock has the gemma4 reasoning parser
+      regression on some MoE variants (v6-coder IFEval cliff observed), so
+      every cohort must canary first.
+
+  lm_eval:
+    pip: "lm-eval[api,math,ifeval]==0.4.11"
+    env: omnimergekit
+    patches:
+      - file: lm_eval/models/openai_completions.py
+        name: fix_a_reasoning_content_fallback
+        purpose: |
+          Fall back to msg.get("reasoning_content") when content="". Required
+          on any vLLM serving Gemma 4 + reasoning parser — closure-capture
+          (#42250) routes the answer to reasoning_content, leaving content
+          empty. Without this patch ARC drops to ~12% (silent-empty).
+        sentinel_line: 'or msg.get("reasoning_content")'
+
+  modelopt:
+    pip: "nvidia-modelopt==0.43.0"
+    env: modelopt
+    pin_reason: |
+      0.44.0 has two Gemma 4 regressions (config dict→list + bf16 calibration
+      NaN). 0.43.0 release matches solidPC behavior.
+
+  omnimergekit_eval:
+    git_remote: "git@github.com:mann1x/omnimergekit.git"
+    subdir: "eval/"
+    track: "main"
+    # Pin to the commit that owns this stack.lock — set on promotion.
+    pinned_sha: "TBD-on-promotion"
+
+  templates:
+    # Frozen template SHAs as of stack@v1 — any change requires a new stack version
+    sha_check_command: "git rev-parse HEAD -- eval/templates/{}.yaml"
+    names:
+      - gpqa_diamond_full
+      - gsm8k_100
+      - math500_100
+      - aime_30
+      - arc_challenge_full
+      - ifeval_100
+      - humaneval_full
+      - humanevalplus_full
+      - lcb_medium_55_v4
+      - anchor30           # canary subset
+
+# Hardware floor — see EVAL_PROTOCOL.md §v3.2 + reference_vastai_eval_pod_query.md
+hardware:
+  driver_cuda_min: 13          # vLLM 0.20.2 needs driver ≥ 580
+  cudnn_min: 9
+  vram_gb_min: 24              # 3090 / L40 / A6000-Ada / H100; 26B + 32k ctx
