@@ -23,6 +23,21 @@ OL_TARGET="${2:?ollama target (e.g. mannix/omnimerge-v4)}"
 HF_TOKEN_ARG="${3:--}"
 INCLUDE="${4:-}"
 
+# Optional flags AFTER positionals: --latest-tier <T> / --no-latest.
+# Default: tag Q4_K_M as :latest after all pushes (so tag-less `ollama pull
+# <target>` works). Pre-flight refuses to start if --latest-tier isn't in
+# the planned TODO and isn't already on ollama.com.
+LATEST_TIER="Q4_K_M"
+NO_LATEST=0
+shift 4 || true
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --latest-tier)  LATEST_TIER="$2"; shift 2 ;;
+        --no-latest)    NO_LATEST=1; shift ;;
+        *) echo "unknown flag: $1" >&2; exit 64 ;;
+    esac
+done
+
 # Token: command-line arg takes precedence over env
 if [[ "$HF_TOKEN_ARG" != "-" && -n "$HF_TOKEN_ARG" ]]; then
     export HF_TOKEN="$HF_TOKEN_ARG"
@@ -59,7 +74,7 @@ hf_download_one() {
     local FILENAME="$1"
     local DEST="$SCRATCH/$FILENAME"
     rm -f "$DEST" 2>/dev/null || true
-    if HF_HUB_ENABLE_HF_TRANSFER=1 hf download "$HF_REPO" "$FILENAME" \
+    if HF_XET_HIGH_PERFORMANCE=1 hf download "$HF_REPO" "$FILENAME" \
             --local-dir "$SCRATCH" >>"$LOG" 2>&1; then
         if [ -s "$DEST" ]; then
             echo "$DEST"
@@ -194,6 +209,19 @@ TODO=$(comm -23 <(echo "$ALL_TAGS" | sort -u) <(echo "$EXISTING" | sort -u) || t
 N_TODO=$(echo "$TODO" | grep -c . || true)
 log "TODO: $N_TODO tag(s)"
 
+# Pre-flight: latest-tier must be in TODO or already on ollama.com (unless --no-latest)
+if [[ "$NO_LATEST" -eq 0 ]]; then
+    if echo "$TODO" | grep -q "^${LATEST_TIER}$"; then
+        log ":latest pre-flight OK (${LATEST_TIER} in TODO; will retag at end)"
+    elif echo "$EXISTING" | grep -q "^${LATEST_TIER}$"; then
+        log ":latest pre-flight OK (${LATEST_TIER} already on ollama; will pull+retag at end)"
+    else
+        log "FATAL: --latest-tier=${LATEST_TIER} not in TODO and not on ollama.com."
+        log "       Fix: pick a different tier with --latest-tier, or pass --no-latest"
+        exit 64
+    fi
+fi
+
 # Lookup filename for each TODO tag from DISCOVERY_FILTERED
 get_filename() {
     echo "$DISCOVERY_FILTERED" | awk -F'\t' -v t="$1" '$1==t {print $2; exit}'
@@ -241,6 +269,23 @@ fi
 # Final scratch cleanup
 rm -rf "$SCRATCH" 2>/dev/null || true
 
+# === :latest retag stage ============================================
+if [[ "$NO_LATEST" -eq 0 ]]; then
+    BACKFILL="$(dirname "$0")/ollama_backfill_latest.sh"
+    if [[ -x "$BACKFILL" ]]; then
+        log "=== :latest retag (source=:${LATEST_TIER}) ==="
+        if bash "$BACKFILL" "$OL_TARGET" "$LATEST_TIER"; then
+            log "  :latest retag OK"
+        else
+            log "  :latest retag FAILED — manual recovery: bash $BACKFILL $OL_TARGET $LATEST_TIER"
+        fi
+    else
+        log "  :latest stage skipped — backfill script not found at $BACKFILL"
+    fi
+else
+    log "  :latest stage skipped (--no-latest)"
+fi
+
 log "All done for $OL_TARGET. Tags published:"
 curl -sSL "https://ollama.com/${OL_TARGET}/tags" 2>/dev/null \
-    | grep -oE "${OL_TARGET}:[A-Za-z0-9_-]+" | sort -u | tee -a "$LOG"
+    | grep -oE "${OL_TARGET}:[A-Za-z0-9_.-]+" | sort -u | tee -a "$LOG"

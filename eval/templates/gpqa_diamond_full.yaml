@@ -1,6 +1,12 @@
 # GPQA Diamond — full 198-question set. Matches the canonical eval used for
-# 109e/98e/v3 GPQA numbers. Uses GPQA chain-of-thought zero-shot, deepseek
-# reasoning format (when supported by backend).
+# 109e/98e/v3 GPQA numbers and the v4-MTP Q6_K card recipe (llama.cpp path).
+# GPQA chain-of-thought zero-shot, deepseek reasoning format.
+#
+# Per-engine tuning lives in `backend_overrides:` below — DO NOT merge the
+# two engines' budgets into the shared `generation:` block. vLLM needs 24k
+# thinking + 32k max_gen to dodge Fix-A truncation on stack@2; llama.cpp
+# needs only 8k thinking + 16k max_gen for the v4-MTP-card 4h55m wall.
+# Mixing them throttles llama.cpp 4× and starves vLLM in a single template.
 name: gpqa_diamond_full
 backend: lm-eval
 task: gpqa_diamond_cot_zeroshot
@@ -9,12 +15,14 @@ selection:
   type: filter
   all: true
 generation:
+  # llama.cpp canonical (Gemma 4 26B-A4B Q6_K, 4h55m for 198q on 3090).
+  # Empirical: budget=8192 + max_gen=16384 keeps 95th-pct response ≤9k tokens.
   max_gen_toks: 16384
-  thinking_token_budget: 12288    # 2026-05-12: clip Gemma 4 reasoning loops; see EVAL_PROTOCOL §3
-  temperature: 0.6                # canonical GPQA sampler
-  top_p: 0.95
-  top_k: 20
-  do_sample: true
+  thinking_token_budget: 8192
+  temperature: 0.0                # greedy — matches v4 published + v5-coder pod recipe
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
 scoring:
   metric: exact_match
   filter: flexible-extract
@@ -26,7 +34,25 @@ backend_args:
   batch_size: 1
   vllm_reasoning_parser: gemma4
   vllm_default_chat_template_kwargs: {enable_thinking: true}
+  # llama-server: 16384 max_gen + 8k thinking + ~2k prompt = ~26k worst case.
+  # parallel=2 with -c 65536 = 32768/slot. Per v4-MTP card: ~5h wall for 198q.
+  llama_ctx: 65536
+  llama_parallel: 2
+  max_length: 65536
 cache:
   sqlite_prefix: gpqa_diamond
 reports:
   token_stats: true
+
+# Per-engine overrides — merged into the template AFTER load by omk_eval.
+# Keys here override the shared sections above when --backend matches.
+backend_overrides:
+  vllm:
+    # vLLM Fix-A history: on stack@2 with content-only reasoning_content
+    # fallback, GPQA truncated 22/198 questions at budget=12288. Bump to 24k
+    # thinking + 32k max_gen. NOTE: vLLM + Gemma 4 MoE is BLACKLISTED as of
+    # 2026-05-22 (see memory/feedback_vllm_gemma4_moe_blacklist.md); this
+    # override is preserved for the eventual stack@3 / vLLM re-enable.
+    generation:
+      max_gen_toks: 32768
+      thinking_token_budget: 24576

@@ -326,7 +326,14 @@ def llama_bench_defaults(task: str) -> list[str]:
     t = (task or "").lower()
     if any(s in t for s in ("humaneval", "mbpp", "livecodebench", "lcb")):
         return ["--jinja", "--reasoning", "off"]
-    if any(s in t for s in ("gpqa", "aime", "mmlu_pro", "mmlu-pro")):
+    # Reasoning + IFEval + arithmetic + classification: Gemma 4 always emits
+    # CoT on these, and without --reasoning-format deepseek the chat parser
+    # returns content="" (the silent-empty bug). The budget is then synced
+    # to the template's thinking_token_budget by the caller.
+    if any(s in t for s in (
+            "gpqa", "aime", "mmlu_pro", "mmlu-pro",
+            "ifeval", "gsm8k", "math500", "math_500", "arc_challenge",
+            "arc-challenge", "anchor")):
         return ["--reasoning-format", "deepseek",
                 "--reasoning-budget", "8192"]
     return []
@@ -474,6 +481,11 @@ def dispatch_lm_eval(template: dict, model_tag: str, base_url: str,
     # or generation.http_timeout (LCB style).
     request_timeout = int(ba.get("request_timeout",
                                  g.get("http_timeout", 1800)))
+    # lm-eval local-chat-completions defaults max_length to 2048-1 and
+    # silently truncates long prompts (GPQA prompts hit this). Default 32768
+    # matches launch_llama's default `-c 32768`; templates can override via
+    # `backend_args.max_length`. See feedback_lm_eval_max_length_default.md.
+    max_length = int(ba.get("max_length", 32768))
     model_args = ",".join([
         f"model={model_tag}",
         f"base_url={base_url}/chat/completions",
@@ -482,6 +494,7 @@ def dispatch_lm_eval(template: dict, model_tag: str, base_url: str,
         f"timeout={request_timeout}",
         "tokenizer_backend=huggingface",
         f"tokenizer={tokenizer}",
+        f"max_length={max_length}",
         f"max_gen_toks={g.get('max_gen_toks', 2048)}",
     ])
     # Build --gen_kwargs from the template's generation block plus any
@@ -597,16 +610,26 @@ def estimate_thinking_chars(completion: str) -> tuple[int, str | None]:
     return 0, None
 
 
-def compute_token_stats(samples_path: Path) -> dict:
+def compute_token_stats(samples_path: Path, tokenizer_id: str | None = None) -> dict:
     """Aggregate prompt/completion/thinking tokens + finish_reasons from a
     samples.jsonl file. Per protocol v2 §2.4, this block is mandatory in
     every run's summary.json — including thinking-token tracking.
 
-    Thinking tokens are estimated from completion text (no separate field
-    in the chat-completions response) using ~4 chars/token, which is a
-    coarse but stable estimate for Latin scripts. For exact counts, the
-    tokenizer would have to be reloaded — not worth the cost when the goal
-    is to detect "model spent most of its budget thinking, not answering"."""
+    Token-count provenance (added stack@2, 2026-05-21):
+    vLLM /v1/chat/completions returns usage.{prompt,completion}_tokens, but
+    lm-eval's local-chat-completions adapter (`parse_generations` returns
+    List[str]) discards the usage block at the API-adapter level. Both the
+    SQLite cache (pickled completion string) and samples.jsonl carry the
+    parsed text only. So neither source has the counts; we recover them
+    here by re-tokenizing the completion text with the same tokenizer
+    vLLM used (`tokenizer_id`). When `tokenizer_id` is None or the load
+    raises, we soft-fail back to 0s with a 'tokenizer_unavailable' note
+    — the bench's score is unaffected, only token telemetry degrades.
+
+    Thinking tokens are estimated from the reasoning-block char count
+    (~4 chars/token) — exact thinking_tokens would need parser state
+    we don't preserve in the sample row.
+    """
     import statistics
     if not samples_path.exists():
         return {"error": f"no samples at {samples_path}"}
@@ -641,8 +664,38 @@ def compute_token_stats(samples_path: Path) -> dict:
                 return v
         return ""
 
+    # Try to recover token counts by re-tokenizing the completion text
+    # with the same tokenizer vLLM served. Soft-fail: on any error
+    # (missing transformers, bad path, OOM) we leave the per-sample
+    # zeros lm-eval emits and record the reason in the stats dict.
+    tok = None
+    tok_note: str | None = None
+    if tokenizer_id:
+        try:
+            from transformers import AutoTokenizer
+            tok = AutoTokenizer.from_pretrained(
+                tokenizer_id, trust_remote_code=True, use_fast=True
+            )
+        except Exception as e:  # pragma: no cover — soft-fail telemetry
+            tok = None
+            tok_note = f"tokenizer_unavailable: {type(e).__name__}: {e}"
+
+    def _ct_count(s: dict) -> int:
+        raw = s.get("completion_tokens")
+        if isinstance(raw, int) and raw > 0:
+            return raw
+        if tok is None:
+            return 0
+        text = _completion_text(s)
+        if not text:
+            return 0
+        try:
+            return len(tok(text, add_special_tokens=False).input_ids)
+        except Exception:
+            return 0
+
     pt = [s.get("prompt_tokens") or 0 for s in samples]
-    ct = [s.get("completion_tokens") or 0 for s in samples]
+    ct = [_ct_count(s) for s in samples]
     cl = [len(_completion_text(s)) for s in samples]
     fr: dict[str, int] = {}
     thinking_chars = []
@@ -657,6 +710,22 @@ def compute_token_stats(samples_path: Path) -> dict:
     empty = sum(1 for s in samples if not _completion_text(s).strip())
     # ~4 chars/token estimate
     thinking_tokens_est = [c // 4 for c in thinking_chars]
+    if tok is not None:
+        ct_method = f"tokenizer:{tokenizer_id}"
+    elif tokenizer_id is None:
+        ct_method = "usage_field_only"
+    else:
+        ct_method = "fallback_zero"
+    ct_block: dict = {
+        "sum": sum(ct),
+        "p10": sorted(ct)[len(ct) // 10] if ct else 0,
+        "p50": int(statistics.median(ct)) if ct else 0,
+        "p90": sorted(ct)[len(ct) * 9 // 10] if ct else 0,
+        "max": max(ct) if ct else 0,
+        "method": ct_method,
+    }
+    if tok_note:
+        ct_block["note"] = tok_note
     return {
         "n": len(samples),
         "prompt_tokens": {
@@ -666,13 +735,7 @@ def compute_token_stats(samples_path: Path) -> dict:
             "p90": sorted(pt)[len(pt) * 9 // 10] if pt else 0,
             "max": max(pt) if pt else 0,
         },
-        "completion_tokens": {
-            "sum": sum(ct),
-            "p10": sorted(ct)[len(ct) // 10] if ct else 0,
-            "p50": int(statistics.median(ct)) if ct else 0,
-            "p90": sorted(ct)[len(ct) * 9 // 10] if ct else 0,
-            "max": max(ct) if ct else 0,
-        },
+        "completion_tokens": ct_block,
         "thinking_tokens_est": {
             "method": "len(reasoning_block) // 4",
             "sum": sum(thinking_tokens_est),
@@ -856,6 +919,28 @@ def main() -> None:
     template = load_template(args.template)
     log(f"loaded template {template['name']} (n={template['n']}, backend={template['backend']})")
 
+    # Apply per-engine overrides. vLLM and llama.cpp need different
+    # max_gen_toks / thinking_token_budget tuning (vLLM Fix-A truncation
+    # at 12k vs llama.cpp's canonical 8k budget on Gemma 4). A template can
+    # carry a `backend_overrides:` section keyed by --backend value:
+    #   backend_overrides:
+    #     vllm:
+    #       generation: {max_gen_toks: 32768, thinking_token_budget: 24576}
+    #     llama:
+    #       backend_args: {llama_parallel: 2}
+    # The override dict is deep-merged into the template top-level after load.
+    _bo = template.pop("backend_overrides", None) or {}
+    _engine_override = _bo.get(args.backend)
+    if _engine_override:
+        def _deep_merge(base: dict, override: dict) -> None:
+            for k, v in override.items():
+                if isinstance(v, dict) and isinstance(base.get(k), dict):
+                    _deep_merge(base[k], v)
+                else:
+                    base[k] = v
+        _deep_merge(template, _engine_override)
+        log(f"applied backend_overrides[{args.backend}]: {_engine_override}")
+
     # Resolve served name + tokenizer + out dir
     served_name = args.served_name or Path(args.model).name
     tokenizer = args.tokenizer or args.model
@@ -912,6 +997,14 @@ def main() -> None:
         else:
             # Compose llama extras: bench-typed defaults + template override.
             llama_extra = llama_bench_defaults(template.get("task", ""))
+            # Sync reasoning budget with template thinking_token_budget when the
+            # bench is reasoning-typed (defaults emit --reasoning-budget 8192).
+            # Without this, GPQA templates asking for 24576 silently get 8192
+            # and truncate ~20-30% of reasoning chains on Gemma 4.
+            tb = ((template.get("generation") or {}).get("thinking_token_budget"))
+            if tb is not None and "--reasoning-budget" in llama_extra:
+                idx = llama_extra.index("--reasoning-budget")
+                llama_extra[idx + 1] = str(int(tb))
             ba = template.get("backend_args", {})
             for x in ba.get("llama_extra", []) or []:
                 llama_extra.append(str(x))
@@ -962,7 +1055,7 @@ def main() -> None:
     # 1172" sanity_warning showed up on the fresh ARC run.
     samples_candidates.sort(key=lambda p: p.stat().st_mtime)
     samples = samples_candidates[-1] if samples_candidates else out_dir / "samples.jsonl"
-    stats = compute_token_stats(samples)
+    stats = compute_token_stats(samples, tokenizer_id=(args.tokenizer or args.model))
     # When --limit was used, sanity gates against the requested sample count,
     # not the full template["n"]. Per-template sanity overrides live under the
     # optional `sanity:` block (e.g. relaxed min_p10_chars for MCQ/IFEval).
