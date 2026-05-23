@@ -247,18 +247,65 @@ solutions are short; 3072 is overkill).
 
 #### MultiPL-E
 
+First-class omk backend (`backend: multipl_e`). Templates: `multipl_e_100`
+(rs+java+js × 100), `multipl_e_10_smoke`. Headline = macro mean pass@1 over
+langs; per-lang + micro also recorded. Resume is sqlite (`eval/cache_sqlite.py`,
+keyed `lang::name`). Sampler GREEDY (frozen), like every cohort bench.
+
+##### Generation MUST be chat mode for Gemma-4 (and any reasoning/instruct model)
+
+`generation.mode: chat` in the template. Raw `/v1/completions` (base-model
+style) is FORBIDDEN for Gemma-4: the reasoning model never emits the column-0
+stop terminator (`\n}` etc.), rambles in indented comment garbage to the token
+cap, and the program won't compile. **Evidence (128e Q6_K, MPE-10): raw =
+3.33% (rs 0.10/java 0/js 0); chat = 100% (30/30).** It is NOT a stop-token bug —
+the dataset stop tokens are correct and sent; the model just doesn't produce
+them. Chat mode = `/v1/chat/completions` + chat template + fenced-code
+extraction + `chat_to_body()` (anchor on the prompt's signature line, strip the
+trailing brace-run only for langs whose tests supply the closer: rust 1, java 2
+[method+class]; js keeps its brace). This is the same path that gives HE+ ~90%.
+
 ```
-Server: chat profile, --parallel 2 OK, KV q8_0/q8_0 OK
-Generator: scripts/multipl_e_generate.py
-  --max-tokens 2048 (Rust)  to 4096 (verbose languages like Java/Cpp)
-  --concurrency 2
-  HAS retry on 5xx (bumped 2026-05-10): 4/8/16/32/64/128s backoff,
-    server errors NOT silently dropped (R-RUN: server errs MUST be repeated)
-Eval: scripts/multipl_e_evaluate.sh (Docker; runs nuprl/multipl-e-evaluation image)
-  Pod with no docker → run eval phase locally on solidpc
+Server: --jinja --reasoning off  (-ngl 99 --parallel 2 -c 16384, KV q8_0/q8_0).
+        Chat code-gen needs no thinking budget; reasoning off avoids rumination.
+Generator: eval/multipl_e/multipl_e_generate.py  --mode chat
+  --max-tokens 1024 (chat completions are compact; bodies are short)
+  --concurrency 2 ; sqlite resume via --cache-db ; greedy temp=0
+  retry on 5xx: 4/8/16/32/64/128s backoff, server errs NOT silently dropped
+Eval: eval/multipl_e/multipl_e_evaluate.sh  — MPE_MODE selects:
+  docker  (default; solidpc) → nuprl/multipl-e-evaluation image, --network none
+  native  (pods; no docker)  → nuprl harness evaluation/src/main.py directly
+                               against locally-installed toolchains, UNSANDBOXED
 ```
 
-`memory/feedback_lm_eval_pod_deps.md` (Docker is rare on rented pods)
+##### Native (no-docker) eval on pods — REQUIREMENTS + STACK LOCK
+
+vast.ai pods are unprivileged containers (no docker-in-docker), so MPE eval runs
+**native** (`MPE_MODE=native`, `MPE_HARNESS=/workspace/MultiPL-E`). The nuprl
+harness shells out to per-language toolchains; each language has hard deps the
+Docker image normally provides. Provision via
+`eval/multipl_e/install_mpe_toolchains_native.sh`. **SECURITY: native mode
+executes model-generated code unsandboxed — throwaway pods only, never solidpc.**
+
+Stack lock (validated pod 37268930, 2026-05-23 — MPE-10 128e = 100% rs/java/js):
+
+| Component | Pinned value | Notes |
+|-----------|--------------|-------|
+| MultiPL-E harness | commit `3025a531af74` (2026-01-28) | `git clone https://github.com/nuprl/MultiPL-E /workspace/MultiPL-E` then `git checkout 3025a531af74` |
+| rustc / cargo | 1.75.0 (apt) | rust has no external deps — works out of the box |
+| javac (OpenJDK) | 11.0.30 (`default-jdk`) | — |
+| **javatuples** | **1.2 jar at `/usr/multiple/javatuples-1.2.jar`** | sha256 `2eda5b19…`. `eval_java.py` HARDCODES this path; without it every java problem fails `package org.javatuples does not exist`. Maven Central: `org/javatuples/javatuples/1.2/javatuples-1.2.jar` |
+| **node** | **v20.20.2 (NodeSource)** | Ubuntu-22.04 apt node is **12**, too old — `require('node:assert')` fails `Cannot find module 'node:assert'`. MUST `apt purge libnode-dev libnode72` (file conflict on `/usr/include/node/common.gypi`) before installing node 20. |
+| python | 3.10.12 | — |
+| datasets / sqlitedict / tqdm | 4.8.5 / 2.1.0 / 4.67.3 | tqdm is a harness dep; datasets+sqlitedict are omk's |
+
+Record this table's actual values into `<results_dir>/STACK.txt` per §1.4.5; a
+cohort whose MPE entries differ on harness commit / node / javatuples is invalid.
+Cross-host caveat: the **docker** image (solidpc) and the **native** stack (pods)
+are different evaluators — keep a cohort on ONE eval mode, or re-baseline.
+
+`memory/feedback_lm_eval_pod_deps.md` (Docker is rare on rented pods),
+`memory/feedback_gemma4_chat_only_completions_breaks.md` (the raw-completion trap)
 
 #### LCB-Medium (LiveCodeBench)
 

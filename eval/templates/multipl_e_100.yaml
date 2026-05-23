@@ -20,6 +20,7 @@ selection:
   type: langs
   langs: [rs, java, js]
 generation:
+  mode: chat                 # reasoning model → chat-completions + code extraction (not raw)
   max_gen_toks: 1024
   temperature: 0.0
   top_p: 1.0

@@ -624,6 +624,7 @@ def dispatch_multipl(template: dict, model_tag: str, base_url: str,
     langs = sel.get("langs") or ["rs", "java", "js"]
     n = int(template.get("n", 0))
     max_tokens = int(g.get("max_gen_toks", 1024))
+    mode = g.get("mode", "completion")  # chat = /v1/chat/completions + code extraction
     concurrency = int(ba.get("num_concurrent", 2))
     completions_url = base_url.replace("/v1", "") + "/v1/completions"
     py = os.environ.get("OMK_PYTHON") or (
@@ -648,6 +649,7 @@ def dispatch_multipl(template: dict, model_tag: str, base_url: str,
             gen_cmd = [
                 py, str(MPE_DIR / "multipl_e_generate.py"),
                 "--lang", lang,
+                "--mode", mode,
                 "--base-url", completions_url,
                 "--model-name", model_tag,
                 "--out-dir", str(gen_dir),
