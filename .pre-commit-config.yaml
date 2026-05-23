@@ -1,0 +1,11 @@
+# pre-commit framework config (https://pre-commit.com).
+# Optional: only used if you run `pip install pre-commit && pre-commit install`.
+# The repo's canonical gate is the native hook from scripts/install-git-hooks.sh,
+# which needs no Python framework — this file is for contributors who already
+# use pre-commit and want the same gitleaks scan integrated with their other hooks.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+        # Honors .gitleaks.toml at the repo root automatically.

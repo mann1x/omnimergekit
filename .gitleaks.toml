@@ -1,0 +1,19 @@
+# gitleaks configuration for omnimergekit.
+# Extends the built-in ruleset (HF tokens, AWS keys, generic high-entropy, etc.).
+# Used by the pre-commit hook (scripts/install-git-hooks.sh) and the
+# .pre-commit-config.yaml gitleaks hook.
+#
+# Origin: 2026-05-23 — a live HF token (hf_...) was committed as a
+# `${HF_TOKEN:-<literal>}` convenience fallback in scripts/pod_quant_31b.sh and
+# pushed to this public repo. History was scrubbed; this gate prevents recurrence.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Redaction markers and obvious non-secret placeholders"
+regexes = [
+    '''\*\*\*REMOVED-DEAD-HF-TOKEN\*\*\*''',   # the post-scrub marker left in history
+    '''hf_(xxx+|XXX+|placeholder|your_token_here)''',
+    '''\$\{HF_TOKEN[:?-]''',                    # env-var indirection is NOT a secret
+]
