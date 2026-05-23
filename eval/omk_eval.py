@@ -555,7 +555,10 @@ def dispatch_lcb(template: dict, model_tag: str, base_url: str,
     sel = template["selection"]
     ba = template.get("backend_args", {}) or {}
     cmd = [
-        os.environ.get("OMK_PYTHON", "/root/anaconda3/envs/omnimergekit/bin/python"),
+        os.environ.get("OMK_PYTHON") or (
+            "/root/anaconda3/envs/omnimergekit/bin/python"
+            if os.path.exists("/root/anaconda3/envs/omnimergekit/bin/python")
+            else sys.executable),
         str(LCB_DIR / "lcb_llama_server.py"),
         "--name", model_tag,
         "--base-url", base_url.replace("/v1", ""),
@@ -885,6 +888,67 @@ def extract_canonical_score(template: dict, out_dir: Path) -> tuple[float | None
 # ── CLI ──────────────────────────────────────────────────────────────────
 
 
+_TASK_DEPS: dict[str, list[str]] = {
+    # lm-eval task name (or prefix-match) → required importable modules
+    "minerva_math": ["sympy", "math_verify", "antlr4"],
+    "math500": ["sympy", "math_verify", "antlr4"],
+    "math_500": ["sympy", "math_verify", "antlr4"],
+    "aime": ["sympy", "math_verify", "antlr4"],
+    "ifeval": ["langdetect", "immutabledict", "nltk"],
+    "livecodebench": ["datasets"],
+    "lcb": ["datasets"],
+    "humaneval": [],
+    "mbpp": [],
+    "gpqa": [],
+    "arc": [],
+    "gsm8k": [],
+}
+
+
+def _resolve_required_deps(template: dict) -> list[str]:
+    needs: set[str] = set()
+    # Template-declared explicit deps (highest authority)
+    deps = template.get("dependencies") or {}
+    for m in deps.get("python_modules") or []:
+        needs.add(str(m))
+    # Implicit per-task knowledge
+    task = (template.get("task") or "").lower()
+    for key, mods in _TASK_DEPS.items():
+        if key in task:
+            needs.update(mods)
+    # Always-required core
+    needs.update({"lm_eval"})
+    return sorted(needs)
+
+
+def _check_dependencies(template: dict) -> None:
+    """Pre-flight: verify required Python modules are importable.
+
+    Aborts (exit 6) before launching any server if anything's missing,
+    so a chain-runner fails fast at the broken template instead of
+    losing hours to a half-done suite.
+    """
+    import importlib.util
+    required = _resolve_required_deps(template)
+    missing = [m for m in required if importlib.util.find_spec(m) is None]
+    if missing:
+        log(f"DEP CHECK FAIL: template={template.get('name')} task={template.get('task')}")
+        log(f"  missing modules: {missing}")
+        log(f"  required: {required}")
+        # Best-effort install hint based on known mappings
+        hints = []
+        if any(m in missing for m in ("sympy", "math_verify", "antlr4")):
+            hints.append("pip install 'lm-eval[math]' sympy math_verify antlr4-python3-runtime==4.11")
+        if any(m in missing for m in ("langdetect", "immutabledict", "nltk")):
+            hints.append("pip install 'lm-eval[ifeval]' langdetect immutabledict nltk")
+        if "lm_eval" in missing:
+            hints.append("pip install 'lm-eval[api,math,ifeval]==0.4.11'")
+        for h in hints:
+            log(f"  hint: {h}")
+        fatal(6, f"dependency pre-flight failed: missing {missing}")
+    log(f"dep check OK ({len(required)} modules): {required}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="path or HF id")
@@ -940,6 +1004,9 @@ def main() -> None:
                     base[k] = v
         _deep_merge(template, _engine_override)
         log(f"applied backend_overrides[{args.backend}]: {_engine_override}")
+
+    # Pre-flight: dependency check BEFORE launching any server.
+    _check_dependencies(template)
 
     # Resolve served name + tokenizer + out dir
     served_name = args.served_name or Path(args.model).name
@@ -1006,8 +1073,12 @@ def main() -> None:
                 idx = llama_extra.index("--reasoning-budget")
                 llama_extra[idx + 1] = str(int(tb))
             ba = template.get("backend_args", {})
-            for x in ba.get("llama_extra", []) or []:
-                llama_extra.append(str(x))
+            if ba.get("llama_extra_replace", False):
+                llama_extra = [str(x) for x in (ba.get("llama_extra") or [])]
+                log("llama_extra_replace=true → bench defaults dropped")
+            else:
+                for x in ba.get("llama_extra", []) or []:
+                    llama_extra.append(str(x))
             # Env override wins (LLAMA_EXTRA="--flag1 value1 --flag2 value2").
             env_extra = os.environ.get("LLAMA_EXTRA", "").strip()
             if env_extra:
@@ -1066,6 +1137,27 @@ def main() -> None:
     # samples files. score_dict: {metric_name: value} for all reported metrics.
     score, score_dict = extract_canonical_score(template, out_dir)
 
+    # Record WHICH metric/filter produced the headline score so summary.json is
+    # self-documenting and downstream roll-ups never have to guess. Reverse-look
+    # the score in score_dict, preferring canonical filters. Origin: 2026-05-23 —
+    # a roll-up that re-derived the metric picked strict-match (GPQA 1.52%) and
+    # exact_match,none (math500 41%) when the real flexible-extract/math_verify
+    # values were 72.73% / 94%.
+    chosen_metric, chosen_filter = None, None
+    if score is not None and score_dict:
+        _PREF = ["flexible-extract", "math_verify", "extract_chat", "create_test",
+                 "remove_whitespace", "none", "strict-match"]
+        _cands = [k for k, v in score_dict.items()
+                  if isinstance(v, (int, float)) and v == score]
+        if _cands:
+            _ck = min(_cands, key=lambda k: (
+                _PREF.index(k.split(",", 1)[1]) if ("," in k and k.split(",", 1)[1] in _PREF)
+                else len(_PREF)))
+            if "," in _ck:
+                chosen_metric, chosen_filter = _ck.split(",", 1)
+            else:
+                chosen_metric = _ck  # e.g. "pass_at_1" (LCB)
+
     # Smoke-mode score floor: a smoke run should be REJECTED, not just WARNed,
     # if the canonical metric is at/below the floor. Default floor=0.0 for
     # generate_until tasks (model must produce SOMETHING that scores >0);
@@ -1090,6 +1182,8 @@ def main() -> None:
         "rc": rc,
         "samples_file": str(samples),
         "score": score,
+        "metric": chosen_metric,
+        "filter": chosen_filter,
         "scores": score_dict,
         "token_stats": stats,
         "sanity_warnings": warns,

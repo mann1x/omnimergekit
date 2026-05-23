@@ -496,6 +496,7 @@ For each eval, before publishing a score:
 | 2026-05-10 | GPQA settings drift: qwen3.5 preset on Gemma 4         | ~10pp           |
 | 2026-05-10 | Pod vs local llama.cpp commit drift                    | 3pp HE noise    |
 | 2026-05-10 | Did NOT validate-during-run; let LCB finish before checking p90 gen length | wasted 2 multi-quart runs |
+| 2026-05-23 | Read raw lm_eval `exact_match,strict-match` (GPQA) / `exact_match,none` (math500) instead of omk `summary.json` `.score`; compounded by a SUMMARY.md roll-up globbing the wrong single-`<served>` path → `NO_RESULT`. Falsely reported GPQA 1.52% / math500 41% when the real canonical scores were 72.73% / 94%. | hours of false alarm; nearly re-ran valid evals |
 
 ---
 
@@ -505,6 +506,11 @@ For each eval, before publishing a score:
 omnimergekit/
 ├── eval/
 │   ├── EVAL_PROTOCOL.md                  # this file
+│   ├── omk_eval.py                       # THE canonical eval engine (all backends)
+│   ├── omk_summarize.py                  # multi-model roll-up → reads summary.json .score
+│   ├── eval_suite_llama.sh               # canonical llama.cpp Q6_K suite driver (thin over omk_eval)
+│   ├── eval_suite_vllm.sh                # canonical vLLM NVFP4A16 suite driver
+│   ├── eval_suite_chain.sh               # multi-variant outer chain over the suite drivers
 │   ├── tasks/                            # custom lm_eval YAMLs
 │   │   ├── humaneval_chat.yaml
 │   │   ├── mbpp_chat.yaml
@@ -525,8 +531,20 @@ omnimergekit/
     └── ...
 ```
 
-`backup_models/scripts/` is project-specific glue and ad-hoc one-shots only.
-Anything reusable goes into `omnimergekit/eval/`.
+**Single source of truth for scores.** The canonical score for a finished
+bench is `<results>/<bench>/<served>/summary.json` `.score` (omk_eval already
+selects flexible-extract / math_verify / pass@1,extract_chat / pass_at_1, and
+records `metric`+`filter` provenance). NEVER read raw `results_*.json`
+`strict-match` / `exact_match,none` — that mismatch caused the 2026-05-23
+GPQA-1.52% / math500-41% false alarm. All SUMMARY roll-ups
+(`eval_suite_*.sh`, `omk_summarize.py`) read `summary.json`, not raw results.
+
+**Suite drivers live HERE in `eval/`,** next to the engine they wrap.
+`backup_models/scripts/eval_suite_{llama,vllm,chain}.sh` are symlinks into this
+dir — one tracked source of truth. New eval tooling lands in
+`omnimergekit/eval/`, never as an untracked one-off under
+`backup_models/scripts/`. The rest of `backup_models/scripts/` is
+project-specific glue and ad-hoc one-shots only.
 
 ---
 
@@ -674,6 +692,38 @@ tokens, the runner counts them separately as `completion_tokens.thinking`
 (populated when the response contains a reasoning trace). This catches the
 `<|channel>` malformed-token bug from v1 §1.2 by surface area, not by a
 heuristic that has to be re-discovered every time.
+
+### v2.4.1 Token-count provenance (stack@2, 2026-05-21)
+
+vLLM `/v1/chat/completions` returns `usage.{prompt,completion}_tokens` in
+the HTTP response, but **lm-eval discards it**. The `local-chat-completions`
+adapter's `parse_generations(response_dict) → List[str]` extracts only
+the text — the `usage` block never reaches the sample row, and the SQLite
+cache stores only the pickled completion string (`<pickled, type=str>`).
+So neither `samples_*.jsonl` nor `sqlite_cache/*.db` carries the counts.
+
+`compute_token_stats` (omk_eval.py) recovers them by **re-tokenizing the
+completion text** with the same tokenizer vLLM served, passed via
+`--tokenizer` (defaults to `--model`). Behavior:
+
+- `completion_tokens.method = "tokenizer:<id>"` — counts are from local
+  HF AutoTokenizer (fast=True, `add_special_tokens=False`). Exact within
+  ±0 for greedy chat-completion responses (same vocab).
+- `completion_tokens.method = "fallback_zero"` and a `note` field —
+  tokenizer load failed (missing files, OOM, etc.); counts are 0 but
+  the bench score is unaffected. Soft-fail by design.
+- `completion_tokens.method = "usage_field_only"` — caller didn't pass a
+  tokenizer; the per-sample `completion_tokens` keys (rarely populated)
+  are read as-is. Reserved for older runs / external callers.
+
+Prompt tokens still come from `s.get("prompt_tokens") or 0` — re-tokenizing
+the prompt would need the raw doc text + chat-template rendering, which
+the sample row doesn't preserve. Treat `prompt_tokens` as best-effort
+until a future patch instruments the API adapter.
+
+Retroactively works on any older `samples_*.jsonl` — re-run
+`compute_token_stats(path, tokenizer_id=...)` and the new fields land
+in the recomputed stats block.
 
 ## v2.5 Pre-flight inventory
 
@@ -1812,6 +1862,115 @@ in the card text.
 | `eval/structural_canary.py` | Layer-1 rules over any `samples_*.jsonl` |
 | `eval/omk_canary.py` | Layer-2 orchestrator (run anchor → diff to expectations) |
 | `eval/templates/anchor30.yaml` | Fixed 30-question canary subset |
+| `eval/canary_ifeval_rumination4.py` | Layer-3 rumination-trigger canary (4 IFEval doc_ids) — see §v3.3.8 |
+| `scripts/stack_canary_4doc_run.sh` | Driver: vLLM up → 4-doc canary → teardown |
 | `scripts/build_vllm_wheels.sh` | Per-arch wheel builder for the locked vLLM source |
 | `scripts/install_stack.sh` | Idempotent installer (local + pod) |
 | `eval/STACK_HISTORY.md` | Append-only log of stack promotions |
+
+### v3.3.8 IFEval rumination-trigger canary — MANDATORY on every stack upgrade (2026-05-22)
+
+The Layer-1 + Layer-2 canary regime as defined in §v3.3.3 is **necessary
+but not sufficient**. It failed to catch a real regression introduced by
+stack@2 (vLLM main `68e07d591` + Fix-E cherry-pick) on v5-coder NVFP4A16:
+
+| | v5-coder × stack@1 | v5-coder × stack@2 |
+|---|---:|---:|
+| IFEval prompt_level_strict_acc | 94 % | 91 % |
+| IFEval doc 18 chars | 28 | **13635** (66× repetition loop) |
+| IFEval doc 31 chars | 1591 | 1795 (multilingual contamination — Lao + Greek + Japanese in a Punjabi rubric) |
+| IFEval doc 50 chars | 32 | **10398** (60× repetition loop) |
+| IFEval doc 59 chars | 1498 | **18292** (52× repetition loop) |
+
+Layer-1 missed it because **doc 59 sits below the p50 short_answer
+ceiling of 30000** — only one bad prompt out of 100 doesn't budge p50.
+Layer-2 missed it because `anchor_ifeval_10` uses indices
+`[0, 5, 10, …, 45]` — by construction it does **not** include 18, 31, 50,
+or 59. The four worst-affected prompts on the canonical pruned-MoE
+canary model were structurally invisible to the existing regime.
+
+#### v3.3.8.1 Why these four
+
+Empirically (2026-05-22, v5-coder NVFP4A16 weights):
+
+| doc_id | constraint | greedy fragility |
+|---:|---|---|
+| 18 | Kannada-only | low-resource Indic-script tokens have tiny top-1/top-2 logit gaps; routing micro-numerics decide the path |
+| 31 | Punjabi-only | same family, but with a "produce a rubric" generative scaffold that exposes language-mixing under perturbation |
+| 50 | Marathi-only (haiku) | Devanagari short-answer task; near-tied logits at every step |
+| 59 | no-comma + low-c + ≥250-word essay | non-language constraint cluster; English with three orthogonal hard filters |
+
+All four sit at the **long tail of greedy decoding stability**: the
+top-1/top-2 logit gap is small enough that any routing perturbation
+shifts the argmax, and at least one downstream argmax lands in a
+repetition attractor with no escape. They are stack-sensitive in
+exactly the way Layer-1 thresholds are not designed to catch.
+
+#### v3.3.8.2 Stack@1 baseline (the canary's gold)
+
+Pinned 2026-05-22 from v5-coder NVFP4A16 × stock vLLM 0.20.2 wheel on
+L40 pod 37006213 (T39):
+
+```
+doc 18 → 28 chars,   PASS
+doc 31 → 1591 chars, PASS, Gurmukhi-only
+doc 50 → 32 chars,   PASS
+doc 59 → 1498 chars, PASS, ≥250 words, no commas, c<1
+```
+
+These are the targets every future stack must hit (within 2× tolerance
+on chars; script-purity ≥95 % on docs 18/31/50).
+
+#### v3.3.8.3 Runner
+
+```bash
+# Standalone canary (server must already be up):
+python eval/canary_ifeval_rumination4.py \
+    --base-url http://localhost:8195/v1 \
+    --served-name 98e_v5_coder_nvfp4a16 \
+    --out canary_result.json
+
+# Full driver (boots vLLM, runs canary, tears down):
+bash scripts/stack_canary_4doc_run.sh stack3_revert_39917
+```
+
+Output: `canary_results/4doc_<stack_label>_<TS>/` with `STACK.txt`
+fingerprint, `canary_result.json`, full `run.log`, and `vllm_server.log`.
+
+Exit codes:
+- `0` ALL_PASS — promote-eligible (still needs Layer-1 + Layer-2)
+- `2` ANY_FAIL — at least one doc ruminates or contaminates; stack is
+  not promotable regardless of what the other two layers say
+- `3` SETUP_ERROR — server didn't come up, malformed responses, etc.
+
+#### v3.3.8.4 When to run it
+
+**Every stack upgrade** must run this canary before promotion, in
+addition to §v3.3.4 Steps 1–8. Add a Step 9:
+
+> **Step 9 — Run the IFEval rumination canary.** Pick the canonical
+> pruned-MoE canary model (currently `gemma-4-A4B-98e-v5-coder-NVFP4A16`)
+> and run `scripts/stack_canary_4doc_run.sh <stack_name>`. **All 4 docs
+> must PASS** (exit 0). If any FAIL, the stack regresses on
+> stack-sensitive prompts and is not promotable — iterate the stack, not
+> the thresholds.
+
+Re-baseline only when the canary model itself changes (new pruning
+recipe, new variant promoted to canary status). Re-baselining requires:
+
+1. A stack that has already passed Layers 1 + 2 on its own anchor model.
+2. A run of the canary against the new model on that stack.
+3. Update of the `stack1_baseline_chars` + `max_chars_healthy` constants
+   in `eval/canary_ifeval_rumination4.py` (CANARY_DOCS list) with the
+   new values.
+4. STACK_HISTORY.md entry documenting the re-baseline.
+
+#### v3.3.8.5 Why not just add the 4 docs to anchor30
+
+Because `anchor30.yaml` is wired into `omk_canary.py` via `--limit N`
+(first-N from each parent template), not by per-index selection. Adding
+indices 18/31/50/59 would require teaching the runner to honor
+`selection.type=indices` end-to-end, which it currently does not for
+the canary path. The standalone canary script bypasses that limitation
+and ships today; folding it into anchor30 + omk_canary.py is a future
+cleanup, not a blocker.

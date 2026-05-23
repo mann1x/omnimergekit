@@ -18,21 +18,31 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
+# Failed-round / archived result dirs left behind by retries
+# (e.g. "arc_challenge_full_round1_failed_20260523", "lcb_..._round3_pyfail").
+# These are NOT real benches — never surface them as table columns.
+_SKIP_DIR_RE = re.compile(r"(_round\d+|_pyfail|_failed_\d{8})")
 
-# Stable column order — matches the MicroCoder card table on HF.
+
+# Stable column order — matches the MicroCoder/Gemma card tables on HF.
 BENCH_ORDER = [
     "humaneval_full",
     "humanevalplus_full",
     "mbpp_full",
+    "lcb_medium_55",
+    "lcb_medium_55_v4",
+    "lcb_medium_30",
     "gsm8k_100",
+    "math500_100",
+    "aime_30",
     "mmlu_pro_200",
     "gpqa_diamond_full",
-    "aime_30",
-    "lcb_medium_55",
-    "lcb_medium_30",
+    "arc_challenge_full",
+    "ifeval_100",
 ]
 
 # Pretty-print labels for the markdown header.
@@ -40,12 +50,16 @@ BENCH_LABEL = {
     "humaneval_full": "HE",
     "humanevalplus_full": "HE+",
     "mbpp_full": "MBPP",
+    "lcb_medium_55": "LCB-55",
+    "lcb_medium_55_v4": "LCB-55",
+    "lcb_medium_30": "LCB-30",
     "gsm8k_100": "GSM8K(100)",
+    "math500_100": "MATH500(100)",
+    "aime_30": "AIME(30)",
     "mmlu_pro_200": "MMLU-Pro(200)",
     "gpqa_diamond_full": "GPQA-D",
-    "aime_30": "AIME(30)",
-    "lcb_medium_55": "LCB-55",
-    "lcb_medium_30": "LCB-30",
+    "arc_challenge_full": "ARC-C",
+    "ifeval_100": "IFEval(100)",
 }
 
 
@@ -59,26 +73,33 @@ def load_summary(path: Path) -> dict:
 def fmt_score(summary: dict) -> str:
     """Best-effort extraction of a single headline number from summary.json.
 
-    omk_eval writes different shapes for lm-eval vs lcb runs. Order matches
-    decreasing trust: explicit pass@1 → exact_match → flexible-extract."""
+    omk_eval writes a canonical headline `score` (already the correct metric —
+    flexible-extract / math_verify / pass@1,extract_chat / pass_at_1). Trust
+    that first; only fall back to re-deriving from raw `results` for legacy
+    summary.json files that predate the `score` field. The fallback NEVER
+    prefers strict-match / exact_match,none over flexible-extract / math_verify
+    — that mismatch is exactly what misreported GPQA 1.52% / math500 41% on
+    2026-05-23 when the real scores were 72.73% / 94%."""
     if "_error" in summary:
         return "ERR"
     s = summary
-    # LCB
+    # Canonical headline score (current omk_eval shape).
+    if isinstance(s.get("score"), (int, float)):
+        v = s["score"]
+        return f"{v*100:.2f}" if v <= 1.0 else f"{v:.2f}"
+    # LCB (custom runner shape).
     if "pass_at_1" in s:
         v = s["pass_at_1"]
         return f"{v*100:.2f}" if v <= 1.0 else f"{v:.2f}"
-    # lm-eval HE/MBPP
-    for key in ("pass@1,create_test", "pass_at_1,create_test"):
-        if key in s.get("results", {}):
-            return f"{s['results'][key]*100:.2f}"
+    # Legacy: re-derive from raw results dict, correct-metric-first.
     res = s.get("results", {})
-    # lm-eval flat results dict
-    for k, v in res.items():
-        if k.endswith("exact_match,flexible-extract") or k.endswith("exact_match,strict-match"):
-            return f"{v*100:.2f}"
-        if k.endswith("pass@1,create_test"):
-            return f"{v*100:.2f}"
+    PREF = ("pass@1,extract_chat", "pass@1,create_test", "exact_match,flexible-extract",
+            "math_verify,none", "prompt_level_strict_acc,none", "acc_norm,none",
+            "acc,none", "exact_match,strict-match", "exact_match,none")
+    for pref in PREF:
+        for k, v in res.items():
+            if k.endswith(pref) and isinstance(v, (int, float)):
+                return f"{v*100:.2f}"
     return "—"
 
 
@@ -100,13 +121,22 @@ def main() -> int:
             continue
         model = d.name
         rows.setdefault(model, {})
-        # Each subdir corresponds to one template.
+        # Each subdir corresponds to one template (bench). summary.json lives
+        # either directly under the bench dir (flat, legacy) or one level
+        # deeper under a per-served-name subdir (current omk layout):
+        #   <variant>/<bench>/summary.json
+        #   <variant>/<bench>/<served>/summary.json
         for sub in sorted(d.iterdir()):
             if not sub.is_dir():
                 continue
+            if _SKIP_DIR_RE.search(sub.name):
+                continue
             summ = sub / "summary.json"
             if not summ.exists():
-                continue
+                cand = sorted(sub.glob("*/summary.json"))
+                if not cand:
+                    continue
+                summ = cand[-1]
             data = load_summary(summ)
             if args.name_from == "summary":
                 model = data.get("model", model)
