@@ -35,7 +35,7 @@ source /workspace/miniconda/etc/profile.d/conda.sh
 conda activate modelopt
 export HF_XET_HIGH_PERFORMANCE=1
 export PYTHONDONTWRITEBYTECODE=1
-export HF_TOKEN="${HF_TOKEN:-***REMOVED-DEAD-HF-TOKEN***}"
+export HF_TOKEN="${HF_TOKEN:?HF_TOKEN must be exported in the environment — never hardcode}"
 
 quant_one() {
     local NAME="$1" SRC="$2" DST="$3" REPO="$4"
