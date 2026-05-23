@@ -8,6 +8,7 @@ backend: multipl_e
 task: multipl_e
 n: 10
 selection:
+  type: langs
   langs: [rs, java, js]
 generation:
   max_gen_toks: 1024

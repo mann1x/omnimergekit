@@ -40,14 +40,16 @@ except ImportError:  # pragma: no cover
 
 
 REPO_TEMPLATES_DIR = Path(__file__).resolve().parent
-KNOWN_BACKENDS = {"lm-eval", "lcb_custom"}
+KNOWN_BACKENDS = {"lm-eval", "lcb_custom", "multipl_e"}
 # Selection types:
 #   indices  — list[int] honored by the runner (or baked into a shadow task
 #              via process_docs for lm-eval which doesn't honor --limit indices)
 #   filter   — runner-side filter (currently lcb_custom: difficulty/min_date)
 #   explicit — lcb_custom only: pinned list of task_ids passed to the shim via
 #              --task-ids. Used by curated smoke subsets.
-KNOWN_SELECTION_TYPES = {"indices", "filter", "explicit"}
+#   langs    — multipl_e only: list[str] of MultiPL-E languages; n is the
+#              per-language problem count (first n of each split).
+KNOWN_SELECTION_TYPES = {"indices", "filter", "explicit", "langs"}
 REQUIRED_TOP_LEVEL = {"name", "backend", "task", "n", "selection", "generation", "scoring", "cache"}
 
 
@@ -118,6 +120,20 @@ def validate(t: dict[str, Any], path: Path) -> None:
         for k in ("difficulty", "min_date", "testtype"):
             if k not in sel:
                 raise SystemExit(f"{path}: lcb_custom explicit missing {k!r}")
+    elif sel["type"] == "langs":
+        # MultiPL-E: a list of languages; n is the per-language problem count.
+        if t["backend"] != "multipl_e":
+            raise SystemExit(
+                f"{path}: selection.type=langs only supported for "
+                f"backend=multipl_e (got {t['backend']!r})"
+            )
+        langs = sel.get("langs")
+        if not isinstance(langs, list) or not langs or not all(
+            isinstance(x, str) for x in langs
+        ):
+            raise SystemExit(f"{path}: selection.langs must be a non-empty list[str]")
+        if not isinstance(t["n"], int) or t["n"] <= 0:
+            raise SystemExit(f"{path}: n must be a positive int (per-language count)")
 
 
 def load(arg: str) -> dict[str, Any]:

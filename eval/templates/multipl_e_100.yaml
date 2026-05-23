@@ -17,6 +17,7 @@ backend: multipl_e
 task: multipl_e
 n: 100                      # problems PER language (first N of the split)
 selection:
+  type: langs
   langs: [rs, java, js]
 generation:
   max_gen_toks: 1024
