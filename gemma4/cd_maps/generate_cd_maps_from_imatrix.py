@@ -15,7 +15,7 @@ CD tier table:
   CD-Q6_K:    top=Q8_0,  mid=Q6_K,  low=Q5_K
   CD-Q5_K_M:  top=Q6_K,  mid=Q5_K,  low=Q4_K
   CD-Q4_K_M:  top=Q5_K,  mid=Q4_K,  low=Q3_K
-  CD-Q3_K_M:  top=Q4_K,  mid=Q3_K,  low=IQ3_S
+  CD-Q3_K_L:  top=Q4_K,  mid=Q3_K,  low=IQ3_S
   CD-Q2_K:    top=Q3_K,  mid=Q2_K,  low=IQ2_S
 
 Output: one tensor_types_CD-<LEVEL>.txt per CD level, written to --out-dir.
@@ -31,7 +31,7 @@ CD_TIERS = {
     "CD-Q6_K":   ("Q8_0", "Q6_K", "Q5_K"),
     "CD-Q5_K_M": ("Q6_K", "Q5_K", "Q4_K"),
     "CD-Q4_K_M": ("Q5_K", "Q4_K", "Q3_K"),
-    "CD-Q3_K_M": ("Q4_K", "Q3_K", "IQ3_S"),
+    "CD-Q3_K_L": ("Q4_K", "Q3_K", "IQ3_S"),
     "CD-Q2_K":   ("Q3_K", "Q2_K", "IQ2_S"),
 }
 

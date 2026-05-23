@@ -187,7 +187,7 @@ fi
 echo "[$(date -Iseconds)] step 2: downloading base $BASE_HF_ID to $SRC_DIR ..."
 rm -rf "$SRC_DIR"
 mkdir -p "$SRC_DIR"
-HF_HUB_ENABLE_HF_TRANSFER=1 hf download "$BASE_HF_ID" \
+HF_XET_HIGH_PERFORMANCE=1 hf download "$BASE_HF_ID" \
     --local-dir "$SRC_DIR" \
     --exclude '*.gguf' --exclude 'imatrix.dat'
 echo "  base size: $(du -sh "$SRC_DIR" | cut -f1)"
@@ -262,7 +262,7 @@ fi
 
 echo "[$(date -Iseconds)] step 4: uploading $OUT_DIR → $TARGET_HF_ID ..."
 hf repo create "$TARGET_HF_ID" --type model -y 2>&1 | tail -3 || true
-HF_HUB_ENABLE_HF_TRANSFER=1 hf upload "$TARGET_HF_ID" "$OUT_DIR" . \
+HF_XET_HIGH_PERFORMANCE=1 hf upload "$TARGET_HF_ID" "$OUT_DIR" . \
     --commit-message "replay prune from cached importance (frac=$PRUNE_FRAC) of $BASE_HF_ID"
 
 # Free disk

@@ -1,0 +1,50 @@
+{
+  "template": "math500_100_gptoss",
+  "model": "gpt_oss_20b_mxfp4",
+  "quant": "unknown",
+  "backend": "vllm",
+  "rc": 0,
+  "samples_file": "eval_results/gpt_oss_canonical/math500_100_gptoss/math500_100_gptoss/gpt_oss_20b_mxfp4/lm_eval_out/gpt_oss_20b_mxfp4/samples_minerva_math500_2026-05-17T13-33-04.236859.jsonl",
+  "score": 0.94,
+  "scores": {
+    "exact_match,none": 0.0,
+    "math_verify,none": 0.94
+  },
+  "token_stats": {
+    "n": 100,
+    "prompt_tokens": {
+      "sum": 0,
+      "p10": 0,
+      "p50": 0,
+      "p90": 0,
+      "max": 0
+    },
+    "completion_tokens": {
+      "sum": 0,
+      "p10": 0,
+      "p50": 0,
+      "p90": 0,
+      "max": 0
+    },
+    "thinking_tokens_est": {
+      "method": "len(reasoning_block) // 4",
+      "sum": 0,
+      "p50": 0,
+      "p90": 0,
+      "max": 0,
+      "kinds": {},
+      "ratio_of_completion": 0.0
+    },
+    "completion_chars": {
+      "p10": 239,
+      "p50": 651,
+      "p90": 1476,
+      "max": 2284
+    },
+    "finish_reasons": {
+      "None": 100
+    },
+    "empty_completions": 0
+  },
+  "sanity_warnings": []
+}

@@ -1,0 +1,26 @@
+--- a/lm_eval/models/openai_completions.py
++++ b/lm_eval/models/openai_completions.py
+@@ -215,7 +215,21 @@ class LocalChatCompletion(LocalCompletionsAPI):
+                 tmp = [None] * len(out["choices"])
+                 for choices in out["choices"]:
+                     msg = choices["message"]
+-                    tmp[choices["index"]] = msg["content"] if msg.get("content") else ""
++                    content = msg.get("content") or ""
++                    # Fix-A (2026-05-14, refined 2026-05-21 stack@2):
++                    # On parser silent-empty (vLLM <0.21 on Gemma 4 half-open
++                    # closure), `content` was "" and the answer lived in
++                    # `reasoning_content`. Use content-first; reasoning_content
++                    # is the fallback ONLY when content is genuinely empty.
++                    # The original concat-when-both-populated form contaminated
++                    # rule-based scorers (IFEval no-comma, lowercase, multi-
++                    # section) with the planning bullets the model emits in
++                    # `reasoning`. RCA in memory:
++                    # `feedback_vllm_gemma4_silentempty_rca.md`.
++                    if content:
++                        text = content
++                    else:
++                        text = msg.get("reasoning") or msg.get("reasoning_content") or ""
++                    tmp[choices["index"]] = text
+             except Exception as e:
+                 # account for cases that generation is blocked by content filter,
+                 # which is common for Azure OpenAI Service,

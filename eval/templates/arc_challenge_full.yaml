@@ -40,3 +40,14 @@ cache:
   sqlite_prefix: arc_challenge_full
 reports:
   token_stats: true
+# Per-engine override: arc is in the llama bench-defaults reasoning-typed list
+# and gets `--reasoning-format deepseek --reasoning-budget <budget>`. On
+# pruned Gemma 4 variants the model emits its reasoning to the channel but
+# then the chat-completions content only gets a truncated markdown bullet
+# `*   ` (4 chars) for ~70% of items → score below random. Force no reasoning
+# channel on llama.cpp to mirror the validated 128e recipe (enable_thinking=false).
+backend_overrides:
+  llama:
+    backend_args:
+      llama_extra_replace: true
+      llama_extra: ["--jinja", "--reasoning", "off"]

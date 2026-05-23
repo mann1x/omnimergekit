@@ -211,6 +211,28 @@ def build_predictions_chat(
     ]
 
 
+# ─── Curated subset selectors ────────────────────────────────────────────────
+# `process_docs` lm-eval hooks. Each takes a `datasets.Dataset` and returns
+# a filtered copy. Used by smoke shadow tasks that need a non-contiguous
+# subset (lm-eval `--limit` only takes first-N, which can't probe specific
+# v4-fail indices). The indices below match the matching template YAML
+# under eval/templates/. Keep these two in sync if you ever re-roll.
+
+# HE+ curated 30-problem set for v5-coder T21 qualification (2026-05-17):
+#   5 v4-fails (128e-PASS) + 25 lowest-128e-chars v4-passes from the 128e-
+#   PASS pool. v4 anchor 25/30, 128e 30/30.
+_HE_PLUS_CURATED30_INDICES = {
+    11, 13, 14, 15, 16, 20, 22, 23, 24, 27,
+    28, 30, 34, 35, 42, 45, 47, 48, 49, 52,
+    53, 55, 58, 60, 62, 85, 121, 140, 154, 163,
+}
+
+
+def select_he_plus_curated30(dataset):
+    """Filter HE+ dataset to the 30 curated indices for the smoke template."""
+    return dataset.select(sorted(_HE_PLUS_CURATED30_INDICES))
+
+
 # ─── Regression test ──────────────────────────────────────────────────────────
 # `python utils_chat.py` runs these. If you change `_clean_one`, run it.
 

@@ -17,7 +17,7 @@ $SSH bash <<'POD'
 set -euo pipefail
 source /workspace/miniconda/etc/profile.d/conda.sh
 export PYTHONDONTWRITEBYTECODE=1
-export HF_HUB_ENABLE_HF_TRANSFER=1
+export HF_XET_HIGH_PERFORMANCE=1
 
 # eval_suite_vllm.sh hardcodes /root/anaconda3/envs/* — symlink so it finds
 # our envs.

@@ -1,0 +1,53 @@
+{
+  "template": "gpqa_diamond_full_gptoss",
+  "model": "gpt_oss_20b_mxfp4",
+  "quant": "unknown",
+  "backend": "vllm",
+  "rc": 0,
+  "samples_file": "eval_results/gpt_oss_canonical/gpqa_diamond_full_gptoss/gpqa_diamond_full_gptoss/gpt_oss_20b_mxfp4/lm_eval_out/gpt_oss_20b_mxfp4/samples_gpqa_diamond_cot_zeroshot_2026-05-17T15-26-38.448195.jsonl",
+  "score": 0.5808080808080808,
+  "scores": {
+    "exact_match,strict-match": 0.0,
+    "exact_match,flexible-extract": 0.5808080808080808
+  },
+  "token_stats": {
+    "n": 198,
+    "prompt_tokens": {
+      "sum": 0,
+      "p10": 0,
+      "p50": 0,
+      "p90": 0,
+      "max": 0
+    },
+    "completion_tokens": {
+      "sum": 0,
+      "p10": 0,
+      "p50": 0,
+      "p90": 0,
+      "max": 0
+    },
+    "thinking_tokens_est": {
+      "method": "len(reasoning_block) // 4",
+      "sum": 0,
+      "p50": 0,
+      "p90": 0,
+      "max": 0,
+      "kinds": {},
+      "ratio_of_completion": 0.0
+    },
+    "completion_chars": {
+      "p10": 32,
+      "p50": 984,
+      "p90": 1793,
+      "max": 3026
+    },
+    "finish_reasons": {
+      "None": 198
+    },
+    "empty_completions": 13
+  },
+  "sanity_warnings": [
+    "too many empty completions: 13",
+    "p10 completion length 32 < 60 chars"
+  ]
+}

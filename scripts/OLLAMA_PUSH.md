@@ -8,7 +8,7 @@ Two scripts (different chat-template handling — pick by base architecture):
 
 | Script | Use it for | Chat template |
 |---|---|---|
-| `ollama_push_98e.sh` | Gemma 4 models | **custom** Gemma 4 tools template baked in (the 2nd-tool-call turn fix). Mirrors the published `mannix/gemma4-98e` recipe. |
+| `ollama_push_gemma4.sh` | Gemma 4 models (any variant: 26B-A4B v3/v4/v5/v5-coder/v5-logic, 31B-it/he1, …) | **custom** Gemma 4 tools template baked in (the 2nd-tool-call turn fix). Mirrors the published `mannix/gemma4-98e` recipe. |
 | `ollama_push_generic.sh` | Anything else (Qwen2/3, Llama, Mistral, etc.) | none — ollama auto-detects from the GGUF metadata's `tokenizer.chat_template`. |
 
 Both produce identical published artifacts otherwise; the GGUF bytes uploaded
@@ -78,7 +78,7 @@ of a parent shell.
 TOKEN=$(cat ~/.cache/huggingface/token)
 
 # Gemma 4 (custom tools template + 2nd-turn workaround):
-bash ollama_push_98e.sh \
+bash ollama_push_gemma4.sh \
     ManniX-ITA/gemma-4-A4B-98e-v4-it-GGUF \
     mannix/gemma4-98e-v4 \
     "$TOKEN"
@@ -166,7 +166,7 @@ one quant's blob is live.
 
 ### Don't run both pushes in parallel against the same daemon
 
-On 2026-05-11 we ran `ollama_push_98e.sh` (Gemma 4 v4, 31 tags) and
+On 2026-05-11 we ran the Gemma 4 push script (then named `ollama_push_98e.sh`, now `ollama_push_gemma4.sh`) (Gemma 4 v4, 31 tags) and
 `ollama_push_generic.sh` (Qwen3.6 omnimerge, 25 tags) in parallel against
 one `ollama serve`. The Gemma push consistently completed each iteration;
 the Qwen push failed ~half of them with `context deadline exceeded` on
@@ -182,7 +182,7 @@ matter, just don't overlap them on the same daemon).
 Both scripts derive the tag from the GGUF filename via a regex against the
 HF repo's `tree/main` API:
 
-- `ollama_push_98e.sh` expects `*-it-<TAG>.gguf` (the Gemma 4 naming).
+- `ollama_push_gemma4.sh` expects `*-it-<TAG>.gguf` (the Gemma 4 naming).
   E.g. `gemma-4-A4B-98e-v4-it-CD-Q6_K.gguf` → tag `CD-Q6_K`.
 - `ollama_push_generic.sh` walks the trailing dash-separated components
   and matches against a quant-tag pattern (`F16`, `Q\d+(_[KS01ML]+)?`, `IQ\d+_*`,
@@ -195,7 +195,7 @@ startup so you can sanity-check before pushes start eating bandwidth.
 
 ## Modelfile contents
 
-**Gemma 4 (`ollama_push_98e.sh`):** ships a tools-aware chat template that
+**Gemma 4 (`ollama_push_gemma4.sh`):** ships a tools-aware chat template that
 fixes a 2nd-turn-call regression in the upstream Gemma 4 ollama template, plus
 the v4 sampling defaults (`temperature 0.6 top_p 0.95 num_ctx 256000
 repeat_penalty 1.15 stop <turn|>`).
@@ -250,3 +250,38 @@ template metadata properly.
   (the second push starves on the daemon's HF connection pool and
   every `CREATE FAILED` leaks a `-partial` blob, eventually filling
   disk). Recipe is now: run them **serially**.
+- **2026-05-19 (hardened + renamed)** — two new safeguards landed
+  after the v5-it 13-tier push ballooned `/root/.ollama/models` to
+  128 GB on pod 36949547:
+  - **Orphan blob sweep.** `ollama rm <tag>` removes the manifest but
+    leaves the content-addressed blobs in
+    `$OLLAMA_MODELS/blobs/sha256-*` if any *other* manifest still
+    references them — and for content-deduped blobs they often
+    survive long after every referring manifest is gone. The Gemma
+    script now scans both `/usr/share/ollama/.ollama/models` and
+    `/root/.ollama/models` after each tag and `rm`s blob files with
+    no surviving manifest reference. Logs `swept N blob(s), M MB
+    freed` per iteration.
+  - **Private-model marker file.** The default "already pushed?"
+    check (`curl ollama.com/<target>/tags` HTML scrape) returns
+    empty for **private** models on ollama.com, even when tags
+    *are* pushed. Default-private namespaces (e.g.
+    `mannix/gemma4-98e-v5` while still in evaluation) therefore
+    looked like fresh repos, and the script would happily re-push
+    every tier on a re-run. The script now unions the HTML scrape
+    with a local marker file
+    `$WORKDIR/pushed_<target>.txt` written after each verified
+    push. Pre-populate it manually with the set of known-pushed
+    tiers if running across pods. **To make a model truly public**,
+    mannix must toggle visibility in the ollama.com web UI — the
+    script can't do that.
+  - **Rename.** The script was renamed from `ollama_push_98e.sh` to
+    `ollama_push_gemma4.sh` because it has always been
+    architecture-specific (custom Gemma 4 tools template) not
+    98e-specific — it's the canonical pusher for every Gemma 4
+    variant (98e v3/v4/v5/v5-coder, 31B-it, 31B-he1, …). A frozen
+    historical copy lives at
+    `scripts/archived/ollama_push_98e.sh.frozen-2026-05-19` (write-
+    protected) for reference. **Use the renamed script for all new
+    runs. There is no per-model variant of this script and there
+    never should be — one script, all Gemma 4 push targets.**

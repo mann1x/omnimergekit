@@ -1,0 +1,49 @@
+{
+  "template": "arc_challenge_full_gptoss",
+  "model": "gpt_oss_20b_mxfp4",
+  "quant": "unknown",
+  "backend": "vllm",
+  "rc": 0,
+  "samples_file": "eval_results/gpt_oss_canonical/arc_challenge_full_gptoss/arc_challenge_full_gptoss/gpt_oss_20b_mxfp4/lm_eval_out/gpt_oss_20b_mxfp4/samples_arc_challenge_full_chat_2026-05-17T16-01-11.181813.jsonl",
+  "score": 0.9573378839590444,
+  "scores": {
+    "exact_match,none": 0.9573378839590444
+  },
+  "token_stats": {
+    "n": 1172,
+    "prompt_tokens": {
+      "sum": 0,
+      "p10": 0,
+      "p50": 0,
+      "p90": 0,
+      "max": 0
+    },
+    "completion_tokens": {
+      "sum": 0,
+      "p10": 0,
+      "p50": 0,
+      "p90": 0,
+      "max": 0
+    },
+    "thinking_tokens_est": {
+      "method": "len(reasoning_block) // 4",
+      "sum": 0,
+      "p50": 0,
+      "p90": 0,
+      "max": 0,
+      "kinds": {},
+      "ratio_of_completion": 0.0
+    },
+    "completion_chars": {
+      "p10": 20,
+      "p50": 20,
+      "p90": 241,
+      "max": 800
+    },
+    "finish_reasons": {
+      "None": 1172
+    },
+    "empty_completions": 2
+  },
+  "sanity_warnings": []
+}

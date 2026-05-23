@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+# THE canonical ollama push script. Use it for every model (98e / v4 / v5 /
+# v5-it / v5-coder / he1 / future variants). Do NOT create per-model one-off
+# wrappers — this script takes HF repo + Ollama target as arguments and
+# handles all of them.
+#
+# Strategy per tag: pull GGUF from HF → ollama create from local file →
+# ollama push → ollama rm (manifest) → sweep orphan blobs (so disk stays
+# bounded — `ollama rm` alone leaves the content-addressed blob in
+# $OLLAMA_MODELS/blobs/sha256-* and disk grows by ~10 GB per tier).
+#
+# Idempotent: skips tags already present on ollama.com (via tag-page scrape).
+#
+# Usage:
+#   bash ollama_push_98e.sh <hf_repo> <ollama_target> [include_pattern]
+# e.g.
+#   bash ollama_push_98e.sh ManniX-ITA/gemma-4-A4B-98e-v3-it-GGUF mannix/gemma4-98e
+#   bash ollama_push_98e.sh ManniX-ITA/gemma-4-A4B-98e-v4-it-GGUF mannix/gemma4-98e-v4
+#   bash ollama_push_98e.sh ManniX-ITA/gemma-4-A4B-98e-v5-it-GGUF mannix/gemma4-98e-v5
+#   bash ollama_push_98e.sh ManniX-ITA/gemma-4-A4B-98e-v5-coder-it-GGUF mannix/gemma4-98e-v5-coder
+#   bash ollama_push_98e.sh ManniX-ITA/gemma-4-31b-he1-it-GGUF mannix/gemma4-31b-he1
+
+set -euo pipefail
+HF_REPO="${1:?hf repo (e.g. ManniX-ITA/gemma-4-A4B-98e-v3-it-GGUF)}"
+OL_TARGET="${2:?ollama target (e.g. mannix/gemma4-98e)}"
+INCLUDE="${3:-}"   # optional grep pattern to filter tags
+
+WORKDIR=/workspace/ollama_push
+LOG_DIR=/workspace/logs
+mkdir -p "$WORKDIR" "$LOG_DIR"
+
+ts() { date -Iseconds; }
+log() { echo "[$(ts)] $*" | tee -a "$LOG_DIR/ollama_push_${OL_TARGET//\//_}.log"; }
+
+# === The template + parameters from existing CD-Q6_K push (verbatim) ===
+# Tools template includes the 2nd-turn fix.
+TEMPLATE_FILE="$WORKDIR/template.tmpl"
+cat > "$TEMPLATE_FILE" <<'TMPL_EOF'
+{{- if or .System .Tools }}<bos><|turn>system
+{{ if .System }}{{ .System }}
+{{ end }}{{- if .Tools }}
+You may call one or more functions to assist the user. Available functions:
+{{- range .Tools }}
+<|tool>declaration:{{ .Function.Name }}{{ .Function.Parameters }}<tool|>
+{{- end }}
+
+To call a function, emit:
+<|tool_call>call:FUNCTION_NAME{arg_name:<|"|>string_value<|"|>,other_arg:number}<tool_call|>
+
+All string values MUST be wrapped in <|"|>...<|"|> delimiters. Numbers and booleans are raw.
+{{- end }}<turn|>
+{{ end -}}
+{{- range $i, $msg := .Messages }}
+{{- $last := eq (len (slice $.Messages $i)) 1 -}}
+{{- if eq $msg.Role "system" }}
+{{- if gt $i 0 }}<|turn>system
+{{ $msg.Content }}<turn|>
+{{ end }}
+{{- else if eq $msg.Role "user" }}<|turn>user
+{{ $msg.Content }}<turn|>
+{{ else if eq $msg.Role "assistant" }}<|turn>model
+{{- if $msg.Content }}
+{{ $msg.Content }}
+{{- end }}
+{{- range $msg.ToolCalls }}
+<|tool_call>call:{{ .Function.Name }}{{ .Function.Arguments }}<tool_call|>
+{{- end }}{{ if not $last }}<turn|>
+{{ end }}
+{{- else if eq $msg.Role "tool" }}<|turn>user
+<|tool_response>response:{{ $msg.Name }}{ {{ $msg.Content }} }<tool_response|><turn|>
+{{ end }}
+{{- if and (ne $msg.Role "assistant") $last }}<|turn>model
+{{ end }}
+{{- end }}
+TMPL_EOF
+
+# Discover all .gguf files in the HF repo (sorted, deduped on basename minus -GGUF.gguf suffix)
+log "Discovering tags in $HF_REPO ..."
+TAGS=$(curl -fsSL -H "Authorization: Bearer ${HF_TOKEN:?HF_TOKEN env required}" \
+    "https://huggingface.co/api/models/$HF_REPO/tree/main" \
+    | python3 -c "
+import json, sys, re
+d = json.load(sys.stdin)
+out = []
+for x in d:
+    p = x.get('path','')
+    if x.get('type') != 'file' or not p.endswith('.gguf'):
+        continue
+    # Strip prefix up to and including the model basename, leaving the QUANT_TAG.gguf
+    # e.g. gemma-4-A4B-98e-v3-it-CD-Q6_K.gguf -> CD-Q6_K
+    m = re.match(r'.+?[-_](?:it|bf16)-(.+)\\.gguf$', p)
+    if m:
+        out.append((m.group(1), p))
+print('\\n'.join(t for t, _ in out))
+")
+
+if [[ -n "$INCLUDE" ]]; then
+    TAGS=$(echo "$TAGS" | grep -E "$INCLUDE" || true)
+fi
+
+# Skip F16 by default (40GB, most users don't want it)
+TAGS=$(echo "$TAGS" | grep -vE "^F16$" || true)
+
+log "Tags to push (after filter):"
+echo "$TAGS" | sed 's/^/  /' | tee -a "$LOG_DIR/ollama_push_${OL_TARGET//\//_}.log"
+N_TAGS=$(echo "$TAGS" | grep -c .)
+log "  total: $N_TAGS"
+
+# Existing tags — skip already-pushed.
+# Two sources, unioned:
+#   1. HTML scrape of ollama.com/<target>/tags (works for PUBLIC models)
+#   2. Local marker file $WORKDIR/pushed_<target>.txt (works for PRIVATE models,
+#      and is the only thing that survives across runs on the same pod when the
+#      model is published as private — HTML scrape returns nothing for private)
+# Marker file is written below in the push loop after the positive success+URL
+# markers fire. The marker can be pre-populated manually if known-pushed tags
+# exist from a different pod (cat them in, one per line).
+MARKER_FILE="$WORKDIR/pushed_${OL_TARGET//\//_}.txt"
+EXISTING_HTML=$(curl -sL "https://ollama.com/${OL_TARGET}/tags" 2>/dev/null \
+    | grep -oE "${OL_TARGET}:[A-Za-z0-9_-]+" 2>/dev/null | sed "s|.*:||" | sort -u || true)
+EXISTING_MARKER=""
+if [[ -f "$MARKER_FILE" ]]; then
+    EXISTING_MARKER=$(sort -u "$MARKER_FILE")
+fi
+EXISTING=$(printf '%s\n%s\n' "$EXISTING_HTML" "$EXISTING_MARKER" | sort -u | grep -v '^$' || true)
+if [[ -n "$EXISTING_HTML" ]]; then
+    log "Already on ollama.com (public scrape):"
+    echo "$EXISTING_HTML" | sed 's/^/  /' | tee -a "$LOG_DIR/ollama_push_${OL_TARGET//\//_}.log"
+fi
+if [[ -n "$EXISTING_MARKER" ]]; then
+    log "Already pushed (marker file $MARKER_FILE):"
+    echo "$EXISTING_MARKER" | sed 's/^/  /' | tee -a "$LOG_DIR/ollama_push_${OL_TARGET//\//_}.log"
+fi
+
+# Tags discovered to push
+TODO=$(comm -23 <(echo "$TAGS" | sort -u) <(echo "$EXISTING" | sort -u))
+N_TODO=$(echo "$TODO" | grep -c .)
+log "TODO: $N_TODO tag(s)"
+
+# Discover the actual GGUF filename prefix (everything before the tag)
+# Tags can contain hyphens (CD-Q2_K, IQ4_NL, Q3_K_XL etc.) so use the same regex
+# that built TAGS to extract the prefix correctly.
+FILE_PREFIX=$(curl -fsSL -H "Authorization: Bearer ${HF_TOKEN:?HF_TOKEN env required}" \
+    "https://huggingface.co/api/models/$HF_REPO/tree/main" \
+    | python3 -c "
+import json, sys, re
+d = json.load(sys.stdin)
+for x in d:
+    p = x.get('path','')
+    if x.get('type') == 'file' and p.endswith('.gguf') and 'F16' not in p:
+        m = re.match(r'(.+?[-_](?:it|bf16))-(.+)\.gguf$', p)
+        if m:
+            print(m.group(1))
+            break
+")
+log "Detected file prefix: ${FILE_PREFIX}-<TAG>.gguf"
+
+# Locate hf CLI (may not be on PATH in tmux/nohup contexts)
+HF_CLI=$(command -v hf || true)
+if [[ -z "$HF_CLI" ]]; then
+    for cand in /workspace/miniconda/envs/omnimergekit/bin/hf /root/anaconda3/envs/omnimergekit/bin/hf; do
+        [[ -x "$cand" ]] && HF_CLI="$cand" && break
+    done
+fi
+[[ -z "$HF_CLI" ]] && { log "FATAL: hf CLI not found"; exit 1; }
+log "Using hf CLI: $HF_CLI"
+
+# ── PRE-FLIGHT DAEMON CHECK ───────────────────────────────────────────────
+# IMPORTANT: ollama 0.24.0 prints the misleading warning
+#   "You need to be signed in to push models to ollama.com."
+# DURING NORMAL SUCCESSFUL PUSHES — it's a cosmetic warning, NOT a failure
+# signal. Empirically verified 2026-05-18: every push that landed on
+# ollama.com also emitted this warning. Negative-marker grep is unreliable.
+#
+# The actual signal for success is a "success" line + "You can find your
+# model at: https://..." line in the push output, which fires only after
+# manifest+blob transfer completes. We use that below.
+#
+# Pre-flight here just confirms the daemon is reachable and reads the key
+# from the right HOME (so the registered mannix key — owned by user
+# `ollama` at /usr/share/ollama/.ollama/id_ed25519 — actually gets used).
+log "pre-flight: verifying ollama daemon up + reading the daemon's key path ..."
+if ! curl -fs http://localhost:11434/api/tags >/dev/null 2>&1; then
+    log "FATAL: ollama daemon not responding on 127.0.0.1:11434. Start with:"
+    log "  sudo -u ollama -E HOME=/usr/share/ollama OLLAMA_MODELS=/usr/share/ollama/.ollama/models ollama serve &"
+    exit 2
+fi
+DAEMON_PID=$(pgrep -f "ollama serve" | head -1 || true)
+# Try to read daemon HOME from /proc; permission may be denied if daemon runs
+# as a different user — that's fine, this is informational.
+DAEMON_HOME=$(tr '\0' '\n' </proc/$DAEMON_PID/environ 2>/dev/null | grep ^HOME= | cut -d= -f2- || echo "(unreadable — daemon runs as different user)")
+# Probe common daemon key locations for the pubkey we expect to push under.
+for p in /usr/share/ollama/.ollama/id_ed25519.pub /root/.ollama/id_ed25519.pub "$HOME/.ollama/id_ed25519.pub"; do
+    if [ -f "$p" ]; then
+        log "pre-flight: candidate pubkey at $p — $(cat "$p")"
+    fi
+done
+log "pre-flight: daemon pid=$DAEMON_PID HOME=$DAEMON_HOME"
+log "pre-flight: daemon up — proceeding"
+
+i=0
+PUSH_OK=0
+for TAG in $TODO; do
+    i=$((i+1))
+    log "[$i/$N_TODO] $TAG: downloading GGUF from HF (workaround for ollama hf.co realm bug) ..."
+    df -h /workspace | tail -1 | tee -a "$LOG_DIR/ollama_push_${OL_TARGET//\//_}.log"
+
+    GGUF_FILE="${FILE_PREFIX}-${TAG}.gguf"
+    LOCAL_PATH="$WORKDIR/$GGUF_FILE"
+
+    if [[ ! -f "$LOCAL_PATH" ]]; then
+        if ! "$HF_CLI" download "$HF_REPO" "$GGUF_FILE" --local-dir "$WORKDIR" \
+                >>"$LOG_DIR/ollama_push_${OL_TARGET//\//_}.log" 2>&1; then
+            log "  HF DOWNLOAD FAILED for $TAG; skipping"
+            continue
+        fi
+    fi
+
+    # Modelfile referencing local file
+    MF="$WORKDIR/Modelfile.${TAG}"
+    cat > "$MF" <<EOF
+FROM $LOCAL_PATH
+TEMPLATE """$(cat "$TEMPLATE_FILE")"""
+RENDERER gemma4
+PARSER gemma4
+PARAMETER repeat_penalty 1.15
+PARAMETER stop <turn|>
+PARAMETER stop <|tool_response>
+PARAMETER temperature 0.6
+PARAMETER top_p 0.95
+PARAMETER num_ctx 256000
+PARAMETER repeat_last_n 256
+EOF
+
+    if ! ollama create "${OL_TARGET}:${TAG}" -f "$MF" >>"$LOG_DIR/ollama_push_${OL_TARGET//\//_}.log" 2>&1; then
+        log "  CREATE FAILED for $TAG; skipping"
+        rm -f "$LOCAL_PATH"
+        continue
+    fi
+
+    log "[$i/$N_TODO] $TAG: pushing to ollama.com ..."
+    # ── PER-PUSH SUCCESS VERIFICATION (POSITIVE MARKERS ONLY) ──
+    # Use the success markers that fire only after the push completes:
+    #   "success" line + "You can find your model at: https://..."
+    # The "You need to be signed in" warning DOES NOT indicate failure — it
+    # appears in every push including successful ones in 0.24.0. So we
+    # ignore negative-grep entirely and require positive markers.
+    # If both markers are present → PUSH_OK. Otherwise → log + retry on
+    # next iteration (rc>0 still aborts whole loop because that's a real
+    # process-level failure).
+    PUSH_OUT=$(mktemp)
+    ollama push "${OL_TARGET}:${TAG}" >"$PUSH_OUT" 2>&1
+    PUSH_RC=$?
+    cat "$PUSH_OUT" >>"$LOG_DIR/ollama_push_${OL_TARGET//\//_}.log"
+    HAS_SUCCESS=$(grep -cE "^success$|^success [K]?" "$PUSH_OUT" 2>/dev/null || echo 0)
+    HAS_URL=$(grep -cE "You can find your model at" "$PUSH_OUT" 2>/dev/null || echo 0)
+    if [[ $PUSH_RC -ne 0 ]]; then
+        log "  PUSH process exited non-zero (rc=$PUSH_RC) for $TAG; aborting loop."
+        log "  last 5 lines: $(tail -5 "$PUSH_OUT" | tr '\n' ' | ')"
+        rm -f "$PUSH_OUT" "$LOCAL_PATH"
+        exit 3
+    fi
+    if [[ "$HAS_SUCCESS" -lt 1 ]] || [[ "$HAS_URL" -lt 1 ]]; then
+        log "  PUSH likely failed for $TAG (rc=0 but no success/URL markers). Skipping; will retry next run."
+        log "  last 5 lines: $(tail -5 "$PUSH_OUT" | tr '\n' ' | ')"
+        rm -f "$PUSH_OUT" "$LOCAL_PATH"
+        continue
+    fi
+    rm -f "$PUSH_OUT"
+    PUSH_OK=$((PUSH_OK+1))
+    # Record the verified-pushed tag in the marker file so future runs skip it
+    # even when ollama.com HTML scrape returns nothing (private model case).
+    echo "$TAG" >> "$MARKER_FILE"
+
+    # Free disk: drop local model + local gguf + sweep orphan blobs
+    # ── BLOB SWEEP IS MANDATORY ────────────────────────────────────────
+    # `ollama rm <tag>` removes the manifest under .ollama/models/manifests/
+    # but does NOT delete the content-addressed blobs in .ollama/models/blobs/
+    # that the manifest referenced. Without this sweep, each pushed tier
+    # leaves a ~10 GB GGUF blob on disk forever — 13 tiers → 128 GB bloat.
+    # Verified empirically on pod 36949547 v5-it cycle 2026-05-18/19.
+    ollama rm "${OL_TARGET}:${TAG}" >>"$LOG_DIR/ollama_push_${OL_TARGET//\//_}.log" 2>&1 || true
+    rm -f "$LOCAL_PATH"
+    swept_bytes=0; swept_count=0
+    for od in /usr/share/ollama/.ollama/models /root/.ollama/models; do
+        [ -d "$od/blobs" ] && [ -d "$od/manifests" ] || continue
+        for b in "$od/blobs/"sha256-*; do
+            [ -f "$b" ] || continue
+            d=$(basename "$b")
+            if ! grep -rq "$d" "$od/manifests" 2>/dev/null; then
+                sz=$(stat -c %s "$b" 2>/dev/null || echo 0)
+                rm -f "$b" && { swept_bytes=$((swept_bytes + sz)); swept_count=$((swept_count + 1)); }
+            fi
+        done
+    done
+    log "  swept $swept_count orphan blob(s), $((swept_bytes / 1024 / 1024)) MB freed"
+    log "[$i/$N_TODO] $TAG: DONE (verified pushed)"
+done
+
+log "Push loop finished. Verified-pushed: $PUSH_OK / $N_TODO"
+log "All done for $OL_TARGET. Tags actually visible on ollama.com:"
+curl -fsSL "https://ollama.com/${OL_TARGET}/tags" 2>/dev/null \
+    | grep -oE "${OL_TARGET}:[A-Za-z0-9_-]+" | sort -u | tee -a "$LOG_DIR/ollama_push_${OL_TARGET//\//_}.log"

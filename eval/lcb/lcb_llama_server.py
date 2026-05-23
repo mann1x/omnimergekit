@@ -149,6 +149,13 @@ def main():
                     help="Max problems (use 999 for full medium ~55q)")
     ap.add_argument("--difficulty", default="medium")
     ap.add_argument("--min-date", default="2024-10-01")
+    ap.add_argument("--task-ids", default="",
+                    help="Comma-separated explicit task_id list (e.g. "
+                         "'lcb/leetcode/3579,lcb/leetcode/3566'). When set, "
+                         "only these problems are loaded (post-filter); "
+                         "--limit caps the final size. Output order matches "
+                         "the list. Used by smoke templates that pin a "
+                         "curated subset rather than 'first N by date'.")
     ap.add_argument("--max-tokens", type=int, default=8192,
                     help="Server max_tokens cap. Was 2048; bumped to 8192 "
                          "after observing pod p90 gen ~2000 tokens hitting "
@@ -190,8 +197,11 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
 
+    tid_list = [t.strip() for t in args.task_ids.split(",") if t.strip()] \
+        if args.task_ids else None
     problems = load_lcb(limit=args.limit, difficulty=args.difficulty,
-                        min_date=args.min_date, testtype="functional")
+                        min_date=args.min_date, testtype="functional",
+                        task_ids=tid_list)
     if not problems:
         print("[lcb] no problems loaded; aborting", file=sys.stderr)
         sys.exit(2)

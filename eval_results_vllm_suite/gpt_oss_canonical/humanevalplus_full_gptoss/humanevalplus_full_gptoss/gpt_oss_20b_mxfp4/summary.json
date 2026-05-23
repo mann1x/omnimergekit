@@ -1,0 +1,52 @@
+{
+  "template": "humanevalplus_full_gptoss",
+  "model": "gpt_oss_20b_mxfp4",
+  "quant": "unknown",
+  "backend": "vllm",
+  "rc": 0,
+  "samples_file": "eval_results/gpt_oss_canonical/humanevalplus_full_gptoss/humanevalplus_full_gptoss/gpt_oss_20b_mxfp4/lm_eval_out/gpt_oss_20b_mxfp4/samples_humaneval_plus_chat_2026-05-17T14-03-18.110632.jsonl",
+  "score": 0.4146341463414634,
+  "scores": {
+    "pass@1,extract_chat": 0.4146341463414634
+  },
+  "token_stats": {
+    "n": 164,
+    "prompt_tokens": {
+      "sum": 0,
+      "p10": 0,
+      "p50": 0,
+      "p90": 0,
+      "max": 0
+    },
+    "completion_tokens": {
+      "sum": 0,
+      "p10": 0,
+      "p50": 0,
+      "p90": 0,
+      "max": 0
+    },
+    "thinking_tokens_est": {
+      "method": "len(reasoning_block) // 4",
+      "sum": 0,
+      "p50": 0,
+      "p90": 0,
+      "max": 0,
+      "kinds": {},
+      "ratio_of_completion": 0.0
+    },
+    "completion_chars": {
+      "p10": 0,
+      "p50": 0,
+      "p90": 930,
+      "max": 1551
+    },
+    "finish_reasons": {
+      "None": 164
+    },
+    "empty_completions": 87
+  },
+  "sanity_warnings": [
+    "too many empty completions: 87",
+    "p10 completion length 0 < 60 chars"
+  ]
+}

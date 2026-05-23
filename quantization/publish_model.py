@@ -38,14 +38,12 @@ Usage:
 Requires: huggingface_hub, llama.cpp (convert_hf_to_gguf.py, llama-quantize, llama-server)
 """
 import argparse
-import json
 import os
-import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 try:
     from huggingface_hub import HfApi
@@ -71,7 +69,7 @@ PHASE2_QUANTS = [
     "IQ4_NL", "IQ4_XS",
     "IQ3_M", "IQ3_XS", "IQ3_XXS",
     "Q2_K_L", "Q2_K",
-    "IQ2_M", "IQ2_S", "IQ2_XS", "IQ2_XXS",
+    "IQ2_M", "IQ2_S", "IQ2_XS",
 ]
 
 # _L/_XL variants: base quant + output/embed at Q8_0
@@ -175,10 +173,10 @@ def compute_imatrix(f16_path: str, cal_data: str, output_dir: str,
         return None
 
     out = os.path.join(output_dir, "imatrix.dat")
-    cmd = [imatrix_bin, "-m", f16_path, "-f", cal_data, "-o", out,
+    cmd = [imatrix_bin, "-m", f16_path, "-", cal_data, "-o", out,
            "-ngl", "99", "--chunks", "128"]
 
-    print(f"  Computing imatrix (this uses GPU)...", flush=True)
+    print("  Computing imatrix (this uses GPU)...", flush=True)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     if result.returncode != 0:
         print(f"  imatrix FAILED: {result.stderr[-300:]}", flush=True)
@@ -207,7 +205,7 @@ def sanity_check(gguf_path: str, server_bin: str) -> bool:
             r = requests.get("http://localhost:8098/health", timeout=2)
             if r.json().get("status") == "ok":
                 break
-        except:
+        except Exception:
             pass
         time.sleep(2)
     else:
@@ -297,7 +295,7 @@ def main():
     run_phase1 = args.phase in (0, 1)
     run_phase2 = args.phase in (0, 2)
 
-    print(f"=== Publish pipeline ===")
+    print("=== Publish pipeline ===")
     print(f"  model      : {args.model_dir}")
     print(f"  hf-repo    : {args.hf_repo}")
     print(f"  hf-gguf    : {args.hf_gguf_repo}")
@@ -333,7 +331,7 @@ def main():
 
         # Step 3: Upload README
         if args.readme and args.readme.exists():
-            print(f"\n  Uploading model card...", flush=True)
+            print("\n  Uploading model card...", flush=True)
             if not args.no_upload:
                 upload_file(api, str(args.readme), args.hf_repo, "README.md",
                             "Add model card")
@@ -343,7 +341,7 @@ def main():
         if f16_path is None or not f16_path.exists():
             f16_path = args.output_dir / f"{args.gguf_prefix}-F16.gguf"
             if not f16_path.exists():
-                print(f"\n  Converting to F16 GGUF...", flush=True)
+                print("\n  Converting to F16 GGUF...", flush=True)
                 result = subprocess.run(
                     [sys.executable, convert_script, str(args.model_dir),
                      "--outfile", str(f16_path), "--outtype", "f16"],
@@ -357,7 +355,7 @@ def main():
                 print(f"  F16 exists: {human_size(str(f16_path))}", flush=True)
 
         # Step 5: Quantize + upload non-imatrix tiers
-        print(f"\n  Quantizing non-imatrix tiers...", flush=True)
+        print("\n  Quantizing non-imatrix tiers...", flush=True)
         results = {}
         for quant in PHASE1_QUANTS:
             if quant in skip_quants:
@@ -443,7 +441,7 @@ def main():
 
         # Step 8: Upload imatrix
         if imatrix and os.path.exists(imatrix) and not args.no_upload:
-            print(f"  Uploading imatrix.dat...", flush=True)
+            print("  Uploading imatrix.dat...", flush=True)
             upload_file(api, imatrix, args.hf_gguf_repo, "imatrix.dat",
                         "Add imatrix.dat for reproducibility")
 
@@ -465,7 +463,7 @@ def main():
             print(f"\n  Deleting F16 ({human_size(str(f16_path))})...", flush=True)
             os.remove(f16_path)
 
-    print(f"\n=== DONE ===", flush=True)
+    print("\n=== DONE ===", flush=True)
 
 
 if __name__ == "__main__":

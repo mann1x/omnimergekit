@@ -1,0 +1,52 @@
+{
+  "template": "gsm8k_100_gptoss",
+  "model": "gpt_oss_20b_mxfp4",
+  "quant": "unknown",
+  "backend": "vllm",
+  "rc": 0,
+  "samples_file": "eval_results/gpt_oss_canonical/gsm8k_100_gptoss/gsm8k_100_gptoss/gpt_oss_20b_mxfp4/lm_eval_out/gpt_oss_20b_mxfp4/samples_gsm8k_2026-05-17T13-25-31.291152.jsonl",
+  "score": 0.88,
+  "scores": {
+    "exact_match,strict-match": 0.05,
+    "exact_match,flexible-extract": 0.88
+  },
+  "token_stats": {
+    "n": 100,
+    "prompt_tokens": {
+      "sum": 0,
+      "p10": 0,
+      "p50": 0,
+      "p90": 0,
+      "max": 0
+    },
+    "completion_tokens": {
+      "sum": 0,
+      "p10": 0,
+      "p50": 0,
+      "p90": 0,
+      "max": 0
+    },
+    "thinking_tokens_est": {
+      "method": "len(reasoning_block) // 4",
+      "sum": 0,
+      "p50": 0,
+      "p90": 0,
+      "max": 0,
+      "kinds": {},
+      "ratio_of_completion": 0.0
+    },
+    "completion_chars": {
+      "p10": 43,
+      "p50": 258,
+      "p90": 540,
+      "max": 884
+    },
+    "finish_reasons": {
+      "None": 100
+    },
+    "empty_completions": 0
+  },
+  "sanity_warnings": [
+    "p10 completion length 43 < 60 chars"
+  ]
+}

@@ -33,22 +33,38 @@
 set -euo pipefail
 
 VLLM_SRC=/srv/dev-disk-by-label-opt/dev/vllm-source
-WHEELS_DIR=/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/wheels/gemma4-moe-stack-v2
-BRANCH=gemma4-moe-stack-v2
+WHEELS_ROOT=/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/wheels
 PY=${PY:-/root/anaconda3/envs/vllm/bin/python}
+
+# Defaults — preserved for backwards compatibility.
+BRANCH="${BRANCH_OVERRIDE:-gemma4-moe-stack-v2}"
+SKIP_FIXE_CHECK=0
 
 DEFAULT_ARCHES=(sm86 sm89 sm90 sm100 sm120)
 MULTI=0
 SELECTED=()
 
-for arg in "$@"; do
-    case "$arg" in
-        --multi) MULTI=1 ;;
-        sm[0-9]*) SELECTED+=("$arg") ;;
-        *) echo "unknown arg: $arg" >&2; exit 1 ;;
+# Parse args. Accepts:
+#   sm86 sm89 ...         (positional arch tokens)
+#   --multi               (one fat wheel)
+#   --branch <ref>        (override branch/tag/sha; e.g. v0.20.2)
+#   --skip-fix-e-check    (don't require Fix-E patch in source — for bisection)
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --multi) MULTI=1; shift ;;
+        --branch) BRANCH="$2"; shift 2 ;;
+        --branch=*) BRANCH="${1#*=}"; shift ;;
+        --skip-fix-e-check) SKIP_FIXE_CHECK=1; shift ;;
+        sm[0-9]*) SELECTED+=("$1"); shift ;;
+        *) echo "unknown arg: $1" >&2; exit 1 ;;
     esac
 done
 [[ ${#SELECTED[@]} -eq 0 ]] && SELECTED=("${DEFAULT_ARCHES[@]}")
+
+# Per-branch wheels dir — keep stack@2 wheels isolated from experimental builds.
+# Sanitize ref for use as a directory name (e.g. v0.20.2 → v0.20.2).
+BRANCH_SLUG=$(echo "$BRANCH" | tr '/' '_')
+WHEELS_DIR="$WHEELS_ROOT/$BRANCH_SLUG"
 
 arch_to_dot() {
     local s="${1#sm}"
@@ -101,6 +117,10 @@ if ! command -v ccache >/dev/null 2>&1; then
     echo "ERROR: ccache not found on PATH" >&2
     exit 4
 fi
+# ccache stays shared across branches — most of vllm's C++ is branch-invariant,
+# so the v0.20.2 build can recycle objects compiled for stack@2. Pinning the
+# path to gemma4-moe-stack-v2 is intentional (it's where the original sm86 build
+# already populated the cache; a fresh empty cache would cost 30–60 min more).
 export CCACHE_DIR=/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/wheels/gemma4-moe-stack-v2/ccache
 mkdir -p "$CCACHE_DIR"
 # Hash by content not mtime — conda envs touch binaries during install
@@ -143,12 +163,18 @@ if [[ -d "$DEPS/flashmla-src" ]]; then
     log "FetchContent local-source: FLASH_MLA / DEEPGEMM / QUTLASS / TRITON_KERNELS / VLLM_FLASH_ATTN → $DEPS/*-src"
 fi
 
-# Sanity check: Fix-E patch is present
-if ! grep -q "Fix E (parser hardening" vllm/reasoning/gemma4_reasoning_parser.py; then
-    echo "ERROR: Fix-E patch not detected in $BRANCH — abort" >&2
-    exit 2
+# Sanity check: Fix-E patch is present (skip with --skip-fix-e-check for
+# branches that predate Fix-E, e.g. v0.20.2 used as a bisection baseline).
+if [[ "$SKIP_FIXE_CHECK" -eq 0 ]]; then
+    if ! grep -q "Fix E (parser hardening" vllm/reasoning/gemma4_reasoning_parser.py 2>/dev/null; then
+        echo "ERROR: Fix-E patch not detected in $BRANCH — abort" >&2
+        echo "       (pass --skip-fix-e-check to build a pre-Fix-E baseline)" >&2
+        exit 2
+    fi
+    log "Fix-E parser patch verified present"
+else
+    log "--skip-fix-e-check active; Fix-E presence NOT verified for $BRANCH"
 fi
-log "Fix-E parser patch verified present"
 
 build_one_arch() {
     local arch=$1
@@ -228,12 +254,14 @@ fi
 # Write manifest
 MANIFEST="$WHEELS_DIR/MANIFEST.txt"
 {
-    echo "# gemma4-moe-stack@2 wheel manifest"
+    echo "# vllm wheel manifest"
     echo "# generated: $(date -Iseconds)"
     echo "# vllm-source HEAD: $SHA  (branch $BRANCH)"
-    echo "# fix-E parser cherry-pick: 3d92852eb (originally a39e23ed0)"
-    echo "# base: vllm main HEAD with #42250 closure fix, #43223 NvFP4 MoE,"
-    echo "#       #38939 routed-experts API, #42664 reasoning normalize"
+    if [[ "$SKIP_FIXE_CHECK" -eq 0 ]]; then
+        echo "# fix-E parser cherry-pick: present"
+    else
+        echo "# fix-E parser cherry-pick: SKIPPED (--skip-fix-e-check)"
+    fi
     echo ""
     echo "# arch  size      wheel"
     ls -la "$WHEELS_DIR"/*.whl 2>/dev/null | awk '{print $5"\t"$NF}'

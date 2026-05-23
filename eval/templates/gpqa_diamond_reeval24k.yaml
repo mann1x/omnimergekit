@@ -11,10 +11,10 @@ selection:
 generation:
   max_gen_toks: 49152       # re-eval: bumped from 16384 to fit thinking@24k + answer headroom
   thinking_token_budget: 24576    # re-eval: bumped from 12288 for fair retry of length-capped problems
-  temperature: 0.6                # canonical GPQA sampler
-  top_p: 0.95
-  top_k: 20
-  do_sample: true
+  temperature: 0.0                # 2026-05-17: reverted to greedy (canonical Gemma 4 sampler — see EVAL_PROTOCOL §1.0)
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
 scoring:
   metric: exact_match
   filter: flexible-extract

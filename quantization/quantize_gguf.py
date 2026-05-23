@@ -30,21 +30,23 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 from queue import Queue
 from threading import Thread, Event
-from typing import Optional
 
 # ── Quant definitions ────────────────────────────────────────
 
-# Bartowski standard quants (ordered large → small)
+# Bartowski standard quants in the DEFAULT sweep (ordered large → small).
+# Q2_K is intentionally excluded from the default — empirically it collapses
+# catastrophically on the Gemma 4 MoE prunes (v5-coder HE+ 6.10%, Q2_K_L at
+# 7.99 GB scoring similar). IQ2_XXS is also opt-in only: at 2.06 bpw it
+# triggers a high rumination rate on code generation that makes HE+ eval
+# economically wasteful (T66 on v5-coder, 2026-05-19). Users who explicitly
+# want either can request via `--only Q2_K,IQ2_XXS`.
 BARTOWSKI_QUANTS = [
     "Q8_0",
     "Q6_K_L", "Q6_K",
@@ -52,18 +54,26 @@ BARTOWSKI_QUANTS = [
     "Q4_K_L", "Q4_K_M", "Q4_1", "Q4_K_S", "Q4_0",
     "IQ4_NL", "IQ4_XS",
     "Q3_K_XL", "IQ3_M", "Q3_K_L", "Q3_K_M", "Q3_K_S", "IQ3_XS", "IQ3_XXS",
-    "Q2_K_L", "Q2_K",
-    "IQ2_M", "IQ2_S", "IQ2_XS", "IQ2_XXS",
+    "Q2_K_L",
+    "IQ2_M", "IQ2_S", "IQ2_XS",
 ]
 
-# ContribDynamic (CD) quants: per-layer dynamic quantization based on expert
-# contribution analysis. Important layers get higher precision, less important
-# layers get lower precision. Uses --tensor-type-file with llama-quantize.
+# ContribDynamic (CD) quants in the DEFAULT sweep: per-layer dynamic
+# quantization based on expert contribution analysis. CD-Q2_K is opt-in for
+# the same reason as plain Q2_K — too low-bit to survive on Gemma 4 MoE
+# prunes (v5-coder CD-Q2_K HE+ 4.27%).
 CD_QUANTS = [
-    "CD-Q6_K", "CD-Q5_K_M", "CD-Q4_K_M", "CD-Q3_K_M", "CD-Q2_K",
+    "CD-Q6_K", "CD-Q5_K_M", "CD-Q4_K_M", "CD-Q3_K_L",
 ]
 
-ALL_QUANTS = BARTOWSKI_QUANTS + CD_QUANTS
+# Opt-in only: known-bad on Gemma 4 MoE prunes, kept buildable for
+# reproducibility of older studies and for dense-model testing.
+OPT_IN_QUANTS = [
+    "Q2_K", "CD-Q2_K", "IQ2_XXS",
+]
+
+DEFAULT_QUANTS = BARTOWSKI_QUANTS + CD_QUANTS
+ALL_QUANTS = DEFAULT_QUANTS + OPT_IN_QUANTS
 
 # Quants that require imatrix for good results
 IMATRIX_QUANTS = {q for q in ALL_QUANTS if q.startswith("IQ") or q.startswith("UD-IQ")}
@@ -434,24 +444,8 @@ def create_hf_repo(repo_id: str, original_repo: str, model_name: str,
     api = HfApi()
     create_repo(repo_id, repo_type="model", exist_ok=True)
 
-    # Fetch original README
-    original_readme = ""
-    try:
-        from huggingface_hub import hf_hub_download
-        readme_path = hf_hub_download(original_repo, "README.md")
-        original_readme = Path(readme_path).read_text()
-    except Exception:
-        pass
-
-    # Strip original frontmatter
-    original_body = original_readme
-    if original_readme.startswith("---"):
-        end = original_readme.find("---", 3)
-        if end > 0:
-            original_body = original_readme[end + 3:].strip()
-
     # Build GGUF README
-    readme = f"""---
+    readme = """---
 base_model: {original_repo}
 tags:
   - gguf
@@ -474,7 +468,7 @@ All quants made using imatrix with [calibration data v5](https://gist.github.com
     for q in quant_list:
         readme += f"| {q} | pending |\n"
 
-    readme += f"""
+    readme += """
 ## How to Use
 
 With [llama.cpp](https://github.com/ggml-org/llama.cpp):
@@ -629,7 +623,7 @@ def main():
         if token_path.exists():
             os.environ["HF_TOKEN"] = token_path.read_text().strip()
 
-    print(f"=== GGUF Quantization Pipeline ===", flush=True)
+    print("=== GGUF Quantization Pipeline ===", flush=True)
     print(f"Model: {args.model}", flush=True)
 
     # Pod mode: install deps
@@ -654,7 +648,7 @@ def main():
 
     if base_gguf.exists():
         print(f"Base GGUF exists: {base_gguf} ({base_gguf.stat().st_size / 1024**3:.1f} GB)", flush=True)
-        print(f"Skipping model download.", flush=True)
+        print("Skipping model download.", flush=True)
         model_path = None
         repo_id = args.model
     else:
@@ -667,7 +661,7 @@ def main():
     elif Path(args.model).exists() and Path(args.model).is_dir():
         # Local path: must provide explicit --base-model-id
         print(f"ERROR: --model is a local path ({args.model}). "
-              f"Pass --base-model-id <hf_repo_id> for README generation.", flush=True)
+              "Pass --base-model-id <hf_repo_id> for README generation.", flush=True)
         sys.exit(1)
     else:
         base_model_id = repo_id
@@ -757,11 +751,11 @@ def main():
                     break
 
         if cal_data and cal_data.exists():
-            print(f"\n=== Computing imatrix ===", flush=True)
+            print("\n=== Computing imatrix ===", flush=True)
             print(f"  Calibration data: {cal_data} ({cal_data.stat().st_size / 1024:.0f} KB)", flush=True)
             imatrix_file = compute_imatrix(tools, base_gguf, cal_data, output_dir, ngl=args.ngl)
         else:
-            print(f"  WARNING: No calibration data found, skipping imatrix", flush=True)
+            print("  WARNING: No calibration data found, skipping imatrix", flush=True)
 
     # ── Step 3: Quantize + Upload ────────────────────────────
     print(f"\n=== Quantizing ({len(quants)} variants) ===", flush=True)
@@ -801,7 +795,7 @@ def main():
                 path_in_repo="imatrix.dat",
                 repo_id=hf_repo,
                 repo_type="model",
-                commit_message=f"Add imatrix.dat used to quantize (for reproducibility/audit)",
+                commit_message="Add imatrix.dat used to quantize (for reproducibility/audit)",
             )
             print(f"  imatrix.dat uploaded to {hf_repo}", flush=True)
         except Exception as e:
@@ -840,7 +834,7 @@ def main():
 
     # Wait for uploads to finish
     if upload_thread:
-        print(f"\n=== Waiting for uploads to complete ===", flush=True)
+        print("\n=== Waiting for uploads to complete ===", flush=True)
         upload_queue.join()
         stop_upload.set()
         upload_thread.join(timeout=10)

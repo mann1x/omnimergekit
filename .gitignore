@@ -61,3 +61,6 @@ runs/
 # imatrix.dat ARCHIVAL EXCEPTION:
 # imatrix files MUST be kept WITH their quants when published, but we don't
 # want them in this repo (which holds code, not artifacts).
+
+# generated code-graph output (regenerable)
+graphify-out/

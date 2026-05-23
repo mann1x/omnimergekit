@@ -18,7 +18,8 @@ LCB_INSTRUCT_TEMPLATE = (
 
 def load_lcb(limit: int, difficulty: str = "medium",
              min_date: str = "2024-10-01",
-             testtype: str = "functional") -> list[dict]:
+             testtype: str = "functional",
+             task_ids: list[str] | None = None) -> list[dict]:
     """Load LiveCodeBench problems filtered to function_call style.
 
     Returns a list of normalized problem dicts:
@@ -88,8 +89,11 @@ def load_lcb(limit: int, difficulty: str = "medium",
                 m = re.search(r"def\s+(\w+)\s*\(\s*self", starter)
                 if not m:
                     continue
+                tid = f"lcb/{row.get('platform','?')}/{row.get('question_id','?')}"
+                if task_ids is not None and tid not in task_ids:
+                    continue
                 out.append({
-                    "task_id": f"lcb/{row.get('platform','?')}/{row.get('question_id','?')}",
+                    "task_id": tid,
                     "question_content": row.get("question_content", ""),
                     "starter_code": starter,
                     "method_name": m.group(1),
@@ -101,8 +105,12 @@ def load_lcb(limit: int, difficulty: str = "medium",
                     break
         if len(out) >= limit:
             break
+    if task_ids is not None:
+        order = {t: i for i, t in enumerate(task_ids)}
+        out.sort(key=lambda r: order.get(r["task_id"], 1_000_000))
     print(f"[lcb] loaded {len(out)} problems "
-          f"(difficulty={difficulty}, post {min_date}, functional)")
+          f"(difficulty={difficulty}, post {min_date}, functional"
+          f"{', task_ids=' + str(len(task_ids)) if task_ids else ''})")
     return out
 
 def clean_lcb_completion(completion: str, starter_code: str) -> str:

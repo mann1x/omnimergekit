@@ -1,0 +1,49 @@
+# IFEval 10-question probe subset — for the v5 α-sweep (T35) and any future
+# α / free-knob probe that needs a fast discriminating signal.
+#
+# Picks: 8 v4-pass + 2 v4-fail from ifeval_100, across 8 instruction families,
+# biased toward CLEAN-SHORT v4 baseline responses (avoids ifeval_100 outliers
+# that rumination would dominate). The 2 fails are kept because they're the
+# canonical v4 cliff edges — if α changes flip them to pass, that's a hit;
+# if α drives the 8 passes into fails, that's the v5 rumination cliff.
+#
+# Selection rationale + per-doc breakdown: scripts/ifeval_10probe_indices.json
+# Origin: T35 v5 IFEval α-sweep, 2026-05-18.
+#
+# Frozen indices in the 541-row google/IFEval test split (NOT into the 100-subset):
+#   [20, 80, 85, 105, 160, 165, 225, 300, 375, 455]
+#
+# Runtime: ~6-10 min per α at thinking_budget=12288 on solidpc 3090
+# (vs ~60-90 min for ifeval_100). Lets one α-sweep finish in <1h.
+name: ifeval_10probe
+backend: lm-eval
+task: ifeval
+n: 10
+selection:
+  type: indices
+  indices: [20, 80, 85, 105, 160, 165, 225, 300, 375, 455]
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: prompt_level_strict_acc
+  filter: none
+  validated_against: google/ifeval
+  validation_date: "2026-05-18"
+sanity:
+  min_p10_chars: 5
+backend_args:
+  apply_chat_template: true
+  num_fewshot: 0
+  batch_size: 1
+  num_concurrent: 2
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: ifeval_10probe
+reports:
+  token_stats: true

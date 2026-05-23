@@ -399,7 +399,7 @@ def _checkpoint_load(ckpt_path: Path, num_layers: int, num_experts: int,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--variant", choices=["code", "science", "math"], required=True)
+    ap.add_argument("--variant", choices=["code", "science", "math", "logic"], required=True)
     ap.add_argument("--tier-b-json", required=True,
                     help="Output of extract_pass_traces.py")
     ap.add_argument("--out", required=True)

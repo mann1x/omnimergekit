@@ -7,15 +7,21 @@ set -euo pipefail
 cd /srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models
 
 CANDIDATES=(
-    "C1_max_codetb"
+    "C5_v4floor95_breadth50"
 )
-# Rebalanced 2026-05-17 (smoke for T18 qualification, not full validation):
-# - gsm8k_30 — math sanity, confirms math hasn't collapsed
-# - humaneval_30 — stride from HE-164, v4/128e anchors precomputed at 29/30
-# - lcb_medium_15 — first 15 by date, v4 anchor 12/15, 128e 13/15
-# Total wall ~1h30m-2h. Anchor scores extracted from existing v4 + 128e
-# samples files; no fresh baseline runs needed.
-TEMPLATES=("gsm8k_30" "humaneval_30" "lcb_medium_15")
+# Rebuilt 2026-05-17 (smoke for T21 qualification, not full validation):
+# - gsm8k_30 — math sanity, confirms math hasn't collapsed. v4 anchor 23/30
+#   strict / 24/30 flex (existing samples).
+# - humanevalplus_30 — 30 curated HE+ problems (humaneval_plus_chat).
+#   Composition: 5 v4-fails (128e PASS) + 25 lowest-128e-chars v4-passes.
+#   v4 anchor 25/30, 128e 30/30. ≥25/30 ties v4; >25/30 strict beat.
+# - lcb_medium_15 — 15 curated LCB-medium problems (explicit task_ids).
+#   Composition: 6 v4-fails (low 128e_chars) + 9 v4-passes (low 128e_chars).
+#   v4 anchor 9/15, 128e 15/15. ≥9/15 ties v4; >9/15 strict beat.
+# All subsets are 128e-PASS + low-128e-rumination filtered so candidate FAILs
+# reflect pruning damage, not universally-hard problems.
+# Total wall ~1h30m-2h.
+TEMPLATES=("gsm8k_30" "humanevalplus_30" "lcb_medium_15")
 
 SRC_HF="google/gemma-4-26B-A4B-it"
 RESULTS="eval_results_vllm_suite/v5fixed_t18_longer_smoke/v5coder"
@@ -82,9 +88,9 @@ else:
 "
 }
 parse_lcb() {
-    local TAG=$1
+    local TAG=$1 TPL=$2
     local SERVED="98e_v5coder_${TAG}_nvfp4a16"
-    local R=$(ls -t "$RESULTS/$TAG/lcb_medium_5/lcb_medium_5/$SERVED"/lcb_result*.json 2>/dev/null | head -1 || true)
+    local R=$(ls -t "$RESULTS/$TAG/$TPL/$TPL/$SERVED"/lcb_result*.json 2>/dev/null | head -1 || true)
     [ -z "$R" ] && { echo "?"; return; }
     /root/anaconda3/envs/omnimergekit/bin/python -c "
 import json
@@ -95,13 +101,17 @@ print(r.get('pass_at_1', r.get('pass@1', '?')))
 
 echo
 echo "===== v5-coder longer-smoke summary ====="
-printf "%-22s | %8s | %8s | %8s | %8s\n" "candidate" "gsm_str" "gsm_flx" "HE-20" "LCB-5"
+echo "v4 anchors: gsm_30 26/30 (0.867)  HE+/30 25/30 (0.833)  LCB-15 9/15 (0.600)"
+echo "match-or-beat-v4 bar: gsm ≥0.867, HE+ ≥0.833, LCB ≥0.600"
+echo "(C1 already gsm 18/30 = 0.600 — expected math drop from code-only weighting;"
+echo " the decision criterion is HE+/30 + LCB-15)"
+printf "%-22s | %8s | %8s | %8s | %8s\n" "candidate" "gsm_str" "gsm_flx" "HE+30" "LCB-15"
 printf "%-22s-+-%8s-+-%8s-+-%8s-+-%8s\n" "----------------------" "--------" "--------" "--------" "--------"
 for TAG in "${CANDIDATES[@]}"; do
-    GS=$(parse_lm_eval "$TAG" "gsm8k_v128pass" "exact_match")
-    GF=$(parse_lm_eval "$TAG" "gsm8k_v128pass" "exact_match")
-    HE=$(parse_lm_eval "$TAG" "humaneval_20" "pass@1")
-    LC=$(parse_lcb "$TAG")
+    GS=$(parse_lm_eval "$TAG" "gsm8k_30" "exact_match")
+    GF=$(parse_lm_eval "$TAG" "gsm8k_30" "exact_match")
+    HE=$(parse_lm_eval "$TAG" "humanevalplus_30" "pass@1")
+    LC=$(parse_lcb "$TAG" "lcb_medium_15")
     printf "%-22s | %8s | %8s | %8s | %8s\n" "$TAG" "$GS" "$GF" "$HE" "$LC"
 done | tee "$LOGS/_summary.tsv"
 echo; echo "logs:    $LOGS/"

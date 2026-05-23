@@ -1,0 +1,1442 @@
+# Pre-compact wrap-up (2026-05-21 11:42 UTC)
+
+_Auto-synthesised by the claude-hooks PreCompact hook before context auto-compaction. Mechanically-extractable sections are filled in; sections needing model judgment are marked. To complete the missing parts, invoke `/wrapup` in the next session._
+
+## 1. Session snapshot
+
+- Working directory: `/srv/dev-disk-by-label-opt/dev/omnimergekit`
+- Session id: `4208dc59-08bc-4b1e-8d4e-8ec3407fd4ac`
+- Repo: branch `main`, HEAD `a1a3eb7`
+- Narrative: _needs model — invoke `/wrapup` to fill in_
+
+## User decisions captured this session
+
+_Verbatim AskUserQuestion exchanges from this session, in order. Preserved here because the May-2026 #214 regression matrix lost Q2/Q3 across a compaction boundary — these decisions are load-bearing for resumed work and the summarizer can't reconstruct them from prose alone._
+
+- **Q:** How should I run LiveCodeBench medium for the Gemma 4 evals?
+  **A:** Use official LiveCodeBench runner separately
+- **Q:** How should I handle the v3a MBPP <think>-leak issue (and the same for v3b MBPP/HumanEval)?
+  **A:** we tested it with v2, so use the same
+- **Q:** Given the v2-methodology mismatch on Qwen3.6 base, how to proceed?
+  **A:** Switch to /v1/chat/completions + --apply_chat_template + budget 8192
+- **Q:** Given v3a is a confirmed cross-base merge defect, how do you want to proceed?
+  **A:** Quick v3b isolation test (10 samples) before any other action
+- **Q:** Cross-base merge is confirmed defective (v3a: 14.2% / v3b: 20% / clean base: 40% on MBPP-10). What now?
+  **A:** Retry with same-base merges only (Qwen3.6 finetunes if available)
+- **Q:** Slot 3 source for the same-base v4 merge (no Gemini-3.1 fine-tune for Qwen3.6 yet)?
+  **A:** kai-os/Qwen3.6-27b-Opus4.6-reasoning (LoRA → base, redo merge)
+- **Q:** How to fix the merger's think-amplification on Qwen3.6 base?
+  **A:** Investigate before fixing — dump a head-to-head delta-magnitude inspection
+- **Q:** Diagnosis: v4 think-leak comes from 1-2% rel-L2 perturbations in mlp.gate_proj layers 27-52 (lm_head/embed are byte-identical to base). Cross-base wasn't the...
+  **A:** MLP-passthrough surgery + isolation
+- **Q:** MLP-passthrough fixes the leak (0% unclosed think, 50% mbpp-10 pass@1, beats clean base's 40%). Attn + linear_attn merging is benign/beneficial; MLP merging ...
+  **A:** I'm lost. what is the diff between v4-mlp-passthrough and this v5-mlp-skip?
+- **Q:** Path forward on Task #55 publish decision?
+  **A:** Run GPQA on v4-MLP (Recommended)
+- **Q:** GPQA pacing — pick one?
+  **A:** Restart with parallel slots (Recommended)
+- **Q:** Which stale dirs should I clean up to free disk for the v4 quantize pipeline?
+  **A:** merged/Qwen3.6-27B-Omnimerge-v4 (52 GB) — the broken pre-passthrough merge, gguf_v4 (21 GB) — broken pre-passthrough GGUFs, All three above (~94 GB free), gguf_v4_mlp (21 GB) — Q6_K used for evals ...
+- **Q:** Also delete /workspace/gguf and /workspace/baseline_gguf (43 GB total, unclear ownership)?
+  **A:** Investigate first (ls + sample contents) before deciding
+- **Q:** How should we phase the 3-way merge experiment given the lxt qwen3_5 gap?
+  **A:** Phase 1 first: DARE-TIES + Omnimerge_v2+Fisher today, then patch lxt + ex-LRP after (Recommended)
+- **Q:** What eval suite for each merged 4B?
+  **A:** HumanEval + MBPP (Q6_K, parallel-2) (Recommended)
+- **Q:** Should I start the ex-LRP path now in parallel with the running Fisher/M3 work?
+  **A:** wait, ex-lrp was needing the GPU as well! why now it doesn't?
+- **Q:** Which comparison design do you want?
+  **A:** Why Omnimerge_v2? Omnimerge-v2 is based on qwen3.5 26b! we are comparing the qwen3.5 4b merge with dare-ties, what we just did, against our recipe (the one we use with omnimerge-v2 and v4) + fisher...
+- **Q:** Which other 27B v4 leftovers should I purge? (all re-downloadable, none needed for current 4B experiment)
+  **A:** v4-mlp BF16 (52 GB), Qwen3.6-27B base BF16 (52 GB), Bartowski Q6_K (22 GB)
+- **Q:** How should I file the ex-LRP patches? (visible action — notifies maintainers)
+  **A:** 2 bundled PRs (1 mergekit + 1 lxt) (Recommended)
+- **Q:** Gemma4 128e HumanEval is INVALID due to markdown fences. What do you want next?
+  **A:** Rescore samples by stripping fences (fast, no GPU) (Recommended)
+- **Q:** Destroy the pod?
+  **A:** Keep pod up for HE rerun
+- **Q:** HF transformers + bnb NF4 path is blocked by 5 stacked dep conflicts on this pod's torch-2.4 image. Which path to take?
+  **A:** Upgrade torch to 2.5.1 + retry NF4
+- **Q:** HF transformers + bnb path is blocked at every turn (5+ distinct OOM/dispatch errors over 2.5 h). Cached files are 36-46 GB mixed-precision and don't fit in ...
+  **A:** Free disk + retry: re-cache with manual layer-by-layer NF4
+- **Q:** Ran out of viable HF transformers paths for Gemma 4 MoE (forward fails on packed-NF4 expert blocks; transformers' grouped_mm_fallback can't dequantize them)....
+  **A:** Try vLLM with GGUF on the pod
+- **Q:** vLLM rejects gemma4 GGUF. How to proceed?
+  **A:** vLLM + BF16 + TP=2 (sequential)
+- **Q:** All MoE-compatible 24 GB inference paths exhausted. How to proceed?
+  **A:** A 48GB pod will not fit BF16. Download all scripts from this pod, destroy it. Look for a 3x24GB 3090 pod. It will fit BF16 with vLLM. We can redoenload there from HF the 128e and 98e quants and the...
+- **Q:** Confirm provisioning of this 3x RTX 3090 pod?
+  **A:** Yes — provision offer 35510780
+- **Q:** 5 failed inference paths on this 3x 3090 pod. What now?
+  **A:** Try llmcompressor on pod to make matching FP8 quants
+- **Q:** 7 different paths failed. Final call?
+  **A:** yes, download what is useful from the pod and destroy it. tell me what is the price delta between 4x3090 and 1xH100
+- **Q:** M4 source models 404 — repo names changed?
+  **A:** No these repos existed yesterday and it's unlikely they did change! This is the hallucination issues I was seeing yesterday with xhigh. Damn I should have cheked it. We need the same sources, find ...
+- _… and 148 earlier pair(s) omitted — see transcript for the full series._
+
+## 2. Session achievements
+
+Recent commits (most recent first, capped at 15):
+
+- `a1a3eb7 eval: stack@v2 — vLLM main HEAD (+#42250) + Fix-E parser cherry-pick`
+- `074b5b8 eval: EVAL_PROTOCOL v3 — stack.lock + structural canary + anchor bench`
+- `8d741ad fix(quantize_gguf): hard-gate on imatrix requirements pre-Step-1`
+- `5640f11 fix(quantize_gguf): use absolute path in Modelfile FROM`
+- `e8c44cf eval+v5_moe_sweep: smoke-sized HE-30 + LCB-15 templates for T18 qualification`
+- `bb747be docs: T19.5 longer-smoke results + v4 baseline anchor + T21 motivation`
+- `535dbb6 v5_moe_sweep: v5-coder C1_max_codetb — build + longer-smoke scripts`
+- `fb3607c v5_moe_sweep: v4 baseline longer-smoke + final T19.5 results`
+- `a3f658d deps: bump requests to >=2.33.0 (CVE-2026-25645)`
+- `c15fe51 eval+v5_moe_sweep: longer-smoke templates + T18 candidate orchestrator`
+- `5239093 eval+pod: preserve in-flight eval infra, chat-shadow tasks, 31B pod chain`
+- `a77cf38 docs: T19 v5fixed sweep results + T18 router recovery framework + HE filter fix`
+- `79de2f4 eval: add omk_eval canonical entry point + per-bench templates`
+- `366ffe1 canary: prepend BOS to Gemma 4 prompts (was the false-fail trigger)`
+- `4358bdb mlx-lm offload trap: monkey-patch detector + preflight purge`
+
+Files modified this session (762):
+
+- `/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/google/gemma-4-31B-it/surgery.py`
+- `/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/google/gemma-4-31B-it/eval.sh`
+- `/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/google/gemma-4-31B-it/readme.txt`
+- `/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/google/gemma-4-31B-it/finetune.sh`
+- `/shared/dev/lightseek/scripts/train_cluster.py`
+- `/shared/dev/lightseek/src/lightseek/data/hf_loader.py`
+- `/shared/dev/lightseek/src/lightseek/training/local_sgd.py`
+- `/root/.claude/projects/-srv-dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5-backup-models/memory/project_gemma4_surgery.md`
+- `/root/.claude/projects/-srv-dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5-backup-models/memory/user_mannix.md`
+- `/root/.claude/projects/-srv-dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5-backup-models/memory/reference_tools_locations.md`
+- `/root/.claude/projects/-srv-dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5-backup-models/memory/MEMORY.md`
+- `/root/.claude/projects/-srv-dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5-backup-models/memory/feedback_history_truncation.md`
+- `/shared/dev/lightseek/src/lightseek/models/lora.py`
+- `/root/.claude/projects/-srv-dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5-backup-models/memory/feedback_lightseek_venv.md`
+- `/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/google/gemma-4-31B-it/eval_gpqa.sh`
+- `/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/google/gemma-4-26B-A4B-it/expert_prune.py`
+- `/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/google/gemma-4-31B-it/accuracy_loo.py`
+- `/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/google/eval_gguf.sh`
+- `/root/.claude/settings.json`
+- `/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/google/eval_gpqa_llamacpp.py`
+- `/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/google/eval_gpqa_chat.py`
+- `/root/.claude/projects/-srv-dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5-backup-models/memory/feedback_llama_cpp_gemma4.md`
+- `/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/google/eval_quick_compare.py`
+- `/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/google/eval_quick_3way.sh`
+- `/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/google/eval_quick_96e_128e.sh`
+- `/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/google/gemma-4-26B-A4B-it/expert_topics.py`
+- `/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/google/gemma-4-26B-A4B-it/expert_contribution.py`
+- `/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/google/gemma-4-26B-A4B-it/expert_contribution_ray.py`
+- `/root/.claude/projects/-srv-dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5-backup-models/memory/reference_pandorum_wsl.md`
+- `/root/.claude/projects/-srv-dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5-backup-models/memory/feedback_dont_waste_time.md`
+- … and 732 more
+
+## 3. Open items
+
+_needs model — invoke `/wrapup` to fill in._
+
+## 4. Next items
+
+_needs model — invoke `/wrapup` to fill in._
+
+## 5. Plans referenced
+
+- [docs/PLAN-test-coverage.md](docs/PLAN-test-coverage.md)
+
+## 6. Active monitorings to re-establish
+
+- Bash (background): Download Gemma 4 31B weights from HuggingFace
+- Bash (background): Run combined pipeline (retry)
+- Bash (background): QLoRA fine-tune pruned model (quick preset)
+- Bash (background): QLoRA fine-tune (quick, fixed args)
+- Bash (background): QLoRA fine-tune pruned model (quick)
+- Bash (background): QLoRA fine-tune (unsloth env)
+- Bash (background): QLoRA fine-tune (vocab_size fix)
+- Bash (background): QLoRA fine-tune (data prepared)
+- Bash (background): QLoRA fine-tune (mm_token_type_ids fix)
+- Bash (background): source /root/anaconda3/etc/profile.d/conda.sh && conda activate unsloth && pip i
+- Bash (background): source /root/anaconda3/etc/profile.d/conda.sh && conda activate unsloth && TMPDI
+- Bash (background): QLoRA retrain (FA2 + no vision LoRA)
+- Bash (background): QLoRA retrain (.venv + FA2 2.8.3)
+- Bash (background): Resume training 250 more steps
+- Bash (background): Resume training 250 more steps (fixed)
+- Bash (background): Install lm-eval + copy model to pandorum
+- Bash (background): source /shared/dev/lightseek/.venv/bin/activate && python3 << 'PYEOF'
+import tor
+- Bash (background): Merge bf16 from 500-step checkpoint
+- Bash (background): LaCo surgery on Gemma 4 31B
+- Bash (background): LaCo surgery (shape fix)
+- Bash (background): LaCo surgery (same-type merge only)
+- Bash (background): SLEB analysis (dry run)
+- Bash (background): SLEB analysis (OOM fix)
+- Bash (background): sleep 600 && ssh -i /root/.ssh/id_ed25519 -p 2222 claude_test@192.168.178.157 't
+- Bash (background): Fine-tune LaCo model (500 steps)
+- Bash (background): Fine-tune LaCo model (restart)
+- Bash (background): SLEB surgery (manual, CPU)
+- Bash (background): Download Gemma 4 26B-A4B MoE model
+- Bash (background): Fine-tune SLEB model (500 steps)
+- Bash (background): sleep 600 && grep "DiLoCo round" /tmp/claude-0/-srv-dev-disk-by-uuid-f8b1803e-33
+- Bash (background): Full PPL LOO on all 60 layers
+- Bash (background): Profile expert activations on 26B-A4B
+- Bash (background): Profile experts (CPU offload)
+- Bash (background): Profile experts (bnb patch)
+- Bash (background): GPQA on LaCo finetuned
+- Bash (background): Full expert profiling (all GPQA + MMLU)
+- Bash (background): Expert merge: 96e + 64e models
+- Bash (background): GPQA on 64-expert merged model
+- Bash (background): GPQA on 64-expert (retry)
+- Bash (background): GPQA on 64-expert (fixed)
+- Bash (background): GPQA 64-expert (single GPU)
+- Bash (background): GPQA 64-expert (offload+patch)
+- Bash (background): GPQA 64-expert (bf16 fallback)
+- Bash (background): GPQA 64-expert (no warmup)
+- Bash (background): GPQA 64e (4bit + no warmup)
+- Bash (background): GPQA 64e (clean GPU)
+- Bash (background): GPQA 64e (all patches)
+- Bash (background): GPQA 64e direct (no offload)
+- Bash (background): GPQA 64e (profile-style loading)
+- Bash (background): GPQA 64e (profiling-style load)
+- Bash (background): GPQA 64e bf16 no bnb
+- Bash (background): Convert 64e to GGUF
+- Bash (background): Convert 64e to GGUF (venv)
+- Bash (background): Quantize 64e to Q4_K_M
+- Bash (background): Convert original 26B-A4B to GGUF
+- Bash (background): GPQA 64e via GGUF loading
+- Bash (background): GPQA 64e GGUF (with gguf pkg)
+- Bash (background): GPQA 64e via llama.cpp server
+- Bash (background): GPQA via llama.cpp server
+- Bash (background): GPQA via server (tenacity installed)
+- Bash (background): GPQA via server (fixed model ID)
+- Bash (background): GPQA 64e GGUF (version patched)
+- Bash (background): Full GPQA 64e (198 questions)
+- Bash (background): GPQA reference 128e full model
+- Bash (background): GPQA 64e chat+thinking (198q)
+- Bash (background): GPQA 64e chat 8192ctx
+- Bash (background): GPQA 128e reference via lm-eval chat
+- Bash (background): pkill -f llama-server 2>/dev/null; source /shared/dev/lightseek/.venv/bin/activa
+- Bash (background): source /root/anaconda3/etc/profile.d/conda.sh && conda activate vllm && pip inst
+- Bash (background): GPQA 64e via vLLM
+- Bash (background): GPQA 64e vLLM (with ray)
+- Bash (background): GPQA 64e vLLM (transformers 5.5)
+- Bash (background): GPQA 64e vLLM (hf_hub fixed)
+- Bash (background): AWQ quantize 26B-A4B
+- Bash (background): GPQA 64e CPU bf16 (5q test)
+- Bash (background): sleep 600 && tail -15 /tmp/claude-0/-srv-dev-disk-by-uuid-f8b1803e-334f-4f4b-af3
+- CronCreate */20 * * * *: Check 128e GPQA eval progress: run `grep "Requesting API" /tmp/gpqa_v3.log | tai
+- CronCreate */20 * * * *: Check pod quantization progress: run `ssh -o StrictHostKeyChecking=no -i ~/.ssh/
+- Bash (background): Run Wanda expert compression on CPU
+- Bash (background): Run Wanda compression with lightseek venv
+- Bash (background): Sanity test Wanda model on CPU
+- Bash (background): Run SVD and both compression in parallel
+- Bash (background): Sanity test compressed (both) model
+- Bash (background): Watch sanity test output
+- Bash (background): Run SVD with higher rank retention
+- Bash (background): Sanity test SVD v2 model
+- Bash (background): Run Wanda+SVD v2 combined
+- Bash (background): Sanity test compressed v2
+- Bash (background): Convert wanda to Q4_K_M
+- Bash (background): Convert moei2-v2 to Q4_K_M
+- Bash (background): Convert compressed-v2 to Q4_K_M
+- Bash (background): Convert all 3 variants sequentially to main disk
+- Bash (background): Run GPQA 10q comparison on all 4 models
+- Bash (background): Run GPQA 10q eval with correct venv
+- Bash (background): Re-run GPQA eval with local tokenizer
+- Bash (background): Run GPQA 10q with correct eval pattern
+- Bash (background): Run GPQA eval with lightseek conda env
+- Bash (background): Run GPQA eval fresh
+- Bash (background): Copy script and run
+- Bash (background): Run GPQA eval again
+- Bash (background): Run GPQA eval directly
+- Bash (background): Run GPQA 10q on 3 new variants only
+- Bash (background): Run Wanda at 5%, 10%, 15% pruning
+- Bash (background): Run Wanda at 5/10/15% correctly
+- Bash (background): Run calibration + 3 pruning levels
+- Bash (background): Run 3 pruning levels with NaN fix
+- Bash (background): Convert 3 variants to Q4_K_M on persistent disk
+- Bash (background): Run GPQA 10q on 3 Wanda variants
+- Bash (background): Run Wanda with block-aligned targets
+- Bash (background): Convert block-aligned Wanda models to Q4_K_M
+- Bash (background): Build and quantize the two missing targets
+- Bash (background): Run GPQA 20q on 4 Wanda variants
+- Bash (background): Run DERN 128→97 experts
+- Bash (background): Run full GPQA on gemma4-e4b
+- Bash (background): Rebuild llama.cpp
+- Bash (background): Download bartowski E4B Q4_K_M
+- Bash (background): Run full GPQA on E4B
+- Bash (background): Run DERN with threshold 0.10
+- Bash (background): Sanity test DERN 96e model on CPU
+- Bash (background): Convert DERN 96e to Q4_K_M
+- Bash (background): Queue DERN eval after E4B
+- Bash (background): Restart DERN eval
+- CronCreate */20 * * * *: check DERN 96e GPQA eval progress: tail the last "Requesting API" line from /tmp
+- Bash (background): Restart DERN eval with 65k ctx
+- Bash (background): Test question 14 directly
+- Bash (background): Rerun DERN with router fix
+- Bash (background): Quantize fixed DERN
+- Bash (background): Test question 14 with fixed DERN
+- Bash (background): Try 4-bit GPU load
+- Bash (background): Try 4bit load with GPU free
+- Bash (background): Try 8-bit load
+- Bash (background): Run new neuron analysis
+- CronCreate */20 * * * *: check expert+neuron analysis progress: tail last "elapsed" or "ETA" line from sc
+- Bash (background): Restart with 1024 tokens
+- Bash (background): Run drop+residual for 96 experts
+- Bash (background): Sanity test 96e-dr
+- Bash (background): Quantize 96e-dr
+- Bash (background): Run full GPQA on 96e-dr
+- Bash (background): Run GPQA with absolute paths
+- Bash (background): Run eval against running server
+- CronCreate */20 * * * *: check 96e-dr GPQA progress: tail last "Requesting API" line and any flexible-ext
+- Bash (background): Restart eval with budget
+- Bash (background): Build 96e without residual
+- Bash (background): Quantize pure drop
+- Bash (background): Test Q18 on 96e pure drop
+- Bash (background): Run GPQA on 96e pure drop
+- CronCreate */20 * * * *: check 96e-drop GPQA progress: tail last "Requesting API" line and flexible-extra
+- Bash (background): Build 109e new analysis
+- Bash (background): Quantize 109e-newdrop
+- Bash (background): Try foreground
+- Bash (background): Test Q18 and Q27 on 109e-newdrop
+- Bash (background): Start with output
+- Bash (background): Test Q27 on original 109e
+- Bash (background): Run old expert_drop with 96 map
+- Bash (background): Run v3 analysis
+- CronCreate */20 * * * *: check v3 analysis progress: tail "OK\|FILTERED\|Done in" lines from scripts/neur
+- Bash (background): Run v4 analysis
+- Bash (background): Build 96e+residual using v4
+- Bash (background): Quantize new 96e-dr
+- Bash (background): Start foreground
+- Bash (background): Test Q18/Q27 on v4 96e-dr
+- Bash (background): Full GPQA on 96e-dr v4
+- CronCreate */20 * * * *: check 96e-dr-v4 GPQA progress: tail last "Requesting API" line and flexible-extr
+- Bash (background): Foreground server
+- Bash (background): Test Q18/Q27 on 96e-drop
+- Bash (background): Check actual answers from 96e-drop
+- Bash (background): Run v5 analysis
+- Bash (background): Test 96e-drop on 6 specific questions
+- Bash (background): Quantize 96e-old
+- Bash (background): Test 96e-old on 6 questions
+- Bash (background): Build 96e from v5
+- Bash (background): Quantize 96e-v5
+- Bash (background): Run foreground to see error
+- Bash (background): Test 96e-v5 on 6 questions
+- Bash (background): Run DERN v2 on v4 picks
+- CronCreate */15 * * * *: check DERN v2 progress: tail last "L\\d+: \\d+ assigned" line and any "Done!" or
+- Bash (background): Quantize DERN v2
+- Bash (background): Run per-question analysis
+- Bash (background): Test DERN v2 on 6 questions
+- CronCreate */15 * * * *: check per_question_analysis progress: tail last "[N/6] QXX:" line from scripts/p
+- Bash (background): Run server with output
+- Bash (background): Test 96e-old on 10 chem questions
+- Bash (background): Build hybrid 98e model
+- Bash (background): Build hybrid 98e
+- Bash (background): Quantize 98e-hybrid
+- Bash (background): Start hybrid server
+- Bash (background): Test 98e-hybrid on 6 questions
+- Bash (background): Build 120e hybrid
+- Bash (background): Quantize 120e hybrid
+- Bash (background): Test 120e on 6 questions
+- Bash (background): Convert 120e-hybrid to GGUF F16 in background
+- Bash (background): Start extended per-question analysis on regression questions
+- Bash (background): Quantize 120e-hybrid F16 GGUF to Q4_K_M in background
+- Bash (background): Run 6q curated test on 120e-hybrid v3
+- Bash (background): Run 6q test on 109e with verification against saved baseline
+- Bash (background): Run 6q test on 109e with updated llama.cpp and Gemma 4 official sampling
+- Bash (background): Re-run 109e temp=1.0 seed=42 reproducibility check
+- Bash (background): Run 109e with seeds 0, 7, 13 sequentially
+- Bash (background): Convert 128e HF to F16 GGUF
+- Bash (background): Run 128e Q6_K 4-seed sweep on 11 questions
+- Bash (background): Run 4-test reasoning-format experiment on Q32
+- Bash (background): Run 128e Q6_K definitive baseline with locked methodology
+- Bash (background): Run full pipeline: quantize+eval 109e, 98e-hybrid, 120e v3 to Q6_K
+- Bash (background): 20-min poll: both pod evals + solidpc 128e
+- Bash (background): 20-min poll: all 3 GPQA evals progress
+- Bash (background): 20-min poll: all 3 GPQA evals + chain status
+- Bash (background): 20-min poll all evals
+- Bash (background): Run 128e patch on 4 truncated questions with --dry-multiplier 0.5
+- Bash (background): 20-min poll
+- Bash (background): 20-min poll clean
+- Bash (background): 20-min poll - check for 120e v3 completion
+- Bash (background): 20-min poll - check 120e v3 completion
+- Bash (background): 20-min poll - 120e should be very close
+- Bash (background): 15-min poll focused on 120e v3 completion
+- Bash (background): 15-min poll for 120e v3 completion
+- Bash (background): 20-min poll - 2 remaining evals
+- Bash (background): Download 128e and launch targeted teacher-force analysis on 21 divergent questio
+- Bash (background): 20-min poll all tasks
+- Bash (background): 15-min check for phase 2 completion
+- Bash (background): Build 120e v4 from teacher-force map and launch eval on pod GPU 1
+- Bash (background): Monitor all evals in 20 minutes
+- Bash (background): Monitor all evals in 30 minutes
+- Bash (background): Monitor in 30 minutes
+- Bash (background): Monitor in 20 minutes
+- Bash (background): Verify both evals started after 90s
+- Bash (background): Monitor in 20 min
+- Bash (background): Check pod status after restart attempt
+- Bash (background): Monitor 120e v4 resume in 20 min
+- Bash (background): Check for 120e v4 result in 5 min
+- Bash (background): Check teacher-force start after 2 min
+- Bash (background): Monitor teacher-force in 20 min
+- Bash (background): Wait 10 min then verify clean data
+- Bash (background): Monitor teacher-force v2 in 30 min
+- Bash (background): Monitor teacher-force in 30 min
+- Bash (background): Verify it started properly
+- Bash (background): Check in 5 min
+- Bash (background): Check in 2 min
+- Bash (background): Check in 3 min — verify no OOM
+- Bash (background): Check in 3 min
+- Bash (background): Check CPU start in 2 min
+- Bash (background): Monitor in 10 min
+- Bash (background): Check completion + NaN verification in 10 min
+- Bash (background): Check 109e v3 build in 1 min
+- Bash (background): Monitor 109e v3 in 20 min
+- Bash (background): Monitor in 30 min
+- Bash (background): Verify resume started
+- Bash (background): Monitor resume2 in 20 min
+- Bash (background): Monitor resume2 in 20 min (check for completion)
+- Bash (background): Monitor in 15 min for finish
+- Bash (background): Check patch progress after 60s
+- Bash (background): Check patch progress in 90s
+- Bash (background): Wait 3 min and check patch progress
+- Bash (background): Check patch progress in 5 min
+- Bash (background): Check v2 patch after 30s
+- Bash (background): Check build start
+- Bash (background): Check relaunched build
+- Bash (background): Check 98e v3 build in 10 min
+- Bash (background): Monitor 98e v3 eval in 20 min
+- Bash (background): Check instance status after 30s
+- Bash (background): Recheck pod status in 60s
+- Bash (background): Check both builds after 60s
+- Bash (background): Check manifest progress after 60s
+- Bash (background): Check pod pipeline in 15 min
+- Bash (background): Check quantize restart progress
+- Bash (background): Check F16 conversion in 10 min
+- Bash (background): Monitor quantize pipeline in 20 min
+- Bash (background): Monitor quants in 20 min
+- Bash (background): Monitor both sides in 20 min
+- Bash (background): Monitor both in 20 min
+- Bash (background): Check new pod status
+- Bash (background): Check setup progress after 30s
+- Bash (background): Check setup in 15 min (llama.cpp build done?)
+- Bash (background): Unified monitor for 3 workloads in 20 min
+- Bash (background): Unified monitor in 20 min
+- Bash (background): Check Phase 1 restart progress
+- Bash (background): Monitor Phase 1 in 20 min
+- Bash (background): Wait for pip upgrade then read output
+- Bash (background): Monitor Phase 1 restart in 20 min
+- CronCreate 3,13,23,33,43,53 * * * *: check omnimerge phase1 progress on pod 34628028 (ssh -p 28028 root@ssh7.vast.ai)
+- CronCreate 5,15,25,35,45,55 * * * *: check omnimerge PHASE 2 (merge + eval) progress on pod 34628028 (ssh -p 28028 ro
+- CronCreate 7,17,27,37,47,57 * * * *: check omnimerge PHASE 2 progress on pod 34628028 (ssh -p 28028 root@ssh7.vast.ai
+- CronCreate 2,12,22,32,42,52 * * * *: check omnimerge PHASE 2 v2 (weighted retry) on pod 34628028 (ssh -p 28028 root@s
+- CronCreate 8,18,28,38,48,58 * * * *: check omnimerge PHASE 2 v3 (DELLA 3-way) on pod 34628028 (ssh -p 28028 root@ssh7
+- CronCreate 9,19,29,39,49,59 * * * *: check gpqa 20q thinking compare on pod 34628028 (ssh -p 28028 root@ssh7.vast.ai)
+- CronCreate 6,16,26,36,46,56 * * * *: check gpqa full 198 thinking compare on pod 34628028 (ssh -p 28028 root@ssh7.vas
+- CronCreate 5,35 * * * *: Monitor autonomous Omnimerge publish chain on pod 34628028 (ssh -p 28028 root@ss
+- Bash (background): Convert HF to F16 GGUF with fixed tokenizer
+- Bash (background): Wait for F16 then quantize to Q6_K
+- Bash (background): Quantize F16 to Q6_K
+- Bash (background): Poll for GPQA result completion
+- Bash (background): Wait for HumanEval result
+- Bash (background): Rebuild Claude Q6K for retry
+- Bash (background): Rebuild Claude Q6K properly
+- Bash (background): Clean quantize Claude Q6K
+- Bash (background): Wait for Q6K then SCP to solidpc
+- Bash (background): SCP Claude Q6K to solidpc
+- Bash (background): Create dir and SCP Claude Q6K
+- Bash (background): Upload Claude Q6K to HF from pod
+- Bash (background): Download Claude Q6K from HF
+- Bash (background): Download Claude Q6K from mradermacher
+- Bash (background): Start server + run evals parallel with quantize
+- ScheduleWakeup: check pod Omnimerge GSM8K + quantize progress, solidpc Claude IFEval progress
+- CronCreate */10 * * * *: Check all running workloads on pod 34628028 and solidpc. POD: (1) pgrep for quan
+- ScheduleWakeup: checking pod GSM8K completion + Omnimerge IFEval results + solidpc IFEval progre
+- ScheduleWakeup: pod GSM8K should finish in ~30 min, checking for results
+- Bash (background): SCP expert data to pod
+- CronCreate */10 * * * *: Check pod 34628028 status (ssh -p 28028 root@ssh7.vast.ai): (1) pgrep -af quanti
+- CronCreate */30 * * * *: Run GPQA v2 intermediate scoring: SSH to pod 34628028, run /workspace/score_gpqa
+- CronCreate */20 * * * *: Check all pod 34628028 pipelines: (1) GPQA v2 progress — if done, report final l
+- CronCreate */20 * * * *: Monitor ablation pipeline on pod 34628028: SSH and check (1) which step is runni
+- Bash (background): Hash local 98e weights for HF comparison
+- Bash (background): Download DS-Coder-V2-Lite base (31 GB) in background
+- Bash (background): libstdc++ fix + pip + workspace
+- Bash (background): Clone+build llama.cpp with CUDA Ada (sm_89)
+- Bash (background): Download base + 3 v3a sources in parallel from HF
+- Bash (background): Wait until downloads exceed 215 GB
+- Bash (background): Wait until downloads exceed 215 GB (fixed integer fmt)
+- Bash (background): Restart waiter with %.0f format
+- Bash (background): Wait until v3a merge process exits
+- Bash (background): Wait for Q6_K quant to finish
+- Bash (background): rsync Q6_K v3a from pod to solidpc
+- Bash (background): Wait for Q6_K v3a HF push
+- Bash (background): Wait for kai-os LoRA merge into Qwen3.6 base
+- Bash (background): SAFE waiter for v3b merge (bracket-pattern, no self-match)
+- Bash (background): Wait for v3b F16 convert (safe waiter)
+- Bash (background): Safe waiter for v3b Q6_K quant
+- Bash (background): Rsync v3b Q6_K to solidpc
+- Monitor: v3b GGUF push completion
+- Monitor: v3 eval phase milestones (DONE markers)
+- Monitor: bartowski Q6_K download completion
+- Monitor: v4 source downloads completion
+- Monitor: kai-os LoRA dl finish — trigger anchor rebuild
+- Monitor: anchor rebuild (LoRA→base merge) finish
+- Monitor: All v4 sources ready (anchor + rico03 + valiant)
+- Monitor: v4 merge completion + tokenizer override
+- Monitor: v4 F16 convert exit + auto-launch Q6_K quant
+- Monitor: Wait for v4 delta inspection JSON to land
+- Monitor: Wait for MLP-passthrough surgery to land index file
+- Monitor: Wait for Q6_K to finish
+- Monitor: Wait for Q6_K quantize completion marker
+- Monitor: Wait for llama-server ready
+- Monitor: Wait for Phase 1 completion
+- Monitor: Watch for errors in eval/server logs
+- Monitor: Filtered error watcher (no peg-native noise)
+- Monitor: Re-arm Phase 1 completion watcher
+- Monitor: Re-armed error watcher (filtered)
+- Monitor: Wait for staging completion
+- CronCreate 13,43 * * * *: Pod 35772554 (ssh -p 12554 root@ssh9.vast.ai) status check. Be concise.  For eac
+- Monitor: Wait for Fisher precompute on jackrong-v2 to finish
+- Monitor: Wait for Phase 1 continuation script to finish (all evals done)
+- Monitor: Wait for M2 (Recipe no-Fisher) eval to finish — final phase 1 result
+- Monitor: M4 ex-LRP pipeline progress on pod ssh9.vast.ai:12554
+- Monitor: M4 ex-LRP retry — qwen3_5_text patch applied
+- Monitor: M4 ex-LRP retry #2 — tied-tensor save patch
+- Monitor: M4 ex-LRP retry #3 — full mergekit multimodal patches
+- Monitor: M4 ex-LRP retry #4 — LRP keys remapped to language_model prefix
+- Monitor: M4 + M5 in parallel — patched lrp.py + dare_ties LRP-as-fisher
+- Monitor: M4 + M5 (with prefix-aware Fisher) — Phase 2 + corrected M5
+- Monitor: M4 eval / Fisher upload / M3-redo / publishers — all 4B Phase 1+2 pipelines
+- Monitor: M4 eval (retry) / M3-redo / publisher / fisher — final wave to HF uploads
+- Bash (background): Rsync eval results, caches, logs, scripts from pod to solidpc
+- Monitor: Gemma4 128e HE + MBPP completion
+- Monitor: Gemma4 HE chat-completions eval on pod 35772554
+- Monitor: Gemma4 HE chat-completions v2 (no reasoning split) on pod 35772554
+- Monitor: Gemma4 HE chat-completions v3 (clean cache, no reasoning-format) on pod 35772554
+- Monitor: Gemma4 humaneval_instruct chat eval v4 on pod 35772554
+- Monitor: Gemma4 humaneval_instruct via local-completions+apply_chat_template v5
+- Monitor: Gemma4 humaneval_instruct v5 (continue monitoring, smarter pattern)
+- Monitor: Gemma4 humaneval_instruct v6 (no-think tokenizer patch)
+- Monitor: v7 generation milestones (count + first-loop check)
+- Monitor: v8 cache milestones for early validation
+- Monitor: v9 sampling cache milestones
+- Monitor: Wait for v9 results json to land
+- Monitor: 98e HE+MBPP progress milestones
+- Monitor: 98e MBPP completion + script exit
+- Monitor: 98e HE rerun completion
+- Monitor: 98e MBPP raw mode completion
+- Monitor: 98e MBPP-raw final completion
+- Monitor: 98e v3 weights download completion
+- Monitor: 98e MBPP ollama smoke (5 samples)
+- Monitor: HF download + ollama smoke completion (whichever first)
+- Monitor: Smoke FINAL completion (fixed glob check)
+- Monitor: Smoke v2 (16k tokens) completion
+- Monitor: Smoke v3 (zero-shot ollama) completion
+- Monitor: Pod 35946544 boot + SSH ready
+- Monitor: SSH ready on pod 35946544
+- Monitor: Phase 1 cache milestones + Phase 2 eval start
+- Monitor: Phase 1 cache + Phase 2 eval (corrected)
+- Monitor: pod 35946544 phase1 cache + phase2 eval progress
+- Monitor: pod 35946544 NF4 cache + eval (torch 2.5 retry)
+- Monitor: manual NF4 quant + sizes for both 128e and 98e
+- Monitor: GGUF downloads + vllm smoke test readiness
+- Monitor: Wait for 128e GGUF download to finish on pod 35946544
+- Monitor: vLLM startup + eval progress on pod 35946544
+- Monitor: Wait for SSH to recover on pod 35946544
+- Monitor: 128e BF16 download progress on pod 35946544
+- Monitor: vLLM 128e BF16 startup + eval progress
+- Monitor: vLLM 128e BF16 TP=2 startup
+- Monitor: vLLM 128e BNB-NF4 startup
+- Monitor: Wait for pod 35956995 to reach running state
+- Monitor: BF16 downloads + vLLM install on pod 35956995
+- Monitor: vLLM 128e TP=3 startup + eval progress
+- Monitor: vLLM 128e PP=3 startup + eval progress
+- Monitor: vLLM 128e FP8 TP=2 startup + eval
+- Monitor: FP8 quantization progress on pod
+- Monitor: Wait for pod 35958829 to reach running state
+- Monitor: Wait for pod 35958829 sshd to be reachable
+- Monitor: Wait for pod 35960075 SSH ready
+- Monitor: Wait for pod 35960669 SSH ready
+- Monitor: Pod setup: vllm install + BF16 downloads on 35960669
+- Monitor: Pod 128e TP=4 eval progress (background)
+- Monitor: 128e v2 eval — periodic SQLite cache row + sample sanity (every 10 answers, 3 cy
+- Monitor: Local M4-v2 merge + quantize + eval pipeline
+- Monitor: Local M4-v2 merge pipeline (post layer-aware patch)
+- Monitor: M4-v2 eval (mbpp + humaneval) — sample sanity every cycle
+- Monitor: M4-v2 eval retry — mbpp + humaneval
+- Monitor: M4-v2 eval — lightseek venv (mbpp + humaneval)
+- Monitor: Pod 128e v2 run2 — readiness, sample sanity, completion sample inspection
+- Monitor: Pod 128e v2 run3 — endpoint probe + cache + sample inspection
+- Monitor: Pod 128e v2 — verify real generation + cache progress
+- Monitor: Pod 128e v2 — eval cache progress + sample sanity (ignore startup probes)
+- Monitor: Pod 128e v2 — eval completion watch
+- Bash (background): Download Q6_K (3.4 GB)
+- Bash (background): Launch base Qwen3.5-4B eval
+- Monitor: Base Qwen3.5-4B eval progress + completion
+- Bash (background): Run 10-Q smoke test
+- Bash (background): Replace with absolute include path and rerun smoke
+- Bash (background): Download both source Q6_K GGUFs
+- Bash (background): Launch local sources eval (jackrong + crow)
+- Monitor: Sources eval (jackrong+crow) progress + content sanity (per memory rule)
+- Monitor: Pod 128e HE v3 — content sanity per cycle
+- Monitor: Pod 98e v3 BF16 — MBPP + HE content sanity per cycle
+- Bash (background): Download Fisher scores (~33 GB)
+- Monitor: M6 Fisher download → auto-launch M6 pipeline once both files land
+- Bash (background): Run delta analysis
+- Bash (background): Re-run analyzer
+- Monitor: HF uploads completing
+- Monitor: downloads finishing
+- Monitor: retry downloads finishing
+- Monitor: coder eval phase progress
+- ScheduleWakeup: 25-min status check on coder eval pipeline (HE/MBPP/LCB on 4 models)
+- CronCreate 7,37 * * * *: status check on coder_eval pipeline at /srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-
+- Monitor: microcoder eval progress (new clean log)
+- ScheduleWakeup: 25m heartbeat — jackrong-python LCB has ~22min to finish, then massivdash-ts beg
+- ScheduleWakeup: 25m heartbeat — massivdash-ts MBPP should be done, HE running
+- ScheduleWakeup: 25m heartbeat — massivdash-ts LCB completing, continuum-forged convert+quant lik
+- ScheduleWakeup: 25m heartbeat — massivdash LCB done within 14 min, continuum-forged starting
+- Monitor: continuum-forged eval start (server up + new log writes)
+- ScheduleWakeup: 25m heartbeat — continuum-forged HE/MBPP should be done, LCB starting
+- ScheduleWakeup: 25m heartbeat — LCB nearing completion, HE+MBPP redo about to fire
+- ScheduleWakeup: 25m heartbeat — continuum-forged LCB done, HE+MBPP redo running or finishing
+- Monitor: microcoder pipeline state changes (phase + errors)
+- ScheduleWakeup: 25m heartbeat — merge should be done, convert+quantize starting
+- ScheduleWakeup: 25m heartbeat — LCB completing
+- ScheduleWakeup: 25m heartbeat — v1 LCB final + v1b merge phase
+- ScheduleWakeup: 25m heartbeat — v1b done, sweep advancing through v1c/v1d
+- ScheduleWakeup: 25m heartbeat — v1b done, sweep should be on v1c (the dare_linear test)
+- Monitor: microcoder sweep variant transitions + scores
+- ScheduleWakeup: 25m heartbeat — sweep should have v1c done, v1d running
+- ScheduleWakeup: 25m heartbeat — v1e/f/g should be landing scores
+- ScheduleWakeup: 25m heartbeat — sweep ~3 variants advanced
+- ScheduleWakeup: v1i HE scoring completes seconds, v1j ~13min — check 18:24 to catch v1i score an
+- ScheduleWakeup: v1j MBPP+HE both land in ~9 min; check at 18:34 for full sweep table
+- Monitor: competence v2a phase transitions + errors
+- Monitor: competence v2a phase transitions + scores
+- Bash (background): Wait for smoke test outcome
+- CronCreate 2,12,22,32,42,52 * * * *: Status check on competence v2a pipeline — run this exact command and report conc
+- CronCreate 2,12,22,32,42,52 * * * *: v2b competence-diff status — run and report concisely:  bash -c ' echo "=== $(da
+- CronCreate 7,17,27 * * * *: v2c competence-fisheronly status — run and report concisely:  bash -c ' echo "==
+- CronCreate 7,17,27,37,47,57 * * * *: v2def sweep status — run and report concisely:  bash -c ' echo "=== $(date +%H:%
+- CronCreate 7,17,27,37,47,57 * * * *: finalize pipeline status — report concisely:  bash -c ' echo "=== $(date +%H:%M:
+- ScheduleWakeup: jackrong-python mbpp ETA ~04:55; 15min puts us past the extraction-done + into c
+- Monitor: finalize.sh phase transitions, errors, completion
+- ScheduleWakeup: Monitor armed on finalize log for phase/error/score events; 1500s fallback cover
+- ScheduleWakeup: Phase 4 merge underway; Monitor catches Phase 5/6/errors. Reset safety net to 25
+- ScheduleWakeup: Phase 6 underway; HE+MBPP+LCB eval ~30 min. Reset safety net to 25 min so we lan
+- ScheduleWakeup: v2g LCB ~5 min from done; Monitor will wake on pass@1/ALL DONE first. 20min net 
+- Monitor: extended eval phase transitions, errors, scores
+- ScheduleWakeup: Quant 3 sources ~15 min then first eval starts; 25-min net catches first ext-eva
+- ScheduleWakeup: First model starting; first GSM8K-100 score lands ~25 min in. Net catches first 
+- ScheduleWakeup: jackrong-v2 mmlu_pro mid-run; net catches mmlu_pro completion + aime start.
+- ScheduleWakeup: MMLU-Pro near end; net catches mmlu_pro score + AIME start. AIME 30q × 8K tok wi
+- ScheduleWakeup: Cache reuse fast-forwards gsm8k/mmlu; net catches mid-AIME progress for jackrong
+- ScheduleWakeup: Net catches mmlu completion + AIME-30 mid-run on jackrong-v2; AIME is the first 
+- ScheduleWakeup: mmlu_pro lands imminently → AIME-30 mid-run; net catches AIME score + HE+ start.
+- ScheduleWakeup: continuum-forged just started; net catches gsm8k+mmlu_pro start markers and poss
+- ScheduleWakeup: mmlu_pro mid-run; net catches mmlu_pro completion + AIME start for continuum.
+- ScheduleWakeup: mmlu lands imminently; net catches AIME mid-run on continuum.
+- ScheduleWakeup: jackrong-python mmlu_pro mid-run (20%); net catches mmlu finish + AIME start.
+- ScheduleWakeup: mmlu finishes ~10:45; net catches AIME mid-run on jackrong-python.
+- ScheduleWakeup: aime mid-run; net catches AIME score + HE+ + transition to v2e (next 3-source me
+- ScheduleWakeup: v2e mmlu_pro fresh run; net catches mmlu finish + AIME mid-run for v2e.
+- ScheduleWakeup: v2e mmlu_pro mid-run; net catches mmlu finish + AIME mid-run.
+- ScheduleWakeup: mmlu_pro lands; AIME starts. Net catches AIME mid-run.
+- ScheduleWakeup: v2g mmlu_pro early; net catches mid-run progress.
+- ScheduleWakeup: v2g mmlu_pro mid-run; net catches mmlu finish + AIME mid-run.
+- ScheduleWakeup: mmlu_pro lands now; AIME starts. Net catches AIME mid-run + likely HE+ start.
+- Monitor: pip install fla+causal-conv1d done
+- Monitor: v2h AIME extract progress / OOM / phase change
+- Monitor: v2h chunked AIME extract + blend + merge + quant + eval phases
+- Bash (background): Create empty omnimergekit conda env (Python 3.11)
+- Bash (background): Install core requirements in omnimergekit env
+- Bash (background): Install eval + quant requirements
+- Monitor: v2h remaining extended eval (mmlu_pro / aime / humaneval_plus)
+- Monitor: v2h AIME + HE-Plus completion
+- Monitor: v2i task-arith merge progress + eval scores
+- Monitor: v2i extended eval — MMLU-Pro / AIME / HE-Plus completion
+- Monitor: v2i HE-Plus + ALL DONE
+- Monitor: v2j build+AIME eval progress
+- ScheduleWakeup: v2j build+AIME eval ETA ~15 min; safety net wake if monitor doesn't fire (e.g. s
+- Monitor: v2k build+AIME eval (wider band 14-27)
+- ScheduleWakeup: v2k AIME eval ETA ~10 min; safety net if monitor misses ALL DONE
+- Monitor: v2l build+AIME eval (full MLP skip 18-25)
+- ScheduleWakeup: v2l AIME eval near end; safety net 20 min in case monitor misses ALL DONE
+- Monitor: v2m build+AIME (skip 18-25 + density 0.45)
+- Monitor: v2n build+AIME (v2j skip + darex-q 0.95)
+- ScheduleWakeup: v2n full pipeline ETA ~17 min; safety net 20 min in case monitor misses ALL DONE
+- Monitor: v2o build+AIME (v2j skip + darex-q 0.97)
+- ScheduleWakeup: v2o AIME eval ETA ~6 min; safety net 15 min if monitor misses
+- Monitor: v2n full eval — task transitions and scores
+- ScheduleWakeup: v2n full eval ETA ~45-60 min; safety net 30 min for first checkpoint
+- ScheduleWakeup: v2n MMLU-Pro+HE+ ETA ~25 min; safety wake to catch final scores
+- ScheduleWakeup: v2n MMLU-Pro running, HE+ pending; ~25 min to ALL DONE
+- Monitor: v2n MMLU-Pro + HE+ scores
+- ScheduleWakeup: v2n MMLU-Pro long-tailing; safety wake to catch completion + HE+ progress
+- Monitor: v2p build+AIME (jv-AIME suppression mask)
+- ScheduleWakeup: v2p ETA ~15 min; safety net to catch AIME score
+- Monitor: v2q+v2r build+AIME chained
+- ScheduleWakeup: v2q+v2r chained, ETA both ~20 min; safety net
+- Monitor: phase1 v2opq HE/MBPP/LCB-30 transitions and final scores
+- ScheduleWakeup: Phase 1 sequential 3 variants × ~60min; first v2o complete in ~60min, safety wak
+- ScheduleWakeup: Phase 1 ~2 hours remaining; safety net 30 min
+- Monitor: LCB-55 transitions and final scores
+- Monitor: LCB-55 transitions and scores
+- ScheduleWakeup: LCB-55 jv ~30-50 min; safety net 30 min
+- ScheduleWakeup: jv LCB-55 ~50% done, v2g+v2i still pending; safety net 30 min
+- Monitor: LCB-55 progress (re-armed)
+- ScheduleWakeup: v2g LCB-55 ~50 min, then v2i; safety net 30 min
+- ScheduleWakeup: v2g LCB-55 wrapping; v2i pending; safety net 30 min
+- ScheduleWakeup: v2i LCB-55 should be ~70% done by then; check progress and any v2pq_finish kicko
+- Monitor: v2i LCB-55 finish + v2pq kickoff
+- Monitor: v2pq_finish phase transitions
+- ScheduleWakeup: v2p HE/LCB-30 should be near done by then; heartbeat in case monitor misses a tr
+- ScheduleWakeup: v2q LCB-30 should land within 20 min, finalizing the v2pq sweep
+- Monitor: Microcoder GGUF upload completion
+- Monitor: HE sweep transitions
+- Monitor: HE sweep transitions v2
+- Monitor: HE sweep v3 transitions
+- Bash (background): Launch Gemma 4 31B smoke prune in background
+- Monitor: Gemma 4 31B smoke prune progress
+- Bash (background): Re-launch smoke with CPU-only placement
+- Monitor: Smoke (CPU-only) phase progress
+- Bash (background): Re-launch smoke with --placement auto
+- Monitor: Smoke (auto-placement, GPU offload) progress
+- Bash (background): Re-launch smoke (eval-mode fix)
+- Monitor: Smoke v3 (auto + eval mode) progress
+- Bash (background): Re-launch smoke v4 (alpha on real cuda)
+- Monitor: Smoke v4 (alpha on cuda) progress
+- Bash (background): Re-launch smoke v5 (14GiB GPU)
+- Monitor: Smoke v5 (14GiB GPU) progress
+- Bash (background): Re-launch smoke v6 (8GiB + expandable segments)
+- Monitor: Smoke v6 (8GiB + expandable) progress
+- Bash (background): Re-launch smoke v7 (nf4_global)
+- Monitor: Smoke v7 (nf4_global) progress
+- Bash (background): Re-launch smoke v8 (nf4 + auto device_map)
+- Monitor: Smoke v8 (nf4 auto device_map) progress
+- Monitor: Smoke v8 nf4 phase 1b
+- Bash (background): Re-launch smoke v9 (windowed K=2 only)
+- Monitor: Smoke v9 (windowed K=2 only) progress
+- Monitor: Smoke v9 phase 1a windowed progress
+- Bash (background): Re-launch smoke v10 (windowed L2 K=2)
+- Monitor: Smoke v10 (L2 windowed K=2) progress
+- Monitor: Smoke v10 phase 1a/2 progress detail
+- Bash (background): Launch smoke v11 (nf4_global, chunk=192)
+- Monitor: Smoke v11 (nf4_global chunk=192) progress
+- Monitor: Smoke v11 phase 1b detail
+- Bash (background): Smoke v12 (nf4-first ordering)
+- Monitor: Smoke v12 (nf4-first) progress
+- Monitor: Smoke v12 phase 1b detail
+- Bash (background): Smoke v13 (no grad-ckpt for nf4)
+- Monitor: Smoke v13 (no grad-ckpt) progress
+- Monitor: Smoke v13 phase 1b chunks
+- Bash (background): Smoke v14 (chunk=64, no grad-ckpt)
+- Monitor: Smoke v14 (chunk=64) progress
+- Monitor: Smoke v14 phase 1b chunks
+- Bash (background): Smoke v15 (per-layer nf4 scoring, chunk=192)
+- Monitor: Smoke v15 (per-layer nf4) progress
+- Monitor: Smoke v15 phase 1b detail
+- Bash (background): Verify fix + smoke v16
+- Monitor: Smoke v16 (cuda:0 + per-layer) progress
+- Monitor: Smoke v16 detail
+- Monitor: Smoke v16 phase 1b layer progression
+- Monitor: Smoke v16 finish
+- Monitor: Smoke v16 finish (catch end)
+- Monitor: Smoke v16 finish (phase 0/1b/2/save)
+- Monitor: Smoke v16 phase 1b finish + phase 2
+- Monitor: Smoke v16 phase 0/2/save
+- Monitor: Smoke v16 phase 2 + save
+- Monitor: Smoke v16 final phase 2 + save
+- Monitor: Smoke v16 save completion
+- Monitor: Smoke v16 save complete
+- Monitor: Wait for prune_local_heal to exit
+- Bash (background): Launch he125/he25/he375 sweep in background
+- Monitor: Sweep major milestones (he125/he25/he375)
+- Monitor: 31B HE sweep milestones (he125/he25/he375)
+- Monitor: 31B Q4_K_M quant progress
+- Monitor: Smoke eval base 31B (HE-20/MBPP-40/GPQA-10)
+- Monitor: Smoke eval base 31B retry (HE-20/MBPP-40/GPQA-10)
+- Monitor: Smoke eval base 31B v3 (HE-20/MBPP-40/GPQA-10)
+- Monitor: Smoke chat HE+MBPP base 31B
+- Monitor: Smoke chat v5 base 31B (HE+MBPP)
+- Monitor: Smoke chat v6 base 31B (until fix)
+- Monitor: Live HE+MBPP cache peek
+- Monitor: Wait for test server ready
+- Monitor: Smoke chat v7 base 31B (--reasoning off)
+- Monitor: v8 rescore HE+MBPP with new filters
+- Monitor: 3-variant pipeline (he125/he25/he375)
+- Monitor: Full HE-164 + MBPP-500 on base + 3 pruned variants (events: variant boundaries, 
+- Monitor: Full HE-164 + MBPP-500 (parallel=2) — variant boundaries, scores, errors, server
+- Monitor: Live full HE+MBPP cache peek (parallel=2)
+- Monitor: Full HE+MBPP (post-bug-122 patch) — variant boundaries, scores, errors
+- Monitor: Full HE+MBPP (parallel=1, post bug-122) — variant boundaries, scores, errors
+- Monitor: Wait for VRAM to settle after server startup
+- Monitor: Full HE+MBPP (parallel=2 c=16384) — variant boundaries, scores, errors
+- ScheduleWakeup: First active health check on he125 full HE+MBPP run — verify VRAM + cache progre
+- ScheduleWakeup: Second active health check; expect he125 done and he25 mid-MBPP
+- ScheduleWakeup: 25-min health check on full HE+MBPP pipeline; he25 in flight
+- ScheduleWakeup: 25-min health check; he25 MBPP mid-flight, expect he25 final scores + he375 star
+- ScheduleWakeup: 25-min check; he25 MBPP 318/500, expect he25 done + he375 in flight by next chec
+- ScheduleWakeup: 25-min check; he375 last variant, expect HE done + MBPP mid-flight by next check
+- ScheduleWakeup: Final variant; he375 MBPP at 63/500, expect completion + summary by next check
+- ScheduleWakeup: Final stretch — he375 MBPP at 317/500 (63%); ~7 min more, fire just past complet
+- ScheduleWakeup: he375 MBPP at 489/500 (98%); ~3-4 min to completion + scorer + cleanup, fire pos
+- ScheduleWakeup: 25-min check on T11 he125-S (first variant) — should be in phase 2 prune loop or
+- ScheduleWakeup: 25-min check on relaunched T11; expect he125-S phase 2 mid-progress with the off
+- ScheduleWakeup: 25-min check; expect he25-S nearing completion + verify, he375-S starting
+- ScheduleWakeup: 30-min check; expect all 3 -S manifests done by 04:05; if so launch T11.3 quanti
+- ScheduleWakeup: 30-min check on T11 quantize; expect he125-S done + he25-S in flight
+- ScheduleWakeup: 30-min check; expect he25-S Q4_K_M complete + he375-S in flight
+- ScheduleWakeup: 25-min check; he375-S Q4_K_M should land ~05:35, then llama-server smoke + launc
+- ScheduleWakeup: 25-min check on T11 full eval; expect he125-S HE done + MBPP early
+- ScheduleWakeup: Catch he125-S HE-164 final score (~06:13 CEST), then execute pivot to he375-S HE
+- ScheduleWakeup: Check he125-H producer at ~07:14 CEST (40 min in). Should be mid-phase-2 by then
+- ScheduleWakeup: Mid-run health check for CPU-placement he125-H prune. ETA ~3h. At 50 min in, mod
+- ScheduleWakeup: E2B download running at ~150-200 MB/min, ~10 GB total → ETA ~50 min. Wake at 08:
+- ScheduleWakeup: Check E2B smoke prune (PID 3103991) + base Q4_K_M quantize (PID 3099461) both co
+- ScheduleWakeup: E2B sweep mid-progress at ~08:40. Phase 1 importance (~5 min) + he125-E full pru
+- ScheduleWakeup: First wakeup ~25min after eval start: base HE-164 should be done or near-done at
+- ScheduleWakeup: Base done + first pruned variant (he125-E) HE in flight; verify pruned-variant H
+- ScheduleWakeup: v2 sweep with c=32768 parallel=4; check after 25 min — base fully scored + he125
+- ScheduleWakeup: v4 sweep with reasoning-budget; check after 25 min — base done from cache + he12
+- ScheduleWakeup: +30 min: he25-E HE will have failed (predictable from he125-E pattern) and MBPP 
+- ScheduleWakeup: R1 (he125-Esh) only has ~22 min nominal eval time at parallel=4. Check at 25min 
+- ScheduleWakeup: R1 nearly through HE (163/164), MBPP next; check at +15min should land both scor
+- Monitor: LOO importance + canary verdicts
+- Monitor: events: phase markers + canary verdict per run
+- Monitor: tighter — phase transitions, canary verdict, save dir, exit
+- Monitor: v2 validation: canary verdicts incl. drift/self/shape
+- Bash (background): Start E4B download in background
+- Monitor: E4B download completion + size milestones
+- Monitor: T7.4 E4B sweep — phase transitions, canary verdicts, save dirs, exits
+- Monitor: T7.4 run 3 (positive_max) — phase markers, canary verdict, exit
+- Monitor: T7.5 L4-L7 sweep — phase markers, canary verdicts, save dirs, exits
+- Monitor: T7.5 run 3 (positive_max) — canary verdict + exit
+- Monitor: T13 LoRA heal sweep — phase markers, lora loss, canary verdicts, exits
+- Monitor: T13 LoRA heal sweep v2 — phase markers, lora loss, canary verdicts, exits
+- Monitor: T13b lora-r1/r2 + noheal sweep — phase markers, lora loss, canary verdicts, exit
+- Monitor: noheal retry — phase markers, n/a heal lines, canary verdict, exit
+- Monitor: T13c noheal depth+width — phase markers, canary verdicts, exits
+- Monitor: T13c L4-L11 final run — phase markers, canary verdict, exit + DONE
+- Monitor: T7.6 FFN sweep — phase markers, ffn lines, canary verdicts, exits
+- Monitor: T7.6 FFN sweep v2 — phase markers, mem log, canary, exits
+- Monitor: T7.6 FFN sweep v3 (filter on L4-L7) — phase markers, canary, exits
+- Monitor: T7.6 FFN sweep v4 (no_grad on capture too) — phase markers, canary, exits
+- Monitor: T7.7 ar-lstsq — phase markers, ar rollout, canary, exits
+- Monitor: T8noheal 31B he125 — load, phase1 cache hit, mask, save, canary
+- Monitor: Wait for save + final exit
+- Monitor: T8noheal-scope sweep — band starts/ends, canary verdicts, exits
+- Monitor: T8noheal-scope sweep resume — band ends, canary verdicts
+- Monitor: T8noheal-scope resumed — cache hit/miss, canary verdicts
+- Monitor: T8noheal-scope last 2 bands — cache hit, canary verdict
+- Monitor: Wait for L5659 manifest write + sweep exit
+- Monitor: T8-lora4 31B — load, phase1 cache, mask+lora per layer, save, canary
+- Monitor: T8-lora4 31B — only phase markers, save, canary, exits
+- Monitor: T8-lora4 canary verdict + save + exit
+- Monitor: T10 smoke phase markers + structured events + failures
+- Monitor: 98e-cd build phases + GPQA eval progress
+- Monitor: Catch Q6_K finish + phase 4 boundary to kill before GPQA
+- Monitor: max-Q6K build phase markers
+- Monitor: Catch cache peek + sanity verdict + final scores
+- Monitor: T14 4-variant compare chain progress + scores
+- CronCreate 7,30,53 * * * *: T14 chain heartbeat: check pid 4070154, latest variant log tail, cache row count
+- Monitor: 128e HE-only score landing
+- Monitor: 3072-budget HE chain: variant boundaries + scores + token stats
+- Monitor: 3-smoke chain progress + final summary
+- Monitor: 98e-cd-max LCB-30 medium completion
+- Bash (background): Wait until SSH responds, then full env probe
+- Bash (background): Wait for pod 36469801 SSH then probe env
+- Monitor: Pod download + build completion
+- Monitor: F16 convert completion + size
+- Monitor: F16 GGUF write completion
+- Monitor: Pod imatrix completion + size
+- Monitor: v4 full eval phase progress + scores
+- Monitor: v4 Phase 2 canonical: LCB completion + GPQA milestones + final scores
+- CronCreate 17 */1 * * *: Pod 36469801 watchdog: ssh -p 29800 root@ssh2.vast.ai 'pgrep -af "ollama_push_98
+- Monitor: pod recovery milestones + per-quant push DONE markers
+- Monitor: pod recovery V2 (parallel + double-rm) milestones + per-quant DONE
+- ScheduleWakeup: checking parallel ollama pushes (v4 12/19 + omnimerge 8+/19 with timeouts to ret
+- ScheduleWakeup: checking parallel omnimerge gap-fill (Q3_K_S in flight, 11 more to go) + v4 Q8_0
+- ScheduleWakeup: omnimerge old-script on Q6_K push (3 tags left); after exit chained v4 retry kic
+- ScheduleWakeup: omnimerge retry-aware gap-fill (10 tags @ ~3-5min/tag = ~30-50min); disk at 73% 
+- ScheduleWakeup: omnimerge retry-aware in main loop, 9 tags left. After exit will switch to hf-do
+- Monitor: omnimerge v3 push per-tag DONE/FAIL + final milestones
+- ScheduleWakeup: omnimerge v3 push at 8/11, ~12-15 min to drain remaining 4 tags (Q5_K_M in-fligh
+- Monitor: he1 replay prune milestones: phases, canary, upload
+- ScheduleWakeup: he1 replay prune: base download (~15 min) + Phase 0 nf4 + Phase 1 skipped, Phase
+- ScheduleWakeup: 25-min loop tick — check 128e GPQA progress (will be ~50/198), pod he1 replay (s
+- ScheduleWakeup: 28-min tick — pod should be deep in Phase 0 calib forward (or hitting Phase 2 st
+- ScheduleWakeup: 25-min tick — check 128e GPQA progress (~65/198 expected). Pod replay paused awa
+- ScheduleWakeup: 12-min tick — pod canary verdict imminent (started 09:44, typically 3-10 min). O
+- ScheduleWakeup: 25-min tick — pod AR canary running CPU-bound (~25 min total expected); by next 
+- ScheduleWakeup: 25-min tick — pod canary should hit verdict (pass→save+upload, fail→.broken). Ve
+- ScheduleWakeup: 18-min tick — pod canary should complete its 150-token CPU AR run; verdict + sav
+- ScheduleWakeup: 20-min tick — pod canary likely on last prompt of 3 (91 min in, ~30 min per prom
+- ScheduleWakeup: 15-min tick — pod canary CPU% jumped 100→288, signaling phase change (probably e
+- ScheduleWakeup: 17-min tick — if pod canary still grinding at ~2h40m (≈prompt 3 of 3 by my model
+- ScheduleWakeup: 25-min tick — by then replay should be deep in Phase 0' calib forward (the long 
+- ScheduleWakeup: 25-min tick — replay restarted with full checkpoint stack; verify base download 
+- ScheduleWakeup: 15-min tick — verify phase2 resume loaded L0-L2 from checkpoint (look for "phase
+- ScheduleWakeup: 20-min tick — verify the tree-align fix lets phase2 save layers past L2 cleanly;
+- Monitor: Wait for phase2 layer beyond L2 (proves tree-align fix works)
+- Monitor: retry7 phase boundaries + canary verdict + errors
+- Monitor: retry8 phase boundaries + canary verdict + errors
+- Monitor: retry9 canary verdict or error
+- Monitor: retry10 canary verdict or error
+- Monitor: retry10 canary verdict / phase3 / upload
+- Monitor: retry11 canary verdict + upload (post-pin)
+- Monitor: retry13 mask-mode canary verdict
+- Monitor: retry14 end-to-end progress (mlx fix verification)
+- Monitor: retry14 milestones-only
+- Bash (background): Pull broken weights from pod to local
+- Monitor: F16 GGUF conversion completion
+- Monitor: Wait base F16 conversion
+- Monitor: Wait base llama-server ready
+- Monitor: Wait base llama-server ready or fail
+- Monitor: Wait local he125 CPU server ready
+- Monitor: Wait nf4 selftest completion
+- Monitor: Wait nf4 selftest completion (v2)
+- Monitor: Wait nf4-eager-mask test
+- Monitor: Wait nf4-BOS verdict
+- Monitor: Wait he1 eval server ready
+- Monitor: he1-it Q4_K_M eval progress on pod
+- Monitor: he1-it Q4_K_M eval progress on pod (post lm-eval fix)
+- Monitor: pod he1 bf16 upload + quant pipeline + disk pressure
+- Monitor: pod he1 quant pipeline + imatrix → vLLM LCB-55 launcher
+- Monitor: pod he1 quant + smart imatrix-completion → vLLM LCB-55 launcher
+- Monitor: pod he1 quant + vLLM LCB tracking (both already running)
+- Monitor: pod he1 recovery uploads → restart quant with remaining 23 quants
+- Monitor: he1 quant resume — wait for first quant to land on HF or fatal error
+- Monitor: 128e vLLM LCB: ready→smoke→LCB→done|fail
+- Monitor: 128e vLLM LCB v2 (port 8195) — wait result or fail
+- Monitor: pod he1 quant v2 — Q8_0 catchup + first 2 quants
+- Monitor: 128e vLLM LCB v3 — wait for "running LCB" then "RESULT"
+- Monitor: 128e vLLM LCB v4 — lightseek venv
+- Monitor: pod he1 quant — disk + tier progress, alert if free&lt;20G
+- Monitor: NVFP4A16 download + vllm upgrade → both done
+- Monitor: pod he1lcb55 — vLLM ready → smoke → LCB result for he1-it
+- Monitor: pod he1lcb55 v2 — vLLM ready+smoke+LCB result
+- Monitor: pod: wait quant pipeline done → auto-relaunch LCB-55
+- Monitor: vllm pip retry + nvfp4a16 download → both done
+- Monitor: local NVFP4A16 LCB launch — vllm ready/abort + result
+- Monitor: pod he1lcb55 v3 — vLLM ready+smoke+LCB result
+- Monitor: Both LCBs — track to completion or fail
+- Monitor: Both LCBs v2 — until result/fail
+- Monitor: pod he1lcb55 vllm 0.19.0 — wait result
+- Monitor: pod LCB final attempt — vllm 0.19.0 + tf 5.8.0
+- Monitor: pod LCB — vllm 0.19.0 + tf 5.8.0 result
+- Monitor: pod LCB + quant resume — both pipelines
+- Monitor: vllm 0.20.2 source build — until done/fail
+- Monitor: pod quant3 + local vllm build — both pipelines
+- Monitor: pod quant3 + vllm build — fixed regex for [N/340]
+- Monitor: local NVFP4A16 vllm startup — errors + readiness
+- Monitor: NVFP4A16 vllm v2 startup — readiness or errors
+- Monitor: NVFP4A16 vllm v3 with patch — startup + LCB progress
+- Monitor: vllm main rebuild monitor
+- ScheduleWakeup: vllm main build at 71/341, ~25 min ETA; check back when likely done to relaunch 
+- Monitor: LCB-55 NVFP4A16 rerun → completion
+- Monitor: LCB-55 NVFP4A16 rerun (fresh)
+- ScheduleWakeup: LCB-55 should be ~halfway by then; user has pending question on pod ollama backf
+- Monitor: LCB-55 NVFP4A16 with patched shim → completion
+- Bash (background): [BG-1] rsync pod artifacts → solidpc archive
+- Bash (background): [BG-2] HF download 98e-v3 bf16 (~50GB, needed for quant build)
+- Bash (background): [BG-3] install gptqmodel in modelopt env (transformers 4.x compatible)
+- ScheduleWakeup: LCB-55 should be ~complete or near; start 98e-v3 NVFP4A16 quant + plan v4 + olla
+- Monitor: LCB-55 NVFP4A16 → completion (extended)
+- Monitor: LCB-55 128e_nvfp4a16 completion or stall
+- ScheduleWakeup: Periodic checkpoint during LCB-55 wait — monitors will fire independently on eac
+- Monitor: LCB-55 NVFP4A16 — re-armed to completion (16 of 55 remaining)
+- ScheduleWakeup: Periodic checkpoint while LCB-55 finishes its last 8 problems; monitors fire on 
+- Monitor: LCB-55 retry — 7 timeouts at 1200s
+- ScheduleWakeup: Self-pace tick during the 7-problem retry at 1200s timeout. Monitor b236duv4v fi
+- ScheduleWakeup: 25-min checkpoint during the last 4 retry slots; monitor b236duv4v fires on cach
+- Monitor: 128e quant build (AWQ then GPTQ) — completion or failure
+- Monitor: GPTQ build → auto-launch stage1 for the 3 llm-compressor quants
+- ScheduleWakeup: 25-min checkpoint during GPTQ build (layer 9/29 at last fire). Monitor bxaf0c8fz
+- Monitor: stage1 llmcomp v3 — W4A16 → W4A8 → NVFP4 sequential builds
+- ScheduleWakeup: Checking llmcompressor stage1 w/ _get_no_split_modules shim; if all 3 quants sti
+- ScheduleWakeup: Wait ~4.5min for nvfp4_lc calibration to finish, then check status before relaun
+- ScheduleWakeup: nvfp4_lc finishing shard writes; need ~2min before relaunching stage1 for w4a16/
+- ScheduleWakeup: INT4_AWQ build via modelopt (same engine that worked for NVFP4A16); ETA ~12-15 m
+- ScheduleWakeup: Wake at ~15min for MXFP4 + NVFP4_AWQ_Lite stage1 status. NVFP4A16 took ~10-15min
+- ScheduleWakeup: Check 98e-v3 NVFP4A16 build at ~15min mark. 26B BF16→NVFP4A16 took ~12min for 12
+- ScheduleWakeup: Wake at ~30min for v3+v4 NVFP4A16 build status. Each 98e takes ~12min including 
+- ScheduleWakeup: Wake at 10min — check 98e-v3 build progress with the fixed modelopt fused-expert
+- ScheduleWakeup: Check v3 NVFP4A16 build at ~12min. With full 24GB free and fused-experts plugin 
+- ScheduleWakeup: Wake at +60min to check v3 LCB-55 progress (samples count, last 5 gen lengths, a
+- ScheduleWakeup: Wake at 15min to check rebuild with vision_tower exclude. v3 should finish (~6-8
+- ScheduleWakeup: Wake at 15min to verify v3 vLLM loaded cleanly (no more shape assertion), check 
+- ScheduleWakeup: Wake at +60min to inspect v3 LCB-55 sample count (target 55), p10 generation len
+- Monitor: v3 vLLM startup readiness or failure
+- Monitor: v3 LCB progress markers — wait until 5 samples land or 10 min elapse
+- Monitor: v3 LCB content sanity — emits length + fence + empty stats per 5-sample interval
+- Monitor: v3 LCB-55 @ 24576 — length/fence/pass + token-cap rate per batch
+- ScheduleWakeup: +60min check on v3 LCB-55 @ 24576. Expect ~12 samples done if 290s/problem holds
+- Monitor: v3/v4 LCB-55 @ 24576 — batch length/cap/pass + transitions
+- Monitor: v3/v4 LCB-55 batch progress with length-cap%
+- ScheduleWakeup: v3 LCB-55 mid-run sanity check; monitor bfl6txwb3 drives batch events meanwhile
+- ScheduleWakeup: v3 grinding slow problem at 30/55; check again at 35-40 mark
+- ScheduleWakeup: v3 at 38/55; wake ~18:43 should land near v3 finish or just into v4 launch
+- ScheduleWakeup: v3 at 48/55; wake ~19:24 should catch v3 finish + v4 boot transition
+- ScheduleWakeup: v4 LCB-55 mid-run check; v4 pacing ~3× faster than v3, ETA ~21:30
+- ScheduleWakeup: v4 at 27/55; wake ~20:56 should catch ~35-40/55 mark and refine ETA
+- Monitor: vLLM v4 32k startup — wait for /v1/models or die
+- Monitor: v4 LCB-55 @ 32k unbudgeted — per-5 batch stats: pass/cap/toks
+- Monitor: 128e vLLM gemma4-parser startup — ready or die
+- Monitor: v4 vLLM gemma4 startup — ready or die
+- Monitor: v3 vLLM gemma4 startup — ready or die
+- Monitor: 128e + default-chat-template-kwargs boot
+- Bash (background): Launch 128e smoke suite
+- Bash (background): Relaunch 128e smoke suite
+- Bash (background): Relaunch 128e smoke suite with LM_EVAL_BIN set
+- Bash (background): Relaunch smoke after splitlines fix
+- Monitor: 128e smoke suite per-template progress
+- Monitor: 128e smoke suite per-template progress (run 6)
+- Bash (background): Install lm-eval math deps
+- Monitor: 128e smoke suite progress (run 7)
+- Monitor: 128e smoke run 8 progress
+- Monitor: ARC-C only re-run
+- Monitor: 128e smoke run 10 (HE chat overrides)
+- Monitor: Full chain 128e+v4 per-template progress
+- Monitor: vLLM ready
+- Monitor: lcb test progress
+- Bash (background): Test fix v2 on 3 problems
+- Monitor: lcb fix v2
+- Monitor: Full chain 128e+v4 per-template + score events
+- Monitor: Chain v2 progress + scores
+- Monitor: watch chain log for rewind action + LCB restart
+- Monitor: v4 per-bench score-vs-floor monitor
+- Monitor: chain-restart score-vs-floor monitor (128e + v4)
+- Monitor: router probe completion / failure
+- Monitor: silent-empty vLLM probe completion
+- Monitor: silent-empty vLLM probe (retry with GPU)
+- Monitor: silent-empty vLLM probe retry-2
+- Monitor: v4 LCB-24k retry completion
+- Monitor: canary auto-fire after LCB-24k retry
+- Monitor: canary completion (silent-empty verification)
+- Monitor: canary completion v2 (silent-empty verification)
+- Monitor: canary v3 silent-empty verification (setsid-detached)
+- Monitor: Czechia 36746141 state transition to running
+- Monitor: California pod SSH ready (actual_status transitions to running)
+- Monitor: California pod ready (silent until READY)
+- Monitor: California pod sshd ready
+- Monitor: California pod sshd post-reboot (3 min window then swap decision)
+- Monitor: pod bootstrap phase markers + completion
+- Monitor: bootstrap v2 phase markers + errors
+- Monitor: bootstrap v3 phase markers (with conda-tos fix)
+- Monitor: pod sshd recovers (one-shot, silent)
+- Monitor: post-reboot sshd recovery (silent)
+- Monitor: Pod 36746379 sshd recovery probe (port 26378)
+- Monitor: Pod 36755693 boot + sshd ready
+- Monitor: Pod 36755693 bootstrap phase markers
+- Monitor: Pod 36755693 sequential quant + push progress
+- Monitor: Pod 36755693 quant progress (sequential 128e then v4)
+- Monitor: Pod 36755693 quant with 1-GPU layout
+- Monitor: Pod env-match + quant restart (transformers 5.8.0, modelopt g7a11fb240)
+- Monitor: Pod 36755693 quant — fixed probe, plain device_map=auto
+- Monitor: Canonical quant via omnimergekit/quantize_any.py
+- Monitor: Pod 36755693 quant periodic heartbeat (every 5 min)
+- Monitor: solidPC reeval smoke (gsm8k × 5q × 128e) — validate plumbing
+- Monitor: solidPC reeval smoke v2 (after include-path fix)
+- Monitor: solidPC reeval smoke v3 (inlined YAMLs)
+- Monitor: Pod 36755693 parallel reeval (128e GPU0 + v4 GPU1)
+- Monitor: Pod env-setup (omnimergekit + vllm conda envs per docs)
+- Monitor: Pod env-setup (correct log)
+- Monitor: Pod env-setup v2 (cu128 torch, filtered reqs)
+- Monitor: re-eval progress (vllm ready, template DONE/FAIL, errors)
+- Monitor: re-eval progress v3 (vllm ready, template DONE/FAIL)
+- Monitor: re-eval v4 (vllm ready, template DONE/FAIL, errors)
+- Monitor: re-eval v5 65k ctx (ready, DONE/FAIL, real errors)
+- Monitor: re-eval status (DONE/FAIL, errors) — re-armed
+- CronCreate 17,47 * * * *: [v5-watch] Solidpc v5-code neuron mapping status check. Report concisely: 1) Pro
+- Monitor: re-eval post-reboot post-patch (DONE/FAIL/empties)
+- Monitor: re-eval take 3 (wheel-only vllm) — DONE/FAIL + empties
+- Monitor: v5 nf4 load + first Tier-A prompt timing
+- Monitor: v5 nf4 (monkeypatch) load + first prompt
+- Monitor: v5 nf4 2-stage monkey-patch — load or fail
+- Monitor: v5 nf4: load + Tier-A start + first gen timing or error
+- Monitor: v5 nf4 (patch 4): load + Tier-A first prompt or new error
+- Monitor: pod reeval chain end (ALL REEVAL DONE) — fires once on completion
+- CronCreate 17,47 * * * *: [chain-watch] Pod 36755693 post-round1 chain status check. Concise (≤10 lines): 
+- Monitor: v5 nf4 (checkpointed): load + first ckpt write
+- CronCreate 3,33 * * * *: [v5-autowatch] Solidpc v5-code NF4 mapping autonomous status + restart.  Steps: 
+- Monitor: chain script progresses past Phase 0 into round-2
+- Monitor: chain Phase 0 → Phase 1 transition (round-1 detected → round-2 starts)
+- Monitor: 31B pipeline: quant progress, eval start, errors, OOM, completion
+- Monitor: 31B eval second attempt: vLLM ready or fresh crash
+- Monitor: 31B eval retry — wait for vLLM ready + first template start
+- Monitor: 31B TP=2 eval — first vLLM ready + first template start, or new crash
+- Monitor: vLLM ready or DONE markers in fix_a log
+- Monitor: vLLM source build done or fail
+- Monitor: arc no-parser run completion
+- Monitor: 31B vLLM boot — ready or fail
+- ScheduleWakeup: checking he1-v2 phase [2/4] prune completion (~20 min for 4 layers on 2x3090) an
+- ScheduleWakeup: catch he1v2 phase [3/4] NVFP4A16 quant start + first HE samples on solidpc v5c
+- ScheduleWakeup: catch v5h-tb10 gsm8k_30 smoke result + he1v2 phase 3 NVFP4A16 quant start on pod
+- Monitor: poll council until completed
+- Monitor: poll council until completed (re-arm)
+- Monitor: poll council until completed (extended)
+- Monitor: v5h-tb10 gsm8k_30 result + recook log final state
+- ScheduleWakeup: check v5h-tb10 HE-164 mid-run + he1v2 pod NVFP quant phase start + council if st
+- Monitor: poll council until completed (3rd re-arm)
+- Monitor: poll council until completed (4th re-arm)
+- ScheduleWakeup: catch v5h-tb10 HE-164 result + he1v2 canary 2nd prompt + council if alive
+- Monitor: v5h tb10 HE-164 results landing + bash idle (SIGKILL trigger)
+- ScheduleWakeup: Wake ~16:55: HE-164 expected complete, Monitor fired, GPU free → launch tb15 bui
+- Monitor: v5-fixed JSON regen completion → launch smoke-first orchestrator
+- CronCreate 7,37 * * * *: [v5-watch] v5-fixed regen pid 298214 status check. Concise (≤8 lines): 1) `ps -o
+- CronCreate 13,43 * * * *: [v5fixed-orchestrator-launch] Auto-launch smoke-first orchestrator when v5-fixed
+- ScheduleWakeup: checking tb10 smoke gsm8k_30 result (expert_drop ~5 min left + nvfp4a16 quant ~1
+- ScheduleWakeup: tb10 smoke ETA ~7 min from now (11 reqs × ~60s × 0.5 concurrent), checking score
+- ScheduleWakeup: tb15 smoke ETA ~18-22 min (vLLM warmup ~3 min + 30 reqs × ~60s × 0.5 concurrency
+- CronCreate 21,51 * * * *: [sweep-handoff] Sweep auto-launch gate. Run ONE check per fire, ≤6 lines.  Idemp
+- ScheduleWakeup: HE-164 on tb15 expected to finish around 07:30 (current pace 24s/sample × 101 re
+- ScheduleWakeup: HE-164 ETA ~14 min (17 left × ~50s); checking pass@1 score after completion and 
+- ScheduleWakeup: first sweep variant A2_lp4_uni ETA: build ~5 min + quant ~12 min + gsm8k_30 ~28 
+- ScheduleWakeup: A2 gsm8k_30 finishing soon (1 req left) + HE-1 + LCB-1 (~7 min total) + A3 build
+- ScheduleWakeup: A3 ETA: build 5m + quant 12m + gsm8k 28m ≈ 45 min from now; catch A3 gsm8k score
+- ScheduleWakeup: A3 HE-1 + LCB-1 (~6 min) + A4 build (~20 min) + A4 gsm8k (~28 min); next-variant
+- Monitor: build_diff_corpus.py progress + termination
+- ScheduleWakeup: Check sweep progress: ~28 min should advance variants 3→5 of 13 (A4 finish + A5/
+- ScheduleWakeup: Re-establish sweep check cadence after client restart. Current variant A5 in gsm
+- Monitor: T19 sweep — variant boundaries + per-bench scores + failures
+- ScheduleWakeup: Next variant boundary: A5 LCB-1 wraps ~11:35, B1 build/quant/smokes ~35-50 min; 
+- ScheduleWakeup: B1 ETA TSV-row ~12:20; B2 should be mid-build by 12:27. +28 min lands in B2 quan
+- ScheduleWakeup: B2 gsm now in progress; +28 min should land mid-B3 smokes — math-emphasis weight
+- ScheduleWakeup: B2 wrapping ~13:10; B3_max_tgtheavy starts after, +28 min lands mid-B3 smokes wi
+- Monitor: v5fixed T18 longer-smoke progress + score lines
+- Monitor: v4 baseline longer-smoke progress + score lines
+- Monitor: v5-coder C1 build phases (drop_map → expert_drop → NVFP4A16 quant)
+- Monitor: v5-coder C1 longer-smoke progress + score lines
+- Monitor: v5-coder C1 code-heavy triad progress + score lines
+- Monitor: v5-coder C1 smoke triad — gsm/HE-30/LCB-15 progress + scores
+- Monitor: v5coder C1 HE+/30 + LCB-15 smoke progress
+- Monitor: LCB-15 final problem + smoke summary
+- Monitor: C2 build progress (expert_drop + quant)
+- Monitor: C2 HE+/30 + LCB-15 progress + summary
+- Bash (background): Determine shard-to-layer mapping, fix eval scores, hash base + he125-S in parall
+- Monitor: he1-it shard1 upload progress + base hash completion
+- Monitor: Pod SSH readiness
+- Monitor: Diff script completion
+- Monitor: Pod 36928660 SSH readiness (re-arm)
+- Monitor: Pod 36929284 SSH readiness
+- Monitor: Pod 36929284 prep completion
+- Monitor: Pod env setup completion + T23 humanevalplus_30 completion
+- Monitor: C5 build complete + smoke triad ready trigger
+- Monitor: C5 smoke gsm8k completion + tokens-vs-v4
+- Monitor: Pod env install completion + readiness
+- Monitor: C6 pod build chain — phases + DONE
+- Monitor: Pod 36932551 SSH ready + auto-bootstrap
+- Monitor: C6 chain resume — NVFP quant + gsm8k smoke
+- Monitor: Modelopt fix DONE + C6 chain auto-resume on pod 36929284
+- Monitor: Pod 36933229 SSH ready (Norway, gpt-oss target)
+- Monitor: Pod 36933568 Thailand SSH ready + auto-bootstrap
+- Monitor: C6 chain — NVFP4A16 quant + gsm8k smoke completion
+- Monitor: Thailand pod 36933568 SSH-ready (10-min cadence)
+- Monitor: C6 retry quant with expandable_segments + gsm8k smoke
+- Monitor: Pod 36934326 UK boot + auto-start + SSH ready
+- Monitor: Pod 36934326 UK — transitions only + auto-start
+- Monitor: C7 solidpc build + auto-smoke gsm8k
+- Monitor: Texas pod 36935014 SSH ready + auto-start (transitions only)
+- Monitor: gpt-oss-20b bootstrap on pod 36936278 (state transitions + DONE markers)
+- Monitor: C8 NVFP4A16 ready → auto-launch gsm8k smoke (solidpc)
+- Bash (background): Fix omk env install on pod: torch first, then requirements
+- Monitor: Pod 36936278 omk env fix → continue bootstrap when ready
+- Monitor: C9-steeper NVFP4A16 ready → auto-launch gsm8k smoke (solidpc)
+- Monitor: C9-flatter NVFP4A16 ready → auto-launch gsm8k smoke (solidpc)
+- Monitor: C10-gini NVFP4A16 ready → auto-launch gsm8k smoke (solidpc)
+- CronCreate 7,22,37,52 * * * *: Periodic 15-min pipeline check. For each of the three active pipelines, report a
+- Monitor: C6 local rebuild → auto-launch topk-only knob smoke (solidpc)
+- Monitor: solidpc T18 transfer-knob smoke verdict
+- Monitor: v5 bf16 build + shared knob apply
+- CronCreate 11,41 * * * *: Periodic 30-min pipeline check. For each ACTIVE pipeline, report a one-line stat
+- Monitor: Pod 36929284 vLLM restart progress
+- Monitor: vLLM health then launch v5 publish
+- Monitor: v5-coder quant chain on pod 36929284 — key milestones
+- Monitor: Pod 36986767 bootstrap + v5-coder chain progress (TX 4090)
+- Monitor: USA pod 36986767: transfer + quant chain + ARC rescore milestones
+- ScheduleWakeup: Wait for vllm 0.20.2 + transformers 5.8.1 reinstall on TX pod (pip resolve + dep
+- ScheduleWakeup: 30-min check: probe1 alpha sweep IFEval-100 progress on solidpc (5 runs × ~30-60
+- ScheduleWakeup: Wait for torch 2.11.0+cu128 install on TX pod (~3 min download + install). Then 
+- ScheduleWakeup: Wait for rsync to finish (~2-3 min remaining for ~3GB source) then kick off pip 
+- CronCreate 53 13 18 5 *: Probe 1 α=1.00 should be near-finished or done. Check `cat /srv/dev-disk-by-uuid
+- Monitor: Probe1 α=1.00 SCORE land → handoff to probe2 (10-q subset for α=1.05..1.20)
+- ScheduleWakeup: Pod boot typically ~3 min; check then trigger bootstrap.
+- ScheduleWakeup: Pod still loading (image pull ~7GB); 4 min should be sufficient before retry.
+- ScheduleWakeup: Image pull is slow but not abandoned; give 5 more min before considering destroy
+- ScheduleWakeup: L40 image pull typically ~3-5 min; check at 4 min mark.
+- ScheduleWakeup: torch + requirements + vllm install typically 8-12 min on a fresh pod; check at 
+- ScheduleWakeup: v5 ifeval_10probe needs ~60-90s vllm boot + ~6-10 min eval; check at 4 min to co
+- ScheduleWakeup: eval 4/10 done at ~30s/item average; need ~3min more + parse step. Check at 4 mi
+- ScheduleWakeup: Multi-front: L40 chain (v5 ifeval_100 ~35/100, ETA 45min); pod 36949547 v5-it (e
+- Bash (background): Pull v5-coder NVFP4A16 to solidpc
+- Monitor: Solidpc v5-coder vllm boot — ready or fail
+- Monitor: L40 31B-it vllm boot — ready or fail
+- Monitor: Solidpc v5-coder: lm-eval execution start or fail
+- Monitor: L40 31B-it: lm-eval execution start or fail
+- Monitor: Solidpc v5-coder ARC final score
+- Monitor: L40 31B-it ARC final score
+- Monitor: Pod v5-it GGUF chain exit (any status)
+- Monitor: v5 suite first bench (GPQA) — score or fail
+- Monitor: Pod 37019170 SSH ready
+- Monitor: L40 31B-it ARC final score (re-armed, ~5min ETA)
+- Monitor: Pod v5-it GGUF chain exit (re-armed)
+- Monitor: Pod 37019170 SSH ready (post-reboot)
+- Monitor: Pod 37020050 Poland SSH ready
+- Monitor: Poland pod bootstrap complete (llama.cpp + omk env)
+- Monitor: Poland pod bootstrap DONE (strict)
+- Monitor: pod 37020050 bootstrap completion marker
+- Monitor: pod 37020050 llama.cpp sm_86 build completion
+- Monitor: pod 37020050 bootstrap full completion (conda env)
+- Monitor: pod 37020050 v5-coder HE+ 10q smoke completion
+- Monitor: HE+ sweep per-tier completion + summary
+- Monitor: HE+ sweep v2 per-tier completion (Q4_K_M last)
+- Monitor: v5-it ollama recovery push per-tier + completion
+- Monitor: 128e pull completion on pod 36949547
+- Monitor: HE+ sweep v2 per-tier completion (re-armed)
+- Monitor: 128e pull completion on pod 36949547 (run 2)
+- Monitor: v5-coder CD rebuild: per-tier completion + SHA guard + upload result
+- Monitor: Pod 37020050: HE+ sweep per-tier completion (CD + 2-bit)
+- Monitor: Pod 36949547: v5-coder CD ollama re-push per-tag
+- Monitor: CD-Q4 canary milestones on pod 37020050
+- ScheduleWakeup: Long fallback heartbeat while CD-Q4 canary cooks; monitor should fire first with
+- Monitor: v5-it CD rebuild milestones on pod 36949547
+- ScheduleWakeup: 25 min — canary HE+ should be near-complete by then; v5-it should be deep in ima
+- Monitor: v5-it Q2_K comparison on solidpc
+- Monitor: CD-Q4 canary final score (re-armed after timeout)
+- Monitor: T63 v5-it Q2_K compare on solidpc
+- Monitor: v5-coder 3-bit sweep DONE events on pod 36949547
+- Monitor: T64 3-bit per-10q content sanity (collapse alarm)
+- Monitor: T64 3-bit per-10q content sanity (collapse alarm) — fixed table/decoder
+- Monitor: T63 v5-it CD-Q2_K vs Q2_K — final DONE event + content sanity
+- Monitor: T64 v5-coder 3-bit sweep per-tier events
+- Monitor: CD-Q4 canary v2 — final score + collapse signals
+- Monitor: T63 v5-it Q2_K compare — re-armed, DONE event
+- Monitor: T64 sweep tier events (re-armed)
+- Monitor: T65 v5-it CD rebuild per-tier events
+- Monitor: T66 v5-coder 2-bit sweep tier events
+- Monitor: Canary X — final score + collapse signals
+- Monitor: Canary Y CD-IQ4_K_M — final score + collapse signals
+- Bash (background): Wait for T66 SWEEP DONE on solidpc
+- Bash (background): Wait for Canary Y DONE on pod 20050
+- Bash (background): Wait for Canary Z DONE
+- Bash (background): Arm watcher for T68 terminal events
+- Bash (background): Arm refined T68 watcher
+- Bash (background): Re-arm T68 watcher on the new log
+- Bash (background): Watcher for L40 llama.cpp build completion
+- Monitor: Canary V′ phase transitions on pod 37006213
+- Monitor: 3090 CD-mix sweep recipe completions
+- CronCreate 7,37 * * * *: Pod + pipeline watchdog tick (every 30m, fires at :07 and :37).  **Active pods (
+- Monitor: L40 V′ + 3090 CD-mix sweep results landing
+- Monitor: CD-mix v3 results — L40 V′ + 3090 sweep
+- CronCreate 7,37 * * * *: **PASSIVE WATCHDOG — REPORT ONLY, DO NOT INTERVENE.**  This tick must NOT kill a
+- Monitor: CD-mix scores landing — L40 Wave 1+2 + 3090 Wave 1+2
+- Monitor: L40 publish chain milestones: per-recipe upload + F16 + completion
+- Monitor: L40 publish chain v2 milestones (corrected _L names)
+- Monitor: L40 ollama push milestones — per-tag download + create + push
+- Monitor: T71 hybrid build progress — per-tier quant/upload/ollama milestones
+- Monitor: IQ2 smoke chain — per-tier download/start/pass@1/done
+- Monitor: T71 hybrid build progress v2 — per-tier events + stall detection
+- Monitor: T72 tier 1 build (CD-IQ3_XS_h) — fires when GGUF lands
+- Monitor: IQ2 full HE+ chain — per-tier score completion
+- Monitor: T72 tier 1 full HE+ 164q (CD-IQ3_XS_h) — fires when score lands
+- Monitor: T72 tier 2 CD-IQ3_M_h build → smoke → full HE+ on L40
+- Monitor: T72 tier 2 CD-IQ3_M_h smoke + full HE+ on L40 — fires on score line
+- Monitor: T72 tier 2 smoke→full HE+ chain — auto-launches full on smoke ≥80%
+- Monitor: T72 tier 3 CD-Q4_K_M_h build→smoke→full chain (uses tmux-exit, not file-size, fo
+- Monitor: T72 tier 4 CD-Q5_K_M_h chain — build → smoke → full HE+ on L40
+- ScheduleWakeup: v3 producer rebuild — check first 4-5 Tier-A prompts on pod 36949547 for hot-pat
+- ScheduleWakeup: he1 v2 GGUF chain — check bf16 download completion + F16 convert + imatrix start
+- ScheduleWakeup: T73.0 v3 producer 60-min routine check + he1v2 GGUF chain mid-run check.
+- Monitor: consultants completion
+- CronCreate 19 23 19 5 *: **PASSIVE WATCHDOG — REPORT ONLY, DO NOT INTERVENE.** 23:19 wakeup. Check status
+- CronCreate 58 23 19 5 *: **PASSIVE WATCHDOG — REPORT ONLY, DO NOT INTERVENE.** 23:58 routine 60-min check
+- Bash (background): L40 critical artifacts: imatrix + chain log + watcher log
+- Bash (background): 3090 eval results + sweep log archive
+- Bash (background): L40 canary V′ + t72 + canary W eval results
+- Monitor: v6coder bench completions vs v5-coder
+- Monitor: v6coder spot-check + bench-completion vs v5-coder
+- Monitor: v6coder progress + length stats vs v5-coder
+- Monitor: v6coder bench progress (with sample-fallback length stats)
+- Monitor: v6coder (shared α=1.2) progress vs v5-coder
+- Bash (background): Wait for vLLM ready/fail
+- Monitor: v5-coder gpqa rescore: emit milestones + final score
+- Monitor: v6 chain resume: per-bench score emits
+- Monitor: vLLM sm86 wheel build progress + completion
+- Monitor: vllm sm86 build: object file count + completion detection
+- Monitor: vllm sm86 build (round 2 — no FetchContent): object count + completion
+- Monitor: vllm sm86 build (round 4) — ninja step + completion detection
+
+## 7. Connection state (re-attach targets)
+
+**SSH targets:**
+
+- `claude_test@pandorum`
+- `claude_test@192.168.178.157`
+- `pandorum`
+- `root@192.168.1.157`
+- `manni@192.168.1.157`
+- `192.168.1.157`
+- `claude_test@192.168.1.157`
+- `2222`
+- `claude_test@192.168.178.157"`
+- `root@ssh7.vast.ai`
+- `else`
+- `root@{ssh[0][\"ip\"]}`
+- `root@142.169.249.42`
+- `root@142.169.249.42"`
+- `--direct`
+- `root@185.113.120.195`
+- `root@ssh1.vast.ai`
+- `root@ssh2.vast.ai`
+- `root@ssh7.vast.ai:/workspace/phase1.log`
+- `root@ssh2.vast.ai:"/workspace/tensor_types_CD-Q6_K.txt`
+- `root@ssh7.vast.ai:/workspace/humaneval_probe/`
+- `root@ssh7.vast.ai:'/workspace/humaneval_Qwen3.5-27B-*/'`
+- `exit`
+- `session`
+- `--label`
+- `root@ssh9.vast.ai`
+- `root@ssh9.vast.ai:/workspace/gguf/Qwen3.6-27B-Omnimerge-v3a-Q6_K.gguf`
+- `root@ssh9.vast.ai:/workspace/gguf/Qwen3.6-27B-Omnimerge-v3b-Q6_K.gguf`
+- `root@ssh9.vast.ai"`
+- `root@ssh3.vast.ai"`
+- `test`
+- `probe`
+- `26544`
+- `root@ssh3.vast.ai`
+- `root@ssh3.vast.ai:/workspace/scripts/`
+- `root@$HOST`
+- `root@ssh8.vast.ai:/workspace/scripts/`
+- `root@ssh5.vast.ai`
+- `root@ssh5.vast.ai:/workspace/eval/128e_vllm_tp4_bf16_v2/{mbpp,humaneval}/128e/samples_*.jsonl`
+- `root@ssh5.vast.ai:/workspace/eval/128e_vllm_tp4_bf16_v3_he_only/humaneval/128e/samples_*.jsonl`
+- `details`
+- `root@ssh5.vast.ai:/workspace/eval/98e_vllm_tp4_bf16_v3/mbpp/98e/samples_mbpp_2026-05-01T18-41-09.694146.jsonl`
+- `'root@ssh5.vast.ai:/workspace/eval/98e_vllm_tp4_bf16_v3/humaneval/98e/samples_*.jsonl'`
+- `root@ssh5.vast.ai"`
+- `root@59.138.98.106`
+- `root@32.197.205.81`
+- `root@ssh2.vast.ai"`
+- `show`
+- `root@$SSHHOST`
+- `pod`
+- `check`
+- `root@ssh'`
+- `to`
+- `root@ssh6.vast.ai`
+- `with`
+- `again`
+- `once`
+- `-o`
+- `exec`
+- `port`
+- `solidpc`
+- `--delete`
+- `info`
+- `pod36755693`
+- `pod-36755693`
+- `root@23.158.136.85"`
+- `root@23.158.136.85`
+- `root@ssh4.vast.ai`
+- `root@ssh4.vast.ai:/workspace/eval_results/gpt_oss_canonical/`
+- `root@ssh4.vast.ai:/workspace/logs/gpt_oss_canonical_*/`
+- `$POD_USER@$POD_HOST"`
+- `root@ssh1.vast.ai"`
+- `root@ssh8.vast.ai`
+- `key`
+- `China`
+- `root@149.36.0.84`
+- `root@ssh3.vast.ai:/workspace/backup_models/logs/`
+- `root@ssh3.vast.ai:/workspace/backup_models/eval_results_vllm_suite/`
+- `root@$TX_HOST`
+- `root@$CANON_HOST`
+- `stdin`
+- `root@82.141.118.37`
+- `root@82.141.118.37"`
+- `root@70.34.245.103`
+- `root@216.81.247.106`
+- `--raw`
+- `disconnect`
+- `root@141.193.211.34`
+- `"root@$host"`
+- `root@213.173.108.94`
+- `root@ssh6.vast.ai"`
+- `root@ssh4.vast.ai"`
+- `root@{d.get('ssh_host')}\")`
+- `root@95.217.114.135`
+- `root@$host`
+- `root@pod36949547`
+- `root@$L40_HOST`
+- `root@$P3090_HOST`
+
+**URLs mentioned:**
+
+- https://github.com/QuixiAI/laserRMT
+- https://github.com/EleutherAI/shortgpt
+- https://github.com/MingxuanZhangPurworworworwordue/ShortGPT
+- https://github.com/yangjianxin1/LaCo
+- https://github.com/microsoft/TransformerCompression
+- https://github.com/jiwonsong-dev/SLEB
+- https://github.com/pratyushasharma/laser
+- https://github.com/cognitivecomputations/laser-rmt
+- https://github.com/anthropics/claude-code/issues
+- https://huggingface.co/datasets/Idavidrein/gpqa
+- https://json-schema.org/draft/2020-12/schema
+- https://json.schemastore.org/claude-code-settings.json
+- https://*.example.com/*\
+- https://hooks.example.com/*\
+- https://
+- https://huggingface.co/blog/gemma4
+- https://github.com/EleutherAI/lm-evaluation-harness
+- https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/gpqa/cot_zeroshot/_gpqa_cot_zeroshot_yaml
+- https://github.com/EleutherAI/lm-evaluation-harness/issues/3430
+- https://github.com/ggml-org/llama.cpp/issues/21388
+- https://github.com/ggml-org/llama.cpp/issues/21321
+- https://github.com/ggml-org/llama.cpp/issues/21365
+- https://huggingface.co/nvidia/Gemma-4-31B-IT-NVFP4
+- https://arxiv.org/abs/2503.19786
+- https://deepmind.google/blog/gemma-4-byte-for-byte-the-most-capable-open-models/
+- https://artificialanalysis.ai/models/gemma-4-31b
+- http://localhost:8099
+- https://gist.github.com/bartowski1182/82ae9b520227f57d79ba04add13d0d0d
+- https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+- https://huggingface.co/bartowski/google_gemma-4-26B-A4B-it-GGUF
+
+**IP addresses:**
+
+- `192.168.178.157`
+- `192.168.178.2`
+- `192.168.178.2:21277`
+- `142.169.249.42`
+- `13:04:30`
+- `18:44:03`
+- `01:04:20`
+- `01:04:46`
+- `01:04:56`
+- `185.113.120.195`
+- `10:30:51`
+- `15:19:49`
+- `15:55:49`
+- `16:30:14`
+- `18:10:55`
+- `19:37:50`
+- `20:57:41`
+- `21:11:09`
+- `23:25:50`
+- `16:23:30`
+- `16:26:08`
+- `16:27:40`
+- `16:29:12`
+- `16:30:45`
+- `16:32:19`
+- `16:33:51`
+- `16:36:24`
+- `16:44:06`
+- `16:51:49`
+- `16:53:21`
+
+## 8. Restore checklist
+
+```
+git status -sb
+git log --oneline -10
+# Plans referenced this session:
+# - docs/PLAN-test-coverage.md
+```

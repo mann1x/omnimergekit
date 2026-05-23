@@ -33,7 +33,7 @@ CALIB_SAMPLES=512  # matches 128e/v4 recipe — activates enough MoE experts (n/
 
 source /workspace/miniconda/etc/profile.d/conda.sh
 conda activate modelopt
-export HF_HUB_ENABLE_HF_TRANSFER=1
+export HF_XET_HIGH_PERFORMANCE=1
 export PYTHONDONTWRITEBYTECODE=1
 export HF_TOKEN="${HF_TOKEN:-***REMOVED-DEAD-HF-TOKEN***}"
 

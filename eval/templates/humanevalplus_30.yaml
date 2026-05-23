@@ -1,0 +1,65 @@
+# HumanEval+ 30-problem curated smoke for v5-coder T21 qualification.
+#
+# Subset construction (2026-05-17):
+#   - Source: humaneval_plus_chat (evalplus stricter test suite — 14 v4 fails
+#     vs 5 on plain HE-164; better discriminator).
+#   - Filter A — 128e PASS: every selected problem is solved by the 128e
+#     NVFP4A16 baseline. A candidate FAIL is therefore pruning damage, not a
+#     universally-hard problem.
+#   - Filter B — 128e didn't ruminate: 128e_chars below ~p86 of the
+#     128e-PASS pool. Excludes problems where 128e itself thrashed; if the
+#     base struggled, the pruned variant has no realistic shot, so they're
+#     poor smoke probes.
+#   - Composition: ALL 5 v4-fails with 128e-PASS (indices 15, 20, 140, 154,
+#     163) + 25 lowest-128e-chars v4-passes from the 128e-PASS pool.
+#
+# v4 and 128e anchors (computed from existing samples files on disk):
+#   v4   HE+/30 = 25/30 (0.833)   (5 fails: 15, 20, 140, 154, 163)
+#   128e HE+/30 = 30/30 (1.000)
+#
+# Smoke property: any v5-coder candidate that scores >25/30 strictly beats
+# v4 on HE+; ≥25/30 ties. Pruning damage shows up as failures on the 25
+# v4-pass problems. Per-problem audit recommended on borderline.
+#
+# Replaces humaneval_30.yaml (HE-164 stride 30/30 subset, v4=29/30 — no
+# headroom for discrimination).
+name: humanevalplus_30
+backend: lm-eval
+task: humaneval_plus_chat_curated30   # shadow with hardcoded process_docs
+                                       # filter — lm-eval --limit alone would
+                                       # pick first-30 rows, missing the
+                                       # targeted v4-fail probes 140/154/163.
+n: 30
+selection:
+  # type=indices; honored by the SHADOW TASK (process_docs filter), not by
+  # lm-eval --limit. The shadow task humaneval_plus_chat_curated30 hardcodes
+  # these same indices in utils_chat.select_he_plus_curated30; keep them in
+  # sync if you ever re-roll the subset.
+  type: indices
+  indices: [11, 13, 14, 15, 16, 20, 22, 23, 24, 27,
+            28, 30, 34, 35, 42, 45, 47, 48, 49, 52,
+            53, 55, 58, 60, 62, 85, 121, 140, 154, 163]
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: pass_at_1
+  filter: build_predictions
+  validated_against: evalplus/humanevalplus
+  validation_date: "2026-05-17"
+backend_args:
+  lm_eval_include_path: lm_eval_tasks/humaneval_chat
+  apply_chat_template: true
+  num_fewshot: 0
+  batch_size: 1
+  confirm_run_unsafe_code: true
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: humanevalplus_30
+reports:
+  token_stats: true

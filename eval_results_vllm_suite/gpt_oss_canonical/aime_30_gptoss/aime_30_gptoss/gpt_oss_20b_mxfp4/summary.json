@@ -1,0 +1,52 @@
+{
+  "template": "aime_30_gptoss",
+  "model": "gpt_oss_20b_mxfp4",
+  "quant": "unknown",
+  "backend": "vllm",
+  "rc": 0,
+  "samples_file": "eval_results/gpt_oss_canonical/aime_30_gptoss/aime_30_gptoss/gpt_oss_20b_mxfp4/lm_eval_out/gpt_oss_20b_mxfp4/samples_aime24_chat_2026-05-17T13-46-45.522874.jsonl",
+  "score": 0.6,
+  "scores": {
+    "exact_match,none": 0.6
+  },
+  "token_stats": {
+    "n": 30,
+    "prompt_tokens": {
+      "sum": 0,
+      "p10": 0,
+      "p50": 0,
+      "p90": 0,
+      "max": 0
+    },
+    "completion_tokens": {
+      "sum": 0,
+      "p10": 0,
+      "p50": 0,
+      "p90": 0,
+      "max": 0
+    },
+    "thinking_tokens_est": {
+      "method": "len(reasoning_block) // 4",
+      "sum": 0,
+      "p50": 0,
+      "p90": 0,
+      "max": 0,
+      "kinds": {},
+      "ratio_of_completion": 0.0
+    },
+    "completion_chars": {
+      "p10": 0,
+      "p50": 1525,
+      "p90": 2985,
+      "max": 3561
+    },
+    "finish_reasons": {
+      "None": 30
+    },
+    "empty_completions": 7
+  },
+  "sanity_warnings": [
+    "too many empty completions: 7",
+    "p10 completion length 0 < 60 chars"
+  ]
+}

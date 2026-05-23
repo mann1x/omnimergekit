@@ -113,7 +113,7 @@ echo "  extra:       ${EXTRA_ARGS[*]:-(none)}"
 
 # --- download source weights (no GGUF, no imatrix) ---
 echo "[$(date -Iseconds)] downloading source weights ..."
-HF_HUB_ENABLE_HF_TRANSFER=1 \
+HF_XET_HIGH_PERFORMANCE=1 \
     hf download "$SOURCE" \
         --local-dir "$SRC_DIR" \
         --exclude '*.gguf' --exclude 'imatrix.dat'
@@ -191,7 +191,7 @@ EOF
 # --- upload ---
 echo "[$(date -Iseconds)] creating HF repo (if missing) + uploading ..."
 hf repo create "$TARGET" --type model -y 2>&1 | tail -3 || true
-HF_HUB_ENABLE_HF_TRANSFER=1 hf upload "$TARGET" "$MLX_DIR" . \
+HF_XET_HIGH_PERFORMANCE=1 hf upload "$TARGET" "$MLX_DIR" . \
     --commit-message "MLX-${BITS}bit (${BACKEND}) conversion of $SOURCE"
 
 echo "[$(date -Iseconds)] === DONE ==="

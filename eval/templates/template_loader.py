@@ -41,7 +41,13 @@ except ImportError:  # pragma: no cover
 
 REPO_TEMPLATES_DIR = Path(__file__).resolve().parent
 KNOWN_BACKENDS = {"lm-eval", "lcb_custom"}
-KNOWN_SELECTION_TYPES = {"indices", "filter"}
+# Selection types:
+#   indices  — list[int] honored by the runner (or baked into a shadow task
+#              via process_docs for lm-eval which doesn't honor --limit indices)
+#   filter   — runner-side filter (currently lcb_custom: difficulty/min_date)
+#   explicit — lcb_custom only: pinned list of task_ids passed to the shim via
+#              --task-ids. Used by curated smoke subsets.
+KNOWN_SELECTION_TYPES = {"indices", "filter", "explicit"}
 REQUIRED_TOP_LEVEL = {"name", "backend", "task", "n", "selection", "generation", "scoring", "cache"}
 
 
@@ -92,6 +98,26 @@ def validate(t: dict[str, Any], path: Path) -> None:
             for k in ("difficulty", "min_date", "testtype"):
                 if k not in sel:
                     raise SystemExit(f"{path}: lcb_custom filter missing {k!r}")
+    elif sel["type"] == "explicit":
+        # Currently only lcb_custom supports this — explicit task_id list
+        # passed to the LCB shim via --task-ids.
+        if t["backend"] != "lcb_custom":
+            raise SystemExit(
+                f"{path}: selection.type=explicit only supported for "
+                f"backend=lcb_custom (got {t['backend']!r})"
+            )
+        tids = sel.get("task_ids")
+        if not isinstance(tids, list) or not all(isinstance(x, str) for x in tids):
+            raise SystemExit(f"{path}: selection.task_ids must be a list[str]")
+        if t["n"] != len(tids):
+            raise SystemExit(
+                f"{path}: n={t['n']} disagrees with len(task_ids)={len(tids)}"
+            )
+        if len(set(tids)) != len(tids):
+            raise SystemExit(f"{path}: selection.task_ids contains duplicates")
+        for k in ("difficulty", "min_date", "testtype"):
+            if k not in sel:
+                raise SystemExit(f"{path}: lcb_custom explicit missing {k!r}")
 
 
 def load(arg: str) -> dict[str, Any]:

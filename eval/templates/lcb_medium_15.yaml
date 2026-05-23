@@ -1,27 +1,52 @@
-# LCB-medium 15-problem smoke for v5-coder T18 qualification.
-# Filter selects first 15 medium problems since 2024-10-01 by contest_date.
-# This resolves to: lcb/leetcode/{3579, 3566, 3502, 3607, 3593, 3629, 3627,
-# 3639, 3654, 3487, 3587, 3622, 3591, 3647, 3594}.
+# LCB-medium 15-problem curated smoke for v5-coder T21 qualification.
 #
-# v4 and 128e anchors (from existing lcb_medium_55 samples, both on disk):
-#   v4   LCB-15 = 12/15 (0.800)   (fails: 3607, 3487, 3647)
-#   128e LCB-15 = 13/15 (0.867)   (fails: 3607, 3622)
+# Subset construction (2026-05-17 rebuild — replaces the prior
+# "first-15-by-date" formulation which had v4=12/15, too little headroom):
+#   - Filter A — 128e PASS: every selected problem is solved by 128e.
+#   - Filter B — 128e didn't ruminate: 128e completion_chars below p75 of
+#     the 128e-PASS pool (~12 422 chars). Excludes problems where even the
+#     baseline thrashed; those are no fair smoke probes for a pruned model.
+#   - Composition: 6 v4-fails (sorted by 128e_chars ascending — the cleanest
+#     pruning-damage probes) + 9 v4-passes (sorted by 128e_chars ascending
+#     — fast canary problems where 128e + v4 both succeed quickly).
 #
-# Smoke property: candidate FAILs on the 12 v4-pass problems are pure
-# pruning damage. The 3 v4-fail problems (3607, 3487, 3647) are universally
-# harder.
+# v4 and 128e anchors (extracted from LCB-55 lcb_result.json on disk):
+#   v4   LCB-15 = 9/15 (0.600)    (fails: 3487, 3686, 3634, 3720, 3771, 3805)
+#   128e LCB-15 = 15/15 (1.000)
 #
-# Used by T18 qualification of v5-coder candidates (T21). Sits between
-# lcb_medium_5 (canary) and lcb_medium_30 / 55 (full).
+# Smoke property: any v5-coder candidate that scores >9/15 strictly beats
+# v4; ≥9/15 ties. The 6 v4-fail probes are the discriminator; v5-coder
+# winning one or more of them is the meaningful signal.
+#
+# Used by T21 qualification of v5-coder candidates. Sits between
+# lcb_medium_5 (canary, 5q, v4=5/5) and lcb_medium_30 / 55 (full).
 name: lcb_medium_15
 backend: lcb_custom
 task: livecodebench
 n: 15
 selection:
-  type: filter
+  type: explicit
   difficulty: medium
   min_date: "2024-10-01"
   testtype: functional
+  task_ids:
+    # v4-fails (6) — discriminator probes, sorted by 128e_chars
+    - "lcb/leetcode/3634"
+    - "lcb/leetcode/3720"
+    - "lcb/leetcode/3686"
+    - "lcb/leetcode/3487"
+    - "lcb/leetcode/3805"
+    - "lcb/leetcode/3771"
+    # v4-passes (9) — clean reference points, sorted by 128e_chars
+    - "lcb/leetcode/3639"
+    - "lcb/leetcode/3764"
+    - "lcb/leetcode/3627"
+    - "lcb/leetcode/3785"
+    - "lcb/leetcode/3566"
+    - "lcb/leetcode/3795"
+    - "lcb/leetcode/3649"
+    - "lcb/leetcode/3809"
+    - "lcb/leetcode/3751"
 generation:
   max_gen_toks: 16384
   thinking_token_budget: 12288

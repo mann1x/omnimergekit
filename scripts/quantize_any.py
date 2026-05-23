@@ -566,9 +566,15 @@ def main() -> None:
 
     Path(args.dst).mkdir(parents=True, exist_ok=True)
     cmd = [python_bin, "-c", snip]
-    # LD_PRELOAD harmless if not present
+    # LD_PRELOAD: cloud pods bundle a private libstdc++ in the modelopt env to
+    # work around the pytorch image's older system libstdc++ (vast.ai etc).
+    # solidpc / hosts where conda env has no private libstdc++ would print
+    # six `cannot be preloaded: ignored.` warnings per run — harmless but
+    # noisy. Set the preload only when the file actually exists.
     env = dict(os.environ)
-    env["LD_PRELOAD"] = env.get("LD_PRELOAD", f"{env_path}/lib/libstdc++.so.6")
+    preload = f"{env_path}/lib/libstdc++.so.6"
+    if "LD_PRELOAD" not in env and Path(preload).exists():
+        env["LD_PRELOAD"] = preload
     print(f"[quantize_any] $ {python_bin} -c <snippet>")
     sys.exit(subprocess.call(cmd, env=env))
 

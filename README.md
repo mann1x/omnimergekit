@@ -15,7 +15,8 @@ Tools for **model merging**, **expert pruning**, **differential competence-map e
 | `eval/` | Eval drivers — GPQA Diamond, LiveCodeBench (lcb_llama_server.py), HE/MBPP rescore-with-fence-strip helpers. |
 | `recipes/` | End-to-end pipelines: 4B MicroCoder series, Gemma 4 109e/98e/120e/128e, 27B Omnimerge. |
 | `pod/` | RunPod / Vast.ai helpers (setup, parallel run, retrieve, README publish). |
-| `docs/` | Method docs, experiment journals, recipe deep-dives. |
+| `scripts/` | Ollama publish (`ollama_push_*.sh`, `ollama_backfill_latest.sh`) and inspection (`ollama_inspect_model.py` — pulls GGUF metadata + layers from registry.ollama.ai / ollama.com for any published model). See `docs/OLLAMA_TOOLING.md`. |
+| `docs/` | Method docs, experiment journals, recipe deep-dives. See `V6_CODER_INVESTIGATION.md` for the v5-coder vs v6-coder regression analysis and C11 recipe path. |
 | `experiments/` | Per-experiment notebooks / logs. |
 
 ## Two recipes you'll actually use

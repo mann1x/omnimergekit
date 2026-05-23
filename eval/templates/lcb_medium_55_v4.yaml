@@ -50,3 +50,14 @@ cache:
   sqlite_prefix: lcb_med_55_v4
 reports:
   token_stats: true
+dependencies:
+  python_modules: [datasets]
+# Per-engine override: on llama.cpp the bench-defaults heuristic for "coding"
+# benches returns `--jinja --reasoning off`. On pruned variants (v4/v5/v6-coder)
+# this triggers rumination loops (0/5 EARLY ABORT on v6-coder 2026-05-23).
+# Replace with the parser+budget recipe — same forcing function vLLM uses.
+backend_overrides:
+  llama:
+    backend_args:
+      llama_extra_replace: true
+      llama_extra: ["--reasoning-format", "deepseek", "--reasoning-budget", "12288"]

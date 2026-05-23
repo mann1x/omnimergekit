@@ -1,0 +1,38 @@
+# humaneval_plus_chat_curated30 — chat-aware HE+ filtered to 30 specific
+# indices. Inherits all behaviour from humaneval_plus_chat (chat-mode filter,
+# pass@1 metric, extract_chat builder); the only difference is process_docs
+# pre-selects the curated 30 indices baked into utils_chat.select_he_plus_curated30.
+# Without process_docs, lm-eval `--limit 30` just takes first-30 rows, which
+# would miss our targeted v4-fail probes (HE+/140, /154, /163).
+#
+# Subset composition + anchors documented in
+# eval/templates/humanevalplus_30.yaml.
+task: humaneval_plus_chat_curated30
+dataset_path: evalplus/humanevalplus
+unsafe_code: true
+output_type: generate_until
+test_split: test
+process_docs: !function utils_chat.select_he_plus_curated30
+doc_to_text: "Write a complete Python function that solves the following problem. Output ONLY the function code inside a single ```python ... ``` markdown block.\n\n```python\n{{ prompt }}\n```"
+doc_to_target: "{{test}}\ncheck({{entry_point}})"
+generation_kwargs:
+  until:
+    - "\n```"
+    - "</s>"
+    - "<|endoftext|>"
+  max_gen_toks: 4096
+  do_sample: false
+metric_list:
+  - metric: !function utils_chat.pass_at_k
+    aggregation: mean
+    higher_is_better: true
+    k: [1]
+repeats: 1
+num_fewshot: 0
+filter_list:
+  - name: "extract_chat"
+    filter:
+      - function: "custom"
+        filter_fn: !function utils_chat.build_predictions_chat
+metadata:
+  version: 1.0

@@ -1,0 +1,53 @@
+{
+  "template": "lcb_medium_55_gptoss",
+  "model": "gpt_oss_20b_mxfp4",
+  "quant": "unknown",
+  "backend": "vllm",
+  "rc": 0,
+  "samples_file": "eval_results/gpt_oss_canonical/lcb_medium_55_gptoss/lcb_medium_55_gptoss/gpt_oss_20b_mxfp4/lcb_result.samples.jsonl",
+  "score": 0.8909090909090909,
+  "scores": {
+    "pass_at_1": 0.8909090909090909,
+    "n_pass": 49,
+    "n": 55
+  },
+  "token_stats": {
+    "n": 1,
+    "prompt_tokens": {
+      "sum": 299,
+      "p10": 299,
+      "p50": 299,
+      "p90": 299,
+      "max": 299
+    },
+    "completion_tokens": {
+      "sum": 530,
+      "p10": 530,
+      "p50": 530,
+      "p90": 530,
+      "max": 530
+    },
+    "thinking_tokens_est": {
+      "method": "len(reasoning_block) // 4",
+      "sum": 0,
+      "p50": 0,
+      "p90": 0,
+      "max": 0,
+      "kinds": {},
+      "ratio_of_completion": 0.0
+    },
+    "completion_chars": {
+      "p10": 2255,
+      "p50": 2255,
+      "p90": 2255,
+      "max": 2255
+    },
+    "finish_reasons": {
+      "stop": 1
+    },
+    "empty_completions": 0
+  },
+  "sanity_warnings": [
+    "sample count 1 != expected 55"
+  ]
+}
