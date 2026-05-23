@@ -53,6 +53,16 @@ except ImportError:
         score_lcb_problem,
     )
 
+# Shared sqlite response cache (eval/cache_sqlite.py, one dir up). Optional:
+# when present + --cache-db given, sqlite is the durable resume store
+# (2026-05-23 "all evals resume through sqlite" directive). Degrades to the
+# legacy jsonl resume if the module is unavailable (e.g. a stripped pod).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+try:
+    from cache_sqlite import SqliteResponseCache  # noqa: E402
+except Exception:
+    SqliteResponseCache = None
+
 
 def chat_complete(base_url: str, model: str, prompt: str, max_tokens: int,
                   timeout: float = 600.0,
@@ -168,6 +178,12 @@ def main():
                          "Re-runs skip problems already cached here.")
     ap.add_argument("--no-resume", action="store_true",
                     help="Ignore existing cache; regenerate every problem.")
+    ap.add_argument("--cache-db", default=None,
+                    help="Sqlite resume DB path (omk_eval passes "
+                         "<out_dir>/sqlite_cache/<prefix>_<tag>.db). When set, "
+                         "sqlite is the durable resume store keyed by task_id; "
+                         "the .samples.jsonl is still written as the scoring "
+                         "artifact. Omit for standalone jsonl-only resume.")
     ap.add_argument("--thinking-budget", type=int, default=0,
                     help="vLLM thinking_token_budget cap (0=disabled). Mandatory "
                          "for Gemma 4 + --reasoning-parser gemma4 — without it "
@@ -206,11 +222,23 @@ def main():
         print("[lcb] no problems loaded; aborting", file=sys.stderr)
         sys.exit(2)
 
-    cache = {} if args.no_resume else load_cache(cache_path)
+    # Resume store. Directive (2026-05-23): all evals resume through sqlite.
+    # When --cache-db is given (omk_eval always passes it) sqlite is the durable
+    # source of truth; the .samples.jsonl is still written as the scoring /
+    # inspection artifact. Without --cache-db (bare CLI / legacy pod) fall back
+    # to the jsonl resume so the runner still works standalone.
+    scache = None
+    if args.cache_db and SqliteResponseCache is not None:
+        scache = SqliteResponseCache(args.cache_db)
+        cache = {} if args.no_resume else {k: scache[k] for k in scache.keys()}
+        store = "sqlite"
+    else:
+        cache = {} if args.no_resume else load_cache(cache_path)
+        store = "jsonl"
     if cache:
-        print(f"[lcb] resume: {len(cache)} problem(s) already cached at {cache_path}")
+        print(f"[lcb] resume: {len(cache)} problem(s) already cached ({store})")
 
-    cache_fp = cache_path.open("a")  # append mode preserves prior cache lines
+    cache_fp = cache_path.open("a")  # append mode preserves prior cache lines (artifact)
 
     n_pass = 0
     per_problem = []
@@ -293,7 +321,9 @@ def main():
         }
         cache_fp.write(json.dumps(rec) + "\n")
         cache_fp.flush()
-        os.fsync(cache_fp.fileno())  # crash-safe: don't lose results on SIGKILL
+        os.fsync(cache_fp.fileno())  # crash-safe artifact
+        if scache is not None:
+            scache[tid] = rec        # durable resume store (sqlitedict autocommit)
 
         per_problem.append({
             "task_id": tid,

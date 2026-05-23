@@ -1,0 +1,46 @@
+# LiveCodeBench-medium-100 — a strict SUPERSET of lcb_medium_55 (contains all 55).
+#
+# 100 = canonical 55 (medium + functional + contest_date >= 2024-10-01) + 45
+# earliest extras (post-2023-06). The exact ids are pinned in
+# eval/lcb/lcb_medium_100_taskids.json (built by build_lcb100_taskids.py) so the
+# set is byte-identical across all models (fair cross-model compare) and stable
+# across machines. Regenerate the id file only with an explicit decision — it
+# defines the bench.
+#
+# Recipe = lcb_medium_55 (128e / UNPRUNED): NO reasoning parser; the model
+# reasons inline as compact prose and emits a single clean ```python``` block.
+# Pruned variants (v5/v6-coder) use lcb_medium_100_v4.yaml instead.
+#
+# Sampler is GREEDY (frozen, per CLAUDE.md) for cross-cohort comparability.
+# NOTE: the relaxed date window pulls in pre-2024-10 problems → mild
+# contamination risk; acceptable because the set is identical across the cohort.
+name: lcb_medium_100
+backend: lcb_custom
+task: livecodebench
+n: 100
+selection:
+  type: filter
+  difficulty: medium
+  min_date: "2023-06-01"        # must cover the +45 extras; task_ids pin the set
+  testtype: functional
+  task_ids_file: eval/lcb/lcb_medium_100_taskids.json
+generation:
+  max_gen_toks: 16384
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 1200
+scoring:
+  scorer: lcb_helpers
+backend_args:
+  apply_chat_template: true
+  # NO parser, NO enable_thinking — matches the 128e lcb_medium_55 recipe.
+  vllm_default_chat_template_kwargs: {enable_thinking: false}
+  num_concurrent: 2
+cache:
+  sqlite_prefix: lcb_med_100
+reports:
+  token_stats: true
+dependencies:
+  python_modules: [datasets]

@@ -59,6 +59,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATES_DIR = REPO_ROOT / "eval" / "templates"
 LCB_DIR = REPO_ROOT / "eval" / "lcb"
+MPE_DIR = REPO_ROOT / "eval" / "multipl_e"
 
 
 def log(msg: str) -> None:
@@ -324,7 +325,7 @@ def llama_bench_defaults(task: str) -> list[str]:
     `backend_args.llama_extra`.
     """
     t = (task or "").lower()
-    if any(s in t for s in ("humaneval", "mbpp", "livecodebench", "lcb")):
+    if any(s in t for s in ("humaneval", "mbpp", "livecodebench", "lcb", "multipl")):
         return ["--jinja", "--reasoning", "off"]
     # Reasoning + IFEval + arithmetic + classification: Gemma 4 always emits
     # CoT on these, and without --reasoning-format deepseek the chat parser
@@ -554,6 +555,19 @@ def dispatch_lcb(template: dict, model_tag: str, base_url: str,
     g = template["generation"]
     sel = template["selection"]
     ba = template.get("backend_args", {}) or {}
+    # Sqlite resume DB (2026-05-23 "all evals resume through sqlite" directive).
+    # Same convention as the lm-eval backend's sqlite_cache/ dir.
+    cache_dir = out_dir / "sqlite_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_prefix = template.get("cache", {}).get("sqlite_prefix", template["name"])
+    cache_db = cache_dir / f"{cache_prefix}_{model_tag}.db"
+    # selection.task_ids may be inline OR in a sidecar json (task_ids_file),
+    # resolved relative to the repo root. Inline wins if both are present.
+    task_ids = sel.get("task_ids")
+    if not task_ids and sel.get("task_ids_file"):
+        tf = sel["task_ids_file"]
+        tf = (REPO_ROOT / tf) if not os.path.isabs(tf) else Path(tf)
+        task_ids = json.loads(Path(tf).read_text())
     cmd = [
         os.environ.get("OMK_PYTHON") or (
             "/root/anaconda3/envs/omnimergekit/bin/python"
@@ -566,7 +580,8 @@ def dispatch_lcb(template: dict, model_tag: str, base_url: str,
         "--http-timeout", str(g.get("http_timeout", 900.0)),
         "--difficulty", sel.get("difficulty", "medium"),
         "--min-date", sel.get("min_date", "2024-10-01"),
-        *(["--task-ids", ",".join(sel["task_ids"])] if sel.get("task_ids") else []),
+        "--cache-db", str(cache_db),
+        *(["--task-ids", ",".join(task_ids)] if task_ids else []),
         # For smoke runs (n<=10) honor template `n` exactly; for full runs pad
         # by 50 so the shim's post-filter pool has enough candidates to yield n.
         # Bug 2026-05-16: lcb_medium_1_smoke (n=1) was emitting --limit 51
@@ -587,6 +602,112 @@ def dispatch_lcb(template: dict, model_tag: str, base_url: str,
         cmd += ["--enable-thinking", "true" if ctk["enable_thinking"] else "false"]
     log(f"lcb shim: {' '.join(shlex.quote(c) for c in cmd)}")
     return subprocess.call(cmd)
+
+
+def dispatch_multipl(template: dict, model_tag: str, base_url: str,
+                     out_dir: Path) -> int:
+    """MultiPL-E backend: per-language generate (against the running
+    llama-server /v1/completions) → nuprl Docker eval → aggregate pass@1.
+
+    Resume is sqlite (eval/cache_sqlite.py) per the all-evals-through-sqlite
+    rule; the per-problem JSON files the Docker eval consumes are derived from
+    that cache. Writes:
+      - out_dir/mpe_result.json          aggregate (macro + micro) + per-lang
+      - out_dir/mpe_result.samples.jsonl one row/problem (for token-stats/sanity)
+      - out_dir/generations/humaneval-<lang>/*.json   (Docker eval inputs)
+      - out_dir/results/humaneval-<lang>/*.results.json + _summary.json
+    """
+    import glob as _glob
+    g = template["generation"]
+    sel = template["selection"]
+    ba = template.get("backend_args", {}) or {}
+    langs = sel.get("langs") or ["rs", "java", "js"]
+    n = int(template.get("n", 0))
+    max_tokens = int(g.get("max_gen_toks", 1024))
+    concurrency = int(ba.get("num_concurrent", 2))
+    completions_url = base_url.replace("/v1", "") + "/v1/completions"
+    py = os.environ.get("OMK_PYTHON") or (
+        "/root/anaconda3/envs/omnimergekit/bin/python"
+        if os.path.exists("/root/anaconda3/envs/omnimergekit/bin/python")
+        else sys.executable)
+
+    cache_dir = out_dir / "sqlite_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    prefix = template.get("cache", {}).get("sqlite_prefix", template["name"])
+    cache_db = cache_dir / f"{prefix}_{model_tag}.db"
+
+    gen_root = out_dir / "generations"
+    res_root = out_dir / "results"
+    per_lang: dict[str, dict] = {}
+    rc_overall = 0
+    samples_fp = (out_dir / "mpe_result.samples.jsonl").open("w")
+    try:
+        for lang in langs:
+            gen_dir = gen_root / f"humaneval-{lang}"
+            res_dir = res_root / f"humaneval-{lang}"
+            gen_cmd = [
+                py, str(MPE_DIR / "multipl_e_generate.py"),
+                "--lang", lang,
+                "--base-url", completions_url,
+                "--model-name", model_tag,
+                "--out-dir", str(gen_dir),
+                "--max-tokens", str(max_tokens),
+                "--limit", str(n if n > 0 else 0),
+                "--concurrency", str(concurrency),
+                "--cache-db", str(cache_db),
+            ]
+            log(f"mpe gen [{lang}]: {' '.join(shlex.quote(c) for c in gen_cmd)}")
+            grc = subprocess.call(gen_cmd)
+            if grc != 0:
+                log(f"mpe gen [{lang}] rc={grc} (continuing to evaluate what landed)")
+                rc_overall = rc_overall or grc
+
+            eval_cmd = ["bash", str(MPE_DIR / "multipl_e_evaluate.sh"),
+                        str(gen_dir), str(res_dir)]
+            log(f"mpe eval [{lang}]: {' '.join(shlex.quote(c) for c in eval_cmd)}")
+            erc = subprocess.call(eval_cmd)
+            sumf = res_dir / "_summary.json"
+            if sumf.exists():
+                s = json.loads(sumf.read_text())
+                per_lang[lang] = {"n_pass": s.get("n_pass"), "n_total": s.get("n_total"),
+                                  "pass_at_1": s.get("pass_at_1")}
+            else:
+                per_lang[lang] = {"n_pass": 0, "n_total": 0, "pass_at_1": None}
+                rc_overall = rc_overall or (erc or 1)
+
+            # Append completions to the samples file for token-stats/sanity.
+            for gf in sorted(_glob.glob(str(gen_dir / "*.json"))):
+                try:
+                    d = json.loads(Path(gf).read_text())
+                except Exception:
+                    continue
+                comp = (d.get("completions") or [""])[0] or ""
+                samples_fp.write(json.dumps({
+                    "task_id": f"{lang}::{d.get('name')}",
+                    "resps": [[comp]],
+                    "filtered_resps": [comp],
+                    "completion": comp,
+                }) + "\n")
+    finally:
+        samples_fp.close()
+
+    scored = [v["pass_at_1"] for v in per_lang.values() if v.get("pass_at_1") is not None]
+    macro = (sum(scored) / len(scored)) if scored else None
+    tot_pass = sum((v.get("n_pass") or 0) for v in per_lang.values())
+    tot_n = sum((v.get("n_total") or 0) for v in per_lang.values())
+    micro = (tot_pass / tot_n) if tot_n else None
+    result = {
+        "name": model_tag,
+        "langs": per_lang,
+        "pass_at_1": macro,            # headline: macro mean over languages
+        "pass_at_1_micro": micro,
+        "n_pass": tot_pass,
+        "n_total": tot_n,
+        "aggregate": "macro_mean_over_langs",
+    }
+    (out_dir / "mpe_result.json").write_text(json.dumps(result, indent=2))
+    log(f"mpe result: macro pass@1={macro} micro={micro} per_lang={per_lang}")
+    return rc_overall
 
 
 # ── Post-run sanity + token stats ────────────────────────────────────────
@@ -826,6 +947,28 @@ def extract_canonical_score(template: dict, out_dir: Path) -> tuple[float | None
         }
         return (float(score) if score is not None else None), score_dict
 
+    if backend == "multipl_e":
+        rj = out_dir / "mpe_result.json"
+        if not rj.exists():
+            return None, {}
+        try:
+            d = json.loads(rj.read_text())
+        except Exception as e:  # pragma: no cover
+            return None, {"error": f"mpe_result.json parse: {e}"}
+        # Headline = macro-average pass@1 across languages (each lang weighted
+        # equally); also surface micro + per-lang for the score dict / card.
+        score = d.get("pass_at_1")
+        score_dict = {
+            "pass_at_1": d.get("pass_at_1"),            # macro mean over langs
+            "pass_at_1_micro": d.get("pass_at_1_micro"),
+            "n_pass": d.get("n_pass"),
+            "n_total": d.get("n_total"),
+            "aggregate": d.get("aggregate"),
+        }
+        for lang, v in (d.get("langs") or {}).items():
+            score_dict[f"{lang}_pass_at_1"] = v.get("pass_at_1")
+        return (float(score) if score is not None else None), score_dict
+
     # lm-eval path
     results = list(out_dir.glob("**/lm_eval_out/**/results_*.json"))
     if not results:
@@ -897,6 +1040,7 @@ _TASK_DEPS: dict[str, list[str]] = {
     "ifeval": ["langdetect", "immutabledict", "nltk"],
     "livecodebench": ["datasets"],
     "lcb": ["datasets"],
+    "multipl": ["datasets"],   # MultiPL-E: HF dataset load + nuprl Docker eval
     "humaneval": [],
     "mbpp": [],
     "gpqa": [],
@@ -1110,6 +1254,8 @@ def main() -> None:
                                   limit=args.limit if args.limit > 0 else full_limit)
         elif template["backend"] == "lcb_custom":
             rc = dispatch_lcb(template, served_name, base_url, out_dir)
+        elif template["backend"] == "multipl_e":
+            rc = dispatch_multipl(template, served_name, base_url, out_dir)
         else:
             fatal(10, f"unknown template backend: {template['backend']}")
     finally:
@@ -1118,7 +1264,8 @@ def main() -> None:
 
     # Post-run token stats + sanity
     samples_candidates = list(out_dir.glob("**/samples_*.jsonl")) + \
-                         list(out_dir.glob("**/lcb_result.samples.jsonl"))
+                         list(out_dir.glob("**/lcb_result.samples.jsonl")) + \
+                         list(out_dir.glob("**/mpe_result.samples.jsonl"))
     # Pick the most recently modified samples file. Multiple may co-exist
     # under the same out_dir (re-runs, shadow-task re-tasking, smoke vs full)
     # and the stale ones can have radically different row counts than the

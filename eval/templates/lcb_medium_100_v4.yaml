@@ -1,0 +1,48 @@
+# LiveCodeBench-medium-100 (v4 / pruned recipe) — superset of lcb_medium_55_v4.
+#
+# Same 100-problem set as lcb_medium_100.yaml (pinned task_ids), but with the
+# ASYMMETRIC pruned-variant recipe from lcb_medium_55_v4.yaml: parser=gemma4 +
+# enable_thinking + thinking_token_budget=12288 as a forcing function against
+# the rumination loops pruned variants (v4/v5/v6-coder) fall into on hard
+# problems. 128e uses lcb_medium_100.yaml (no parser) instead — selected by the
+# suite per variant. See lcb_medium_55_v4.yaml for the full rationale.
+#
+# Sampler GREEDY (frozen). On llama.cpp the bench-default "coding" flags would
+# disable reasoning → rumination; backend_overrides.llama swaps in the
+# parser+budget recipe (same forcing function vLLM uses).
+name: lcb_medium_100_v4
+backend: lcb_custom
+task: livecodebench
+n: 100
+selection:
+  type: filter
+  difficulty: medium
+  min_date: "2023-06-01"
+  testtype: functional
+  task_ids_file: eval/lcb/lcb_medium_100_taskids.json
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288   # forcing-function: prevents pruned-variant rumination
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 1200
+scoring:
+  scorer: lcb_helpers
+backend_args:
+  apply_chat_template: true
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+  num_concurrent: 2
+cache:
+  sqlite_prefix: lcb_med_100_v4
+reports:
+  token_stats: true
+dependencies:
+  python_modules: [datasets]
+backend_overrides:
+  llama:
+    backend_args:
+      llama_extra_replace: true
+      llama_extra: ["--reasoning-format", "deepseek", "--reasoning-budget", "12288"]

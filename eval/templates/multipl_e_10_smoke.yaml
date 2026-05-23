@@ -1,0 +1,34 @@
+# MultiPL-E smoke — rs + java + js, first 10 each. Plumbing/correctness gate
+# for the multipl_e backend before the full multipl_e_100 run: verifies the
+# generator writes per-problem JSON, completions parse + extract, the nuprl
+# Docker eval returns a numeric pass@1, and summary.json.score is populated.
+# Identical recipe to multipl_e_100 (greedy); only n differs.
+name: multipl_e_10_smoke
+backend: multipl_e
+task: multipl_e
+n: 10
+selection:
+  langs: [rs, java, js]
+generation:
+  max_gen_toks: 1024
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  scorer: multipl_e
+  metric: pass_at_1
+  aggregate: macro_mean_over_langs
+backend_args:
+  num_concurrent: 2
+  llama_parallel: 2
+  llama_ctx: 16384
+cache:
+  sqlite_prefix: mpe_10_smoke
+reports:
+  token_stats: true
+sanity:
+  min_p10_chars: 1
+dependencies:
+  python_modules: [datasets]
+  docker_images: [ghcr.io/nuprl/multipl-e-evaluation]

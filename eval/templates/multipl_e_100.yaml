@@ -1,0 +1,44 @@
+# MultiPL-E (HumanEval machine-translated) — rs + java + js, first 100 each.
+#
+# First-class omk_eval backend (backend: multipl_e). Per language: generate
+# against the running llama-server /v1/completions endpoint (raw completion,
+# NOT chat — MultiPL-E prompts are code prefixes), then score with the nuprl
+# `ghcr.io/nuprl/multipl-e-evaluation` Docker image. Headline score = macro
+# mean pass@1 across the 3 languages; per-lang + micro also recorded.
+#
+# Resume is sqlite (eval/cache_sqlite.py, keyed lang::name) per the
+# all-evals-through-sqlite rule; the per-problem JSON the Docker eval reads is
+# derived from that cache.
+#
+# Sampler GREEDY (frozen): the generator always sends temperature=0 (any seed
+# is inert at temp=0). Comparable across the 128e / v5-coder / v6-coder cohort.
+name: multipl_e_100
+backend: multipl_e
+task: multipl_e
+n: 100                      # problems PER language (first N of the split)
+selection:
+  langs: [rs, java, js]
+generation:
+  max_gen_toks: 1024
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  scorer: multipl_e
+  metric: pass_at_1
+  aggregate: macro_mean_over_langs
+backend_args:
+  num_concurrent: 2          # generator threads (match llama_parallel)
+  llama_parallel: 2
+  llama_ctx: 16384
+cache:
+  sqlite_prefix: mpe_100
+reports:
+  token_stats: true
+sanity:
+  # Code completions are legitimately short; don't false-alarm on p10 length.
+  min_p10_chars: 1
+dependencies:
+  python_modules: [datasets]
+  docker_images: [ghcr.io/nuprl/multipl-e-evaluation]
