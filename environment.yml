@@ -18,6 +18,7 @@ dependencies:
   - cuda-toolkit=12.6   # match the system CUDA used by torch wheels and llama.cpp
   - git
   - cmake               # for any source-built deps
+  - sqlite              # sqlite3 CLI — inspect lm-eval response caches (eval/cache_sqlite.py)
   - pip:
       - -r requirements.txt
       - -r requirements-eval.txt

@@ -391,6 +391,41 @@ the pod dies. Memory of fixes lives in the repo.
 
 ---
 
+### 2.5 Pod eval bootstrap — ONE canonical script
+
+`eval/pod_eval_bootstrap.sh` is **THE** on-pod setup for a fresh eval/surgery
+pod. Run it ON the pod after landing the repo:
+
+```bash
+git clone https://github.com/mann1x/omnimergekit /workspace/omnimergekit \
+  && HF_TOKEN=... bash /workspace/omnimergekit/eval/pod_eval_bootstrap.sh <flags>
+```
+
+It is idempotent (re-run = no-op) and owns the on-pod **system layer**: apt deps
+(incl. `sqlite3` — §3.1 needs it), miniconda, repo, llama.cpp build
+(`--cuda-arch`, default 86=3090), conda env (`--env` + `--deps
+{eval-full,eval-augment,train,none}`), the solidpc-path symlink farm
+(`--symlink-farm`), HF pulls (`--hf-pull`), and the lm-eval patches
+(`--patches unbound,fix-a`). `--dry-run` prints the plan without touching the
+pod; `--help` lists every flag.
+
+The heavy version-pinned conda envs (omnimergekit-from-requirements, modelopt
+0.43.0, vllm 0.20.2) live in ONE place — `eval/pod_runners/setup_conda_envs.sh`
+— sourced by both this bootstrap (`--vllm-env` / `--modelopt-env` /
+`--deps eval-full`) **and** the controller wrapper
+`scripts/pod_setup_eval_envs.sh`. The two lm-eval patches are standalone
+idempotent helpers under `eval/patches/`.
+
+Per-variant recipes are thin wrappers in
+`eval/pod_runners/bootstrap_<variant>.sh` (c6v3lcb, reeval, gpt_oss, hep_sweep,
+router_recovery), each a 3–5 line call into the bootstrap with the right flags.
+`backup_models/scripts/pod_*bootstrap*.sh` are symlinks into them — one tracked
+source of truth. **NEVER hand-write a new per-task bootstrap under
+`backup_models/scripts/`** (that is how five divergent one-offs accumulated and
+how `sqlite3` went missing on pod 37588132); add a wrapper here instead.
+
+---
+
 ## 3. Validation procedure — what "validate the evals" means
 
 When the user asks "validate the evals" or "check the evals", these are the
@@ -406,8 +441,10 @@ generated outputs. Use `tail`/`grep` on the live log or `sqlite3` on the
 lm_eval cache:
 
 ```bash
-# lm_eval / SQLite cache — first 3 cached responses
-sqlite3 <cache.db> "select task,key,length(response) from kv_cache limit 3" | head
+# lm_eval / SQLite cache — table is `unnamed`, values are PICKLED blobs (key, value).
+#   row count (liveness): sqlite3 <cache.db> "select count(*) from unnamed"
+#   to read responses, unpickle `value` in python (see feedback_eval_sqlite_spot_check)
+sqlite3 <cache.db> "select count(*) from unnamed"
 # or for the JSONL cache used by lcb_llama_server
 head -3 <out>.samples.jsonl | python3 -c "
 import json, sys
@@ -558,6 +595,7 @@ omnimergekit/
 │   ├── eval_suite_llama.sh               # canonical llama.cpp Q6_K suite driver (thin over omk_eval)
 │   ├── eval_suite_vllm.sh                # canonical vLLM NVFP4A16 suite driver
 │   ├── eval_suite_chain.sh               # multi-variant outer chain over the suite drivers
+│   ├── pod_eval_bootstrap.sh             # THE canonical on-pod pod setup (§2.5)
 │   ├── tasks/                            # custom lm_eval YAMLs
 │   │   ├── humaneval_chat.yaml
 │   │   ├── mbpp_chat.yaml
@@ -572,7 +610,12 @@ omnimergekit/
 │   │   ├── multipl_e_generate.py         # MPE generator (retry on 5xx)
 │   │   ├── multipl_e_evaluate.sh         # MPE Docker eval wrapper
 │   │   └── README.md
-│   └── pod_runners/
+│   ├── patches/                          # standalone idempotent lm-eval patch helpers
+│   │   ├── lm_eval_unbound_guard.py      #   UnboundLocalError guard (api_models.py)
+│   │   └── fix_a_lm_eval_patch.py        #   reasoning_content fallback (openai_completions.py)
+│   └── pod_runners/                      # wrappers call ../pod_eval_bootstrap.sh
+│       ├── setup_conda_envs.sh           # shared env recipes (omk/modelopt/vllm pins) — single source
+│       ├── bootstrap_<variant>.sh        # thin wrappers over pod_eval_bootstrap.sh (c6v3lcb, reeval, …)
 │       └── pod_<exp>.sh                  # thin shell launchers; import from eval/
 └── recipes/
     └── ...
