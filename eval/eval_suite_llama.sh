@@ -161,6 +161,7 @@ trap '
 
 # ── main loop ───────────────────────────────────────────────────────────
 declare -A SCORES
+declare -A DURS
 START_TS=$(date +%s)
 log "===== suite start ====="
 for t in "${selected[@]}"; do
@@ -184,12 +185,27 @@ for t in "${selected[@]}"; do
     [[ "$LIMIT" -gt 0 ]] && cmd+=(--limit "$LIMIT")
     log "[$t] cmd: ${cmd[*]}"
     bench_log="$LOGS/eval_suite_llama_${VARIANT}_${t}_${TS}.log"
-    ( "${cmd[@]}" ) > "$bench_log" 2>&1
-    rc=$?
+    bstart=$(date +%s)
+    # ── per-template START marker (suite log + bench log) ───────────────────
+    log "[$t] >>> TEMPLATE START  ts=$(date -Iseconds)  epoch=${bstart}"
+    echo "[$(date -Iseconds)] >>> OMK_TEMPLATE_START template=$t variant=$VARIANT port=$PORT epoch=${bstart}" > "$bench_log"
+    # Timestamp EVERY raw line from omk_eval/lm-eval/llama-server via the
+    # ts_prefix.py helper (python is everywhere; awk strftime is a gawk-only
+    # extension older mawk lacks). pipefail + PIPESTATUS[0] keeps the real
+    # omk_eval exit code through the filter. Protocol: no untimestamped log line.
+    set -o pipefail
+    ( "${cmd[@]}" ) 2>&1 \
+        | python3 -u "$OMK/eval/ts_prefix.py" \
+        >> "$bench_log"
+    rc=${PIPESTATUS[0]}
+    set +o pipefail
+    bend=$(date +%s); bdur=$((bend - bstart))
+    # ── per-template FINISH marker (suite log + bench log) ──────────────────
+    echo "[$(date -Iseconds)] <<< OMK_TEMPLATE_FINISH template=$t rc=$rc dur_s=${bdur}" >> "$bench_log"
     if [[ $rc -eq 0 ]]; then
-        log "[$t] exit=0"
+        log "[$t] <<< TEMPLATE FINISH ts=$(date -Iseconds)  dur_s=${bdur}  rc=0"
     else
-        log "[$t] exit=$rc — see $bench_log"
+        log "[$t] <<< TEMPLATE FINISH ts=$(date -Iseconds)  dur_s=${bdur}  rc=$rc — see $bench_log"
     fi
     # ── Score extraction — canonical summary.json FIRST ─────────────────────
     # omk_eval.py writes summary.json at <results>/<template>/<served>/summary.json
@@ -244,7 +260,20 @@ print('NO_METRIC')
         fi
     fi
     SCORES["$t"]="$score"
+    DURS["$t"]="$bdur"
     log "[$t] score: $score"
+    # Persist this template's wall-clock duration into summary.json so future
+    # dual-GPU splits balance on real per-bench runtime. omk_eval writes its own
+    # (more precise) duration_s; only fill in if absent (e.g. LCB custom runner).
+    if [[ -f "$summ" ]]; then
+        BDUR="$bdur" python3 -c "
+import json,os
+p='$summ'; d=json.load(open(p))
+if 'duration_s' not in d or not d.get('duration_s'):
+    d['duration_s']=int(os.environ['BDUR']); d['duration_s_source']='suite'
+    json.dump(d,open(p,'w'),indent=1)
+" 2>/dev/null || true
+    fi
     # Inter-bench cooldown: kill any straggling llama-server before next template.
     pkill -KILL -f "llama-server.*--port $PORT" 2>/dev/null || true
     sleep 2
@@ -262,10 +291,10 @@ log "===== suite done — ${DUR}s ====="
     echo "Backend: llama.cpp Q6_K"
     echo "Duration: ${DUR}s"
     echo ""
-    echo "| Template | Score |"
-    echo "|----------|-------|"
+    echo "| Template | Score | Duration (s) |"
+    echo "|----------|-------|--------------|"
     for t in "${selected[@]}"; do
-        echo "| $t | ${SCORES[$t]:-MISSING} |"
+        echo "| $t | ${SCORES[$t]:-MISSING} | ${DURS[$t]:-?} |"
     done
 } | tee "$SUMMARY" | sed 's/^/  /' | tee -a "$SUITE_LOG"
 

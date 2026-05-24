@@ -63,11 +63,17 @@ MPE_DIR = REPO_ROOT / "eval" / "multipl_e"
 
 
 def log(msg: str) -> None:
-    print(f"[omk_eval {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    # Full ISO-8601 timestamp (date + time + tz) on EVERY line — the per-bench
+    # logs are the canonical record used to recover per-template wall time, so a
+    # bare HH:MM:SS (no date) is a protocol violation on multi-hour / cross-midnight
+    # runs. Origin: 2026-05-24 — summary.json had no duration and logs weren't
+    # date-stamped, so a dual-GPU split couldn't be planned from prior runtime.
+    print(f"[omk_eval {time.strftime('%Y-%m-%dT%H:%M:%S%z')}] {msg}", flush=True)
 
 
 def fatal(code: int, msg: str) -> "None":
-    print(f"[omk_eval FATAL exit={code}] {msg}", file=sys.stderr, flush=True)
+    print(f"[omk_eval {time.strftime('%Y-%m-%dT%H:%M:%S%z')} FATAL exit={code}] {msg}",
+          file=sys.stderr, flush=True)
     sys.exit(code)
 
 
@@ -1096,6 +1102,7 @@ def _check_dependencies(template: dict) -> None:
 
 
 def main() -> None:
+    _t_start = time.time()  # wall-clock start; recorded as duration_s in summary.json
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="path or HF id")
     ap.add_argument("--template", required=True, help="template name or path")
@@ -1128,6 +1135,10 @@ def main() -> None:
     from template_loader import load as load_template  # type: ignore
     template = load_template(args.template)
     log(f"loaded template {template['name']} (n={template['n']}, backend={template['backend']})")
+    # Machine-parseable START marker (grep '>>> OMK_BENCH_START' to bracket a
+    # template's wall time even when omk_eval is invoked directly, not via the suite).
+    log(f">>> OMK_BENCH_START template={template['name']} backend={args.backend} "
+        f"quant={args.quant} port={args.port}")
 
     # Apply per-engine overrides. vLLM and llama.cpp need different
     # max_gen_toks / thinking_token_budget tuning (vLLM Fix-A truncation
@@ -1336,9 +1347,18 @@ def main() -> None:
         "scores": score_dict,
         "token_stats": stats,
         "sanity_warnings": warns,
+        # Wall-clock duration of this template's run (server spin-up + eval +
+        # scoring). Persisted so future dual-GPU splits can be balanced on real
+        # per-bench runtime instead of a completion-token proxy. Origin 2026-05-24.
+        "duration_s": round(time.time() - _t_start, 1),
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(_t_start)),
+        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     log(f"summary → {out_dir / 'summary.json'}")
+    # Machine-parseable FINISH marker pairing with OMK_BENCH_START above.
+    log(f"<<< OMK_BENCH_FINISH template={template['name']} rc={rc} score={score} "
+        f"dur_s={summary['duration_s']}")
     if score is not None:
         log(f"score: {score:.4f}  (all: {score_dict})")
     log(f"warnings: {warns or 'none'}")
