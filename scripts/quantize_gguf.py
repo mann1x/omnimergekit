@@ -108,7 +108,13 @@ CD_MIX_HYBRID_QUANTS = [
 # studies and to test these tiers on different model families where they may
 # behave differently (e.g. dense models tolerate 2-bit better than MoE prunes).
 OPT_IN_QUANTS = [
-    "Q2_K", "CD-Q2_K", "CD-IQ3_K_M", "CD-IQ2_K", "IQ2_XXS",
+    "Q2_K", "CD-Q2_K", "IQ2_XXS",
+    # CD-IQ3_K_M / CD-IQ2_K: KNOWN-BROKEN on Gemma 4 MoE + the current llama.cpp
+    # --tensor-type-file parser (bug-433: IQ3_M/IQ3_XS/IQ2_M are ftype-mixes,
+    # not per-tensor ggml_types). Retained opt-in as a research artifact for
+    # possible future testing (other archs / future parser / redefinition).
+    # Validate carefully before any real use.
+    "CD-IQ3_K_M", "CD-IQ2_K",
 ] + CD_MIX_L_QUANTS + CD_MIX_HYBRID_QUANTS
 
 # Default sweep when --only is not given.
@@ -246,11 +252,11 @@ LEGACY_CD_FILE_BASE = {
     # LOW=IQ3_S); file-base is Q5_K so llama-quantize lays out the global
     # tensors at Q5_K and the body gets overridden by --tensor-type-file.
     "CD-IQ4_K_M": "Q5_K",
-    # CD-IQ3_K_M (IQ4_XS/IQ3_M/IQ3_S) and CD-IQ2_K (IQ3_M/IQ3_XS/IQ2_M) are the
-    # lower IQ-slot tiers. "IQ3_K_M"/"IQ2_K" are not valid llama ftypes, so the
-    # file-base must be overridden. Q5_K matches CD-IQ4_K_M; the .txt maps tier
-    # every body tensor + pin globals (token_embd/output=Q8_0), so this base is
-    # only a valid-ftype placeholder. Opt-in only (experimental sub-10GB band).
+    # CD-IQ3_K_M (IQ4_XS/IQ3_M/IQ3_S) and CD-IQ2_K (IQ3_M/IQ3_XS/IQ2_M): opt-in
+    # only, KNOWN-BROKEN on Gemma 4 MoE + the current llama.cpp parser (bug-433 —
+    # IQ3_M/IQ3_XS/IQ2_M are not per-tensor ggml_types). File-base Q5_K is a
+    # valid-ftype placeholder; retained as a research artifact for deliberate,
+    # carefully-validated cross-arch / future-parser testing.
     "CD-IQ3_K_M": "Q5_K",
     "CD-IQ2_K": "Q5_K",
 }

@@ -67,8 +67,18 @@ CD_TIERS = {
     # to recover the CD per-layer differentiation benefit *without* the
     # K-tier poison.
     "CD-IQ4_K_M": ("IQ4_NL", "IQ4_XS", "IQ3_S"),   # ~10-11 GB target band
-    "CD-IQ3_K_M": ("IQ4_XS", "IQ3_M",  "IQ3_S"),   # ~9-10 GB target band
-    "CD-IQ2_K":   ("IQ3_M",  "IQ3_XS", "IQ2_M"),   # ~8 GB target band
+    # ⚠ KNOWN-BROKEN on Gemma 4 MoE + the CURRENT llama.cpp --tensor-type-file
+    # parser (bug-433): IQ3_M / IQ3_XS / IQ2_M are LLAMA_FTYPE file-mixes, not
+    # valid per-tensor ggml_types, so parse_ggml_type rejects them as CD_TIERS
+    # slots. RETAINED opt-in ONLY (OPT_IN_QUANTS) — never in a default sweep.
+    # Preserved as a research artifact: may become viable via (a) a future
+    # llama.cpp parser that accepts these names per-tensor, (b) redefinition
+    # with valid per-tensor types, or (c) another architecture's quant path.
+    # TEST CAREFULLY before any real use. For a WORKING sub-10 GB CD tier today,
+    # use the *_h / *_L mix families in generate_cd_maps_mix.py (file-base FTYPE
+    # + body-only override; v5-coder shipped CD-IQ3_XS_h / CD-IQ3_XS_L).
+    "CD-IQ3_K_M": ("IQ4_XS", "IQ3_M",  "IQ3_S"),   # opt-in only — see warning above
+    "CD-IQ2_K":   ("IQ3_M",  "IQ3_XS", "IQ2_M"),   # opt-in only — see warning above
 }
 
 # How many layers in each tier (fixed for Gemma 4 26B-A4B: 30 layers)
@@ -113,6 +123,7 @@ ATTN_VK_PROTECT = {
     # Single-variable test: ONLY body slots change K → IQ; attn stays at
     # Q5_K so any score delta is attributable to the body swap.
     "CD-IQ4_K_M": "Q5_K",
+    # CD-IQ3_K_M / CD-IQ2_K: opt-in only, known-broken on Gemma 4 MoE (bug-433).
     "CD-IQ3_K_M": "Q5_K",
     "CD-IQ2_K":   "Q5_K",
 }
