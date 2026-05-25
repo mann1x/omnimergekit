@@ -690,8 +690,10 @@ def dispatch_multipl(template: dict, model_tag: str, base_url: str,
                 except Exception:
                     continue
                 comp = (d.get("completions") or [""])[0] or ""
+                tid = f"{lang}::{d.get('name')}"
                 samples_fp.write(json.dumps({
-                    "task_id": f"{lang}::{d.get('name')}",
+                    "doc_id": tid,   # uniform with lm-eval samples; token_stats dedups on this
+                    "task_id": tid,
                     "resps": [[comp]],
                     "filtered_resps": [comp],
                     "completion": comp,
@@ -773,10 +775,19 @@ def compute_token_stats(samples_path: Path, tokenizer_id: str | None = None) -> 
         return {"error": "samples file empty"}
     # lm-eval emits one row per (doc, filter). Collapse to unique doc_ids so the
     # n / empty / p10 stats reflect what the user actually requested.
+    # NOTE (2026-05-25): the native LCB/MPE runners write one row per problem keyed
+    # on `task_id` with NO `doc_id` field. Deduping on a missing key made every row
+    # alias to doc_id=None, collapsing 55/100/300 problems to a single record (n=1)
+    # and reporting record-0's length as the whole distribution. Fall back to
+    # `task_id`, then to the row index, so non-lm-eval samples are never collapsed.
     seen_docs: set = set()
     uniq_samples = []
-    for s in samples:
+    for i, s in enumerate(samples):
         did = s.get("doc_id")
+        if did is None:
+            did = s.get("task_id")
+        if did is None:
+            did = f"__idx_{i}"        # no id at all → unique per row, never dedup
         if did in seen_docs:
             continue
         seen_docs.add(did)

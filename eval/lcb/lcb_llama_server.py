@@ -308,6 +308,7 @@ def main():
             n_pass += 1
 
         rec = {
+            "doc_id": tid,          # uniform with lm-eval samples; token_stats dedups on this
             "task_id": tid,
             "passed": bool(passed),
             "reason": reason if not passed else "",
