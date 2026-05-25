@@ -290,8 +290,11 @@ def _cd_file_base_ftype(quant: str) -> str:
         return LEGACY_CD_FILE_BASE[quant]
     return quant[3:]
 
-# Quants that require imatrix for good results
-IMATRIX_QUANTS = {q for q in ALL_QUANTS if q.startswith("IQ") or q.startswith("UD-IQ")}
+# Quants that require imatrix for good results.
+# General rule (T118): ALL K-quants (name contains "_K") + every IQ tier build
+# with imatrix by default — imatrix lifts Q6_K LCB +3pp, neutral on Q4_K_M.
+# Legacy Q8_0/Q4_0/Q4_1 (no "_K") stay imatrix-free (no meaningful benefit).
+IMATRIX_QUANTS = {q for q in ALL_QUANTS if q.startswith("IQ") or q.startswith("UD-IQ") or "_K" in q}
 
 # Sanity check: capital questions
 SANITY_QUESTIONS = [

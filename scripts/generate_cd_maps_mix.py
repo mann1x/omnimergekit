@@ -183,7 +183,7 @@ def load_imatrix_importance(imatrix_path: Path) -> tuple[dict[int, float], int]:
             in_sum2[base] = float(t.data.sum())
         elif name.endswith(".counts"):
             base = name[: -len(".counts")]
-            counts[base] = float(t.data[0])
+            counts[base] = float(t.data.reshape(-1)[0])  # robust: newer llama.cpp writes >1-D per-expert .counts on MoE
 
     layer_re = re.compile(r"^blk\.(\d+)\.")
     per_layer = defaultdict(float)
