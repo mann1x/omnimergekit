@@ -901,6 +901,24 @@ def create_hf_repo(repo_id: str, original_repo: str, model_name: str,
     api = HfApi()
     create_repo(repo_id, repo_type="model", exist_ok=True)
 
+    # Stopgap off-switch (2026-05-25 incident: a per-tier re-publish full-overwrote the curated
+    # GGUF card, wiping the hand-written Qwen-14B comparison chapter). Until README handling is
+    # merge-aware, OMK_NO_README=1 makes the script never touch the page.
+    import os
+    if os.environ.get("OMK_NO_README") == "1":
+        print(f"  OMK_NO_README=1 -> skipping README generation/upload for {repo_id}", flush=True)
+        return repo_id
+    # Defensive default: never clobber an existing curated card. Re-enable a full rebuild with OMK_FORCE_README=1.
+    try:
+        from huggingface_hub import hf_hub_download as _hfd
+        _hfd(repo_id, "README.md", repo_type="model")
+        _readme_exists = True
+    except Exception:
+        _readme_exists = False
+    if _readme_exists and os.environ.get("OMK_FORCE_README") != "1":
+        print(f"  README.md already on {repo_id}; preserving curated card (OMK_FORCE_README=1 to overwrite).", flush=True)
+        return repo_id
+
     # Fetch original README
     original_readme = ""
     try:
@@ -971,6 +989,9 @@ With [ollama](https://ollama.ai) (requires Modelfile or HF direct load).
 
 def update_readme_quant_status(repo_id: str, quant_name: str, size_gb: float, status: str = "done"):
     """Update the GGUF repo README to mark a quant as uploaded with its size."""
+    import os
+    if os.environ.get("OMK_NO_README") == "1":
+        return
     from huggingface_hub import HfApi
     api = HfApi()
     try:
