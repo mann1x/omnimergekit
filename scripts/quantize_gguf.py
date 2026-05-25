@@ -108,7 +108,7 @@ CD_MIX_HYBRID_QUANTS = [
 # studies and to test these tiers on different model families where they may
 # behave differently (e.g. dense models tolerate 2-bit better than MoE prunes).
 OPT_IN_QUANTS = [
-    "Q2_K", "CD-Q2_K", "IQ2_XXS",
+    "Q2_K", "CD-Q2_K", "CD-IQ3_K_M", "CD-IQ2_K", "IQ2_XXS",
 ] + CD_MIX_L_QUANTS + CD_MIX_HYBRID_QUANTS
 
 # Default sweep when --only is not given.
@@ -246,6 +246,13 @@ LEGACY_CD_FILE_BASE = {
     # LOW=IQ3_S); file-base is Q5_K so llama-quantize lays out the global
     # tensors at Q5_K and the body gets overridden by --tensor-type-file.
     "CD-IQ4_K_M": "Q5_K",
+    # CD-IQ3_K_M (IQ4_XS/IQ3_M/IQ3_S) and CD-IQ2_K (IQ3_M/IQ3_XS/IQ2_M) are the
+    # lower IQ-slot tiers. "IQ3_K_M"/"IQ2_K" are not valid llama ftypes, so the
+    # file-base must be overridden. Q5_K matches CD-IQ4_K_M; the .txt maps tier
+    # every body tensor + pin globals (token_embd/output=Q8_0), so this base is
+    # only a valid-ftype placeholder. Opt-in only (experimental sub-10GB band).
+    "CD-IQ3_K_M": "Q5_K",
+    "CD-IQ2_K": "Q5_K",
 }
 
 
@@ -453,23 +460,63 @@ def get_model_name(repo_id: str) -> str:
 # ── imatrix computation ──────────────────────────────────────
 
 def detect_gpu_vram_mb() -> int:
-    """Detect available GPU VRAM in MB. Returns 0 if no GPU."""
+    """Detect free GPU VRAM in MB visible to THIS process. Returns 0 if no GPU.
+
+    Honors CUDA_VISIBLE_DEVICES: imatrix/quantize run only on the visible
+    device(s), so summing every physical GPU (e.g. a busy sibling on a
+    multi-GPU pod) over-estimates available VRAM and makes auto_ngl offload
+    more layers than fit -> cudaMalloc OOM. Sum only the visible indices.
+    """
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=10,
         )
-        if result.returncode == 0:
-            # Sum all GPUs
-            total = sum(int(x.strip()) for x in result.stdout.strip().split("\n") if x.strip())
-            return total
+        if result.returncode != 0:
+            return 0
+        per_gpu = [int(x.strip()) for x in result.stdout.strip().split("\n") if x.strip()]
+        if not per_gpu:
+            return 0
+        vis = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if vis is not None and vis.strip() != "":
+            idxs = [int(t.strip()) for t in vis.split(",")
+                    if t.strip().isdigit() and int(t.strip()) < len(per_gpu)]
+            if idxs:
+                return sum(per_gpu[i] for i in idxs)
+        return sum(per_gpu)
     except Exception:
         pass
     return 0
 
 
-def auto_ngl(model_size_gb: float) -> int:
-    """Auto-detect ngl based on available VRAM. Returns 0 for CPU-only."""
+def _gguf_block_count(gguf_path: Path):
+    """Read <arch>.block_count from a GGUF header (metadata only, no tensors).
+
+    Returns None if unreadable so callers can fall back to a conservative ngl.
+    """
+    try:
+        from gguf import GGUFReader
+        r = GGUFReader(str(gguf_path))
+        for key, field in r.fields.items():
+            if key.endswith(".block_count"):
+                return int(field.parts[field.data[0]][0])
+    except Exception:
+        pass
+    return None
+
+
+def auto_ngl(model_size_gb: float, n_layers: int = None) -> int:
+    """Auto-detect ngl from free VRAM and the model's ACTUAL layer count.
+
+    Returns 99 (all) when the whole model fits, else the number of repeating
+    layers whose F16 weights fit in `usable` VRAM, capped at n_layers-1 so the
+    token-embd / output tensors stay on CPU (they only move to GPU at
+    ngl >= n_layers+1 and would tip a tight card into OOM).
+
+    n_layers MUST be the model's real block count. The old code scaled by a
+    hardcoded 50 ("typical dense"); on a 30-layer Gemma-4-26B F16 (~37 GB) and
+    a 24 GB card that yielded ngl~31 -> full offload -> cudaMalloc OOM.
+    """
     vram_mb = detect_gpu_vram_mb()
     if vram_mb == 0:
         return 0
@@ -477,16 +524,14 @@ def auto_ngl(model_size_gb: float) -> int:
     available = vram_mb - 512  # reserve 512MB for overhead
     if available >= model_mb:
         return 99  # fits entirely
-    # Partial offload: estimate proportion of layers that fit.
-    # 0.85 of available leaves ~3-4 GB headroom for KV cache + compute
-    # buffers on a 24 GB card. Previously 0.60 — too conservative; observed
-    # only ~10 GB used out of 22 GB free during 31B imatrix on 3090.
+    # Partial offload: fraction of model weights that fit, mapped onto the
+    # real layer count. 0.85 leaves ~3-4 GB for KV cache + compute buffers.
     usable = available * 0.85
     ratio = usable / model_mb
-    # Typical dense models have 40-80 layers (Gemma-4-31B: 62, Llama-70B: 80).
-    # 50 is a safer mid-point than the old 35 for large dense models.
-    ngl = max(0, int(ratio * 50))
-    return ngl
+    if n_layers and n_layers > 0:
+        return max(0, min(int(ratio * n_layers), n_layers - 1))
+    # Unknown layer count: conservative fixed fallback (was *50 -> overshoot).
+    return max(0, int(ratio * 32))
 
 
 def compute_imatrix(tools: dict, f16_gguf: Path, cal_data: Path,
@@ -505,8 +550,10 @@ def compute_imatrix(tools: dict, f16_gguf: Path, cal_data: Path,
     # Auto-detect GPU layers if not specified
     if ngl is None:
         model_size_gb = f16_gguf.stat().st_size / 1024**3
-        ngl = auto_ngl(model_size_gb)
-        print(f"  Auto ngl={ngl} (VRAM: {detect_gpu_vram_mb()}MB, model: {model_size_gb:.1f}GB)", flush=True)
+        n_layers = _gguf_block_count(f16_gguf)
+        ngl = auto_ngl(model_size_gb, n_layers=n_layers)
+        print(f"  Auto ngl={ngl} (VRAM: {detect_gpu_vram_mb()}MB free, "
+              f"model: {model_size_gb:.1f}GB, layers: {n_layers})", flush=True)
 
     print(f"  Computing imatrix from {cal_data.name}...", flush=True)
     cmd = [

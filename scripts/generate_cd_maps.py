@@ -125,19 +125,26 @@ def load_imatrix_importance(imatrix_path: Path) -> tuple[dict[int, float], int]:
 
     reader = GGUFReader(str(imatrix_path))
 
-    # in_sum2 is shape [N], counts is shape [1]. Importance = mean in_sum2 / counts
+    # Dense tensors: in_sum2 shape [N], counts shape [1].
+    # MoE expert tensors (newer llama.cpp imatrix): in_sum2 shape
+    # [n_experts, N], counts shape [n_experts, 1] (one activation count per
+    # expert, top-k routing). float(t.data[0]) only worked for the [1] case;
+    # on [n_experts, 1] it raised "only 0-dimensional arrays can be converted
+    # to Python scalars" under numpy 2.x. Sum the whole tensor in both cases:
+    # importance = total in_sum2 / total counts, dimensionally consistent and
+    # shape-agnostic ([1]->scalar, [98,1]->sum over experts).
     in_sum2 = {}
     counts = {}
     for t in reader.tensors:
         name = t.name
         if name.endswith(".in_sum2"):
             base = name[: -len(".in_sum2")]
-            # Mean of the squared activations (proxy for L2 magnitude)
+            # Sum of squared activations (proxy for L2 magnitude)
             data = t.data
             in_sum2[base] = float(data.sum())
         elif name.endswith(".counts"):
             base = name[: -len(".counts")]
-            counts[base] = float(t.data[0])
+            counts[base] = float(t.data.sum())
 
     # Per-layer aggregate
     layer_re = re.compile(r"^blk\.(\d+)\.")
