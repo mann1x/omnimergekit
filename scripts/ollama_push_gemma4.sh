@@ -28,17 +28,36 @@ HF_REPO="${1:?hf repo (e.g. ManniX-ITA/gemma-4-A4B-98e-v3-it-GGUF)}"
 OL_TARGET="${2:?ollama target (e.g. mannix/gemma4-98e)}"
 INCLUDE="${3:-}"   # optional grep pattern to filter tags
 
-# Optional flags AFTER positionals: --latest-tier <T> / --no-latest.
+# Optional flags AFTER positionals:
+#   --latest-tier <T>  tier to retag as :latest (default Q4_K_M)
+#   --no-latest        skip the :latest retag stage
+#   --force            push EVERY discovered tag, ignoring ALL skip-detection
+#                      (public scrape + marker file). Use when the published
+#                      bytes are WRONG and must be overwritten IN PLACE — ollama
+#                      tags are mutable, so a re-push replaces the manifest;
+#                      nothing needs to be removed first. e.g. CD-* tiers
+#                      rebuilt with a corrected map. Equivalent to legacy
+#                      FORCE_REPUSH=1 env var (still honored).
+#   --private          the ollama model is PRIVATE: ollama.com's public /tags
+#                      page does NOT list a private model's tags, so the scrape
+#                      can't tell whether anything is published. This suppresses
+#                      the (misleading) scrape and relies on the marker file
+#                      only. For a byte-replacing private re-push, combine with
+#                      --force (then neither scrape nor marker can cause a skip).
 # Defaults: latest-tier=Q4_K_M; latest stage runs UNLESS --no-latest is set.
 # Pre-flight refuses to launch if latest-tier isn't in TODO and isn't already
 # on ollama.com (so we don't push every tier only to leave :latest missing).
 LATEST_TIER="Q4_K_M"
 NO_LATEST=0
+FORCE_REPUSH="${FORCE_REPUSH:-0}"   # env back-compat; --force sets it too
+PRIVATE=0
 shift 3 || true
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --latest-tier)  LATEST_TIER="$2"; shift 2 ;;
         --no-latest)    NO_LATEST=1; shift ;;
+        --force)        FORCE_REPUSH=1; shift ;;   # push every tag; overwrite in place
+        --private)      PRIVATE=1;      shift ;;   # private model: public scrape can't see tags
         *) echo "unknown flag: $1" >&2; exit 64 ;;
     esac
 done
@@ -134,8 +153,13 @@ log "  total: $N_TAGS"
 # markers fire. The marker can be pre-populated manually if known-pushed tags
 # exist from a different pod (cat them in, one per line).
 MARKER_FILE="$WORKDIR/pushed_${OL_TARGET//\//_}.txt"
-EXISTING_HTML=$(curl -sL "https://ollama.com/${OL_TARGET}/tags" 2>/dev/null \
-    | grep -oE "${OL_TARGET}:[A-Za-z0-9_-]+" 2>/dev/null | sed "s|.*:||" | sort -u || true)
+if [[ "$PRIVATE" -eq 1 ]]; then
+    log "  --private set: skipping ollama.com public scrape (a private model is not publicly listed, so the scrape can't tell what's published). Relying on marker file only."
+    EXISTING_HTML=""
+else
+    EXISTING_HTML=$(curl -sL "https://ollama.com/${OL_TARGET}/tags" 2>/dev/null \
+        | grep -oE "${OL_TARGET}:[A-Za-z0-9_-]+" 2>/dev/null | sed "s|.*:||" | sort -u || true)
+fi
 EXISTING_MARKER=""
 if [[ -f "$MARKER_FILE" ]]; then
     EXISTING_MARKER=$(sort -u "$MARKER_FILE")
@@ -155,8 +179,8 @@ fi
 # that were bit-identical to plain Q-* — pushing again overwrites the tag
 # manifest on ollama.com with the new GGUF bytes). Combine with FORCE_TAGS
 # regex (or INCLUDE arg) to limit the scope of the override.
-if [[ "${FORCE_REPUSH:-0}" == "1" ]]; then
-    log "FORCE_REPUSH=1: ignoring EXISTING tag list — every TAG will be repushed (overwrites ollama.com manifest)."
+if [[ "$FORCE_REPUSH" == "1" ]]; then
+    log "--force / FORCE_REPUSH=1: ignoring EXISTING tag list (public scrape + marker) — every TAG will be (re)pushed, overwriting the ollama.com manifest in place."
     EXISTING=""
 fi
 
