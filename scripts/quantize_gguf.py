@@ -292,9 +292,27 @@ def _cd_file_base_ftype(quant: str) -> str:
 
 # Quants that require imatrix for good results.
 # General rule (T118): ALL K-quants (name contains "_K") + every IQ tier build
-# with imatrix by default — imatrix lifts Q6_K LCB +3pp, neutral on Q4_K_M.
+# with imatrix by default — imatrix lifts Q6_K LCB +3pp and most K-quants.
 # Legacy Q8_0/Q4_0/Q4_1 (no "_K") stay imatrix-free (no meaningful benefit).
 IMATRIX_QUANTS = {q for q in ALL_QUANTS if q.startswith("IQ") or q.startswith("UD-IQ") or "_K" in q}
+
+# Per-tier EXCEPTIONS: tiers that match the rule above by name but where imatrix
+# measurably HURTS quality, so they are built imatrix-FREE. IMATRIX_QUANTS (the
+# rule) and IMATRIX_EXCLUDE (the exceptions) are the two explicit halves of the
+# policy — the "with imatrix" list and the "without imatrix" list.
+#   Q4_K_M (v6-coder, 2026-05-25): imatrix HE+ 90.85% vs plain 92.07% (-1.22pp).
+IMATRIX_EXCLUDE = {"Q4_K_M"}
+
+
+def _uses_imatrix_by_rule(quant: str) -> bool:
+    """True iff `quant` should be built WITH an imatrix under the name-based rule:
+    a _K / IQ / UD-IQ tier AND not in the IMATRIX_EXCLUDE exception set. CD-*
+    technical requirements (a map that assigns IQ*/Q2_K tensors, which llama-quantize
+    mandates an imatrix for) are handled separately by callers and are NOT
+    suppressed by this rule."""
+    if quant in IMATRIX_EXCLUDE:
+        return False
+    return quant in IMATRIX_QUANTS or "IQ" in quant
 
 # Sanity check: capital questions
 SANITY_QUESTIONS = [
@@ -660,10 +678,11 @@ def quantize_one(tools: dict, f16_gguf: Path, output_dir: Path,
         if "IQ" in ttxt or "Q2_K" in ttxt:
             cd_needs_imatrix = True
 
-    # Add imatrix if available and quant benefits from it
-    # (standalone IQ*/UD-IQ* quants, anything with "IQ" in its name, or CD- maps
-    #  that assign at least one tensor to an IQ*/Q2_K tier)
-    if imatrix_file and (quant in IMATRIX_QUANTS or "IQ" in quant or cd_needs_imatrix):
+    # Add imatrix if available and quant benefits from it: standalone IQ*/UD-IQ*
+    # quants and any _K tier (minus IMATRIX_EXCLUDE, e.g. Q4_K_M which imatrix
+    # hurts), or CD- maps that assign at least one tensor to an IQ*/Q2_K tier
+    # (a hard llama-quantize requirement, never suppressed by the exclude list).
+    if imatrix_file and (_uses_imatrix_by_rule(quant) or cd_needs_imatrix):
         cmd.extend(["--imatrix", str(imatrix_file)])
 
     # _L/_XL variants: keep embed/output at Q8_0 for better quality
@@ -755,6 +774,47 @@ def _read_sha256_sidecar(gguf_path: Path) -> str | None:
     if len(first) == 64 and all(c in "0123456789abcdef" for c in first):
         return first
     return None
+
+
+def _hf_remote_sha256(repo_id: str, path_in_repo: str) -> str | None:
+    """Content sha256 of `path_in_repo` already on the HF *model* repo, or None
+    if the file is absent / unreadable. HF exposes the LFS oid, which is the
+    sha256 of the file content, so it is directly comparable to our local
+    `sha256sum` digest."""
+    try:
+        from huggingface_hub import HfApi
+        infos = HfApi().get_paths_info(repo_id, [path_in_repo],
+                                       repo_type="model", expand=True)
+        for f in infos:
+            if getattr(f, "path", None) == path_in_repo:
+                lfs = getattr(f, "lfs", None)
+                if lfs is not None:
+                    return getattr(lfs, "sha256", None)
+    except Exception as e:
+        print(f"  (remote sha lookup failed for {path_in_repo}: {e})", flush=True)
+    return None
+
+
+def _hf_already_has(repo_id: str, local_path: Path, path_in_repo: str) -> bool:
+    """True iff a byte-identical copy (same content sha256) of `local_path` is
+    already on `repo_id`. Fail-safe: any error, missing remote file, or sha
+    mismatch returns False so the caller still uploads.
+
+    Why this exists: a per-tier rebuild invokes `quantize_gguf --only <tier>`
+    once per tier as a fresh process, so the F16 base (~37 GB) and imatrix.dat
+    were being re-uploaded on *every* tier. The local digest is cached in the
+    `<path>.sha256` sidecar, so the 37 GB F16 is hashed at most once across all
+    per-tier invocations (and not at all once the sidecar exists)."""
+    remote = _hf_remote_sha256(repo_id, path_in_repo)
+    if not remote:
+        return False
+    local = _read_sha256_sidecar(local_path)
+    if local is None:
+        try:
+            local = _write_sha256_sidecar(local_path)  # computes once, caches
+        except Exception:
+            return False
+    return local == remote
 
 
 def verify_cd_distinct(cd_path: Path, quant: str, model_name: str,
@@ -1707,10 +1767,8 @@ def main():
     # the operator can fix it (install llama-imatrix / provide cal data) and
     # restart, instead of discovering it tier-by-tier.
     def _quant_needs_imatrix(q: str) -> bool:
-        if q in IMATRIX_QUANTS:
-            return True
-        if q.startswith("IQ"):
-            return True
+        # CD-* technical requirement first: a map assigning IQ*/Q2_K tensors makes
+        # imatrix mandatory at quantize time, regardless of IMATRIX_EXCLUDE.
         if q.startswith("CD-"):
             tt = Path(__file__).parent / f"tensor_types_{q}.txt"
             if tt.exists():
@@ -1720,7 +1778,7 @@ def main():
                         return True
                 except OSError:
                     pass
-        return False
+        return _uses_imatrix_by_rule(q)
 
     imatrix_required_by = [q for q in quants if _quant_needs_imatrix(q)]
     if imatrix_required_by:
@@ -2061,31 +2119,42 @@ def main():
                                daemon=True)
         upload_thread.start()
 
-    # Also upload base F16 GGUF
+    # Also upload base F16 GGUF — but skip when a byte-identical copy is already
+    # on the repo. Without this, a per-tier `--only` rebuild re-pushes ~37 GB on
+    # every tier (the F16 lives outside the tier loop, so each fresh invocation
+    # re-uploads it). Force a re-upload with OMK_FORCE_BASE_UPLOAD=1.
     if hf_repo:
-        upload_queue.put((base_gguf, f"{precision.upper()} base"))
+        if os.environ.get("OMK_FORCE_BASE_UPLOAD") != "1" \
+                and _hf_already_has(hf_repo, base_gguf, base_gguf.name):
+            print(f"  {precision.upper()} base already on {hf_repo} (sha match) "
+                  f"— skipping re-upload", flush=True)
+        else:
+            upload_queue.put((base_gguf, f"{precision.upper()} base"))
 
     # MANDATORY: upload imatrix.dat alongside the quants so it can never be lost.
     # If future rebuilds are needed, the canonical imatrix is always reachable
     # from the HF repo itself — no pod-destroy-and-lose-forever scenarios.
     # User rule 2026-04-11: "You MUST SAVE the imatrix.dat used to quantize".
     if hf_repo and imatrix_file and imatrix_file.exists():
-        try:
-            from huggingface_hub import HfApi
-            api = HfApi()
-            imatrix_size_mb = imatrix_file.stat().st_size / 1024**2
-            print(f"\n  Uploading imatrix.dat ({imatrix_size_mb:.1f} MB) to HF repo...", flush=True)
-            api.upload_file(
-                path_or_fileobj=str(imatrix_file),
-                path_in_repo="imatrix.dat",
-                repo_id=hf_repo,
-                repo_type="model",
-                commit_message="Add imatrix.dat used to quantize (for reproducibility/audit)",
-            )
-            print(f"  imatrix.dat uploaded to {hf_repo}", flush=True)
-        except Exception as e:
-            print(f"  WARNING: imatrix.dat upload FAILED: {e}", flush=True)
-            print(f"  imatrix.dat is still available locally at: {imatrix_file}", flush=True)
+        if _hf_already_has(hf_repo, imatrix_file, "imatrix.dat"):
+            print(f"  imatrix.dat already on {hf_repo} (sha match) — skipping re-upload", flush=True)
+        else:
+            try:
+                from huggingface_hub import HfApi
+                api = HfApi()
+                imatrix_size_mb = imatrix_file.stat().st_size / 1024**2
+                print(f"\n  Uploading imatrix.dat ({imatrix_size_mb:.1f} MB) to HF repo...", flush=True)
+                api.upload_file(
+                    path_or_fileobj=str(imatrix_file),
+                    path_in_repo="imatrix.dat",
+                    repo_id=hf_repo,
+                    repo_type="model",
+                    commit_message="Add imatrix.dat used to quantize (for reproducibility/audit)",
+                )
+                print(f"  imatrix.dat uploaded to {hf_repo}", flush=True)
+            except Exception as e:
+                print(f"  WARNING: imatrix.dat upload FAILED: {e}", flush=True)
+                print(f"  imatrix.dat is still available locally at: {imatrix_file}", flush=True)
 
     failed = []
     succeeded = []
