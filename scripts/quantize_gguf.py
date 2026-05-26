@@ -532,28 +532,73 @@ def _gguf_block_count(gguf_path: Path):
     return None
 
 
-def auto_ngl(model_size_gb: float, n_layers: int = None) -> int:
-    """Auto-detect ngl from free VRAM and the model's ACTUAL layer count.
+def _gguf_layer_sizing(gguf_path: Path):
+    """Return (n_layers, per_layer_bytes, nonlayer_bytes) from a GGUF using the
+    ACTUAL summed tensor byte sizes, so partial-offload budgeting reflects real
+    per-block weight size — not total/uniform-count. The token_embd + output
+    tensors (~1.5 GB for Gemma-4) are NOT per-layer and stay on CPU during
+    partial offload, so they are excluded from the per-layer figure. Returns
+    None on failure so callers fall back to the n_layers path."""
+    try:
+        import re as _re
+        from gguf import GGUFReader
+        r = GGUFReader(str(gguf_path))
+        n_layers = None
+        for key, field in r.fields.items():
+            if key.endswith(".block_count"):
+                n_layers = int(field.parts[field.data[0]][0])
+                break
+        if not n_layers:
+            return None
+        blk = _re.compile(r"\bblk\.\d+\.")
+        layer_b = nonlayer_b = 0
+        for t in r.tensors:
+            nb = int(t.n_bytes)
+            if blk.search(t.name):
+                layer_b += nb
+            else:
+                nonlayer_b += nb
+        if layer_b <= 0:
+            return None
+        return n_layers, layer_b / n_layers, nonlayer_b
+    except Exception:
+        return None
 
-    Returns 99 (all) when the whole model fits, else the number of repeating
-    layers whose F16 weights fit in `usable` VRAM, capped at n_layers-1 so the
-    token-embd / output tensors stay on CPU (they only move to GPU at
-    ngl >= n_layers+1 and would tip a tight card into OOM).
 
-    n_layers MUST be the model's real block count. The old code scaled by a
-    hardcoded 50 ("typical dense"); on a 30-layer Gemma-4-26B F16 (~37 GB) and
-    a 24 GB card that yielded ngl~31 -> full offload -> cudaMalloc OOM.
+def auto_ngl(model_size_gb: float, n_layers: int = None, layer_sizing=None) -> int:
+    """Auto-detect ngl from FREE VRAM and the model's layer geometry.
+
+    Returns 99 (all) when the whole model fits. For partial offload the budget
+    is in REAL bytes when `layer_sizing` (n_layers, per_layer_bytes,
+    nonlayer_bytes) is supplied: offloaded blocks must fit in
+    (free VRAM - max(2GB,12%) compute/KV/context headroom) / per_layer_bytes.
+    Falls back to the cruder uniform ratio*n_layers when only n_layers is known,
+    and to a fixed *32 when neither is. ngl is always capped at n_layers-1 so
+    token_embd/output stay on CPU (moving them to GPU at ngl>=n_layers tips a
+    tight card into OOM).
+
+    History: the original scaled by a hardcoded 50 ("typical dense") -> on a
+    30-layer Gemma-4-26B F16 / 24 GB card that gave ngl>=n_layers -> full
+    offload -> cudaMalloc OOM. The n_layers cap fixed the overshoot; layer_sizing
+    additionally budgets by ACTUAL per-block bytes (token_embd/output excluded).
     """
-    vram_mb = detect_gpu_vram_mb()
-    if vram_mb == 0:
+    free_mb = detect_gpu_vram_mb()
+    if free_mb == 0:
         return 0
     model_mb = model_size_gb * 1024
-    available = vram_mb - 512  # reserve 512MB for overhead
-    if available >= model_mb:
-        return 99  # fits entirely
-    # Partial offload: fraction of model weights that fit, mapped onto the
-    # real layer count. 0.85 leaves ~3-4 GB for KV cache + compute buffers.
-    usable = available * 0.85
+    if free_mb - 1024 >= model_mb:
+        return 99  # fits entirely (with a small compute margin)
+    # Byte-accurate partial offload (preferred): budget by the ACTUAL per-block
+    # weight size, not total/uniform-count.
+    if layer_sizing:
+        nl, per_layer_b, _nonlayer_b = layer_sizing
+        per_layer_mb = per_layer_b / 1024 / 1024
+        if nl and per_layer_mb > 0:
+            headroom_mb = max(2048, int(free_mb * 0.12))
+            budget_mb = max(0, free_mb - headroom_mb)
+            return max(0, min(int(budget_mb / per_layer_mb), nl - 1))
+    # Uniform fallback: fraction of total weights that fit, onto real n_layers.
+    usable = (free_mb - 512) * 0.85
     ratio = usable / model_mb
     if n_layers and n_layers > 0:
         return max(0, min(int(ratio * n_layers), n_layers - 1))
@@ -577,10 +622,16 @@ def compute_imatrix(tools: dict, f16_gguf: Path, cal_data: Path,
     # Auto-detect GPU layers if not specified
     if ngl is None:
         model_size_gb = f16_gguf.stat().st_size / 1024**3
-        n_layers = _gguf_block_count(f16_gguf)
-        ngl = auto_ngl(model_size_gb, n_layers=n_layers)
-        print(f"  Auto ngl={ngl} (VRAM: {detect_gpu_vram_mb()}MB free, "
-              f"model: {model_size_gb:.1f}GB, layers: {n_layers})", flush=True)
+        sizing = _gguf_layer_sizing(f16_gguf)
+        n_layers = sizing[0] if sizing else _gguf_block_count(f16_gguf)
+        ngl = auto_ngl(model_size_gb, n_layers=n_layers, layer_sizing=sizing)
+        if sizing:
+            print(f"  Auto ngl={ngl} (free {detect_gpu_vram_mb()}MB; {sizing[0]} layers @ "
+                  f"{sizing[1]/1e9:.2f}GB/layer, nonlayer {sizing[2]/1e9:.2f}GB, "
+                  f"model {model_size_gb:.1f}GB)", flush=True)
+        else:
+            print(f"  Auto ngl={ngl} (VRAM: {detect_gpu_vram_mb()}MB free, "
+                  f"model: {model_size_gb:.1f}GB, layers: {n_layers})", flush=True)
 
     print(f"  Computing imatrix from {cal_data.name}...", flush=True)
     cmd = [
