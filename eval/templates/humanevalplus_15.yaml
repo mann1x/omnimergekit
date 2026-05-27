@@ -1,0 +1,57 @@
+# HumanEval+ 15-problem FAST recipe-screening diagnostic (T125, 2026-05-26).
+#
+# Purpose: a ~15-problem HE+ subset to triage new router-recovery / prune
+# recipes quickly, biased toward the behaviours that discriminate them —
+# rumination, rumination-recovery, and prune-specific failures — rather than a
+# uniform first-N sample. NOT a substitute for humanevalplus_full when reporting.
+#
+# Built from the 62e-v1-coder EAC router-recovery run as the exemplar recipe,
+# cross-referenced against three samples sources (scripts/build_he15_curated.py):
+#   PRE  = pre-EAC 62e baseline   (prune-damage baseline, ~49.39%)
+#   POST = post-EAC 62e           (recipe under test)
+#   E128 = 128e Q6_K llama.cpp    (ceiling / "same as 128e" reference)
+#
+# Composition (15):
+#   3  stable     : PRE PASS + POST PASS, both concise (<5k chars) — sanity floor.
+#   <=6 EAC-wins  : PRE ruminated (raw >20k) -> POST concise+correct, AND E128 PASS.
+#                   The router-recovery signal; fewer selected if <6 qualify.
+#   rest no-help  : ~half runaway loops (POST raw >20k, EAC didn't fix),
+#                   ~half wrong-only-on-62e (POST FAIL, E128 PASS, not a loop).
+#                   Falls back to all-runaway if no wrong-only-62e problems exist.
+#
+# Indices are AUTO-FILLED by scripts/build_he15_curated.py and mirror
+# utils_chat._HE_PLUS_CURATED15_INDICES (the shadow task is authoritative; the
+# selection.indices below is kept in sync as documentation).
+name: humanevalplus_15
+backend: lm-eval
+task: humaneval_plus_chat_curated15   # shadow with hardcoded process_docs filter
+n: 15
+selection:
+  type: indices
+  # AUTOINDICES15-BEGIN (filled by scripts/build_he15_curated.py)
+  indices: [0, 1, 5, 10, 13, 14, 23, 39, 45, 53, 59, 75, 129, 140, 143]
+  # AUTOINDICES15-END
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: pass_at_1
+  filter: build_predictions
+  validated_against: evalplus/humanevalplus
+  validation_date: "2026-05-26"
+backend_args:
+  lm_eval_include_path: lm_eval_tasks/humaneval_chat
+  apply_chat_template: true
+  num_fewshot: 0
+  batch_size: 1
+  confirm_run_unsafe_code: true
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: humanevalplus_15
+reports:
+  token_stats: true

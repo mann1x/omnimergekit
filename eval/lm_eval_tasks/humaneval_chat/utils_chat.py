@@ -233,6 +233,38 @@ def select_he_plus_curated30(dataset):
     return dataset.select(sorted(_HE_PLUS_CURATED30_INDICES))
 
 
+# HE+ curated 15-problem FAST recipe-screening diagnostic (T125, 2026-05-26):
+# built from the 62e-v1-coder EAC router-recovery run as the exemplar recipe.
+# Composition + provenance in eval/templates/humanevalplus_15.yaml; indices are
+# auto-filled by scripts/build_he15_curated.py (keep in sync with that template).
+_HE_PLUS_CURATED15_INDICES = {0, 1, 5, 10, 13, 14, 23, 39, 45, 53, 59, 75, 129, 140, 143}  # AUTOINDICES15 — filled by build_he15_curated.py
+
+
+def select_he_plus_curated15(dataset):
+    """Filter HE+ dataset to the 15 curated fast-diagnostic indices."""
+    if not _HE_PLUS_CURATED15_INDICES:
+        raise ValueError(
+            "humaneval_plus_chat_curated15: indices not yet populated — run "
+            "scripts/build_he15_curated.py after the post-EAC HE+ run completes."
+        )
+    return dataset.select(sorted(_HE_PLUS_CURATED15_INDICES))
+
+
+# fc15_25 HE+ regression fast-screen: the 15 HumanEval+ problems the 62e
+# v1-coder (fc15_25-p8 mean-20 tie-break winner) FAILS — 3 rumination
+# (76, 84, 156) + 12 capability. Used to screen recipe-fine-tuning candidates
+# on the exact HE+ failures without a full 164-problem run. doc_id == HumanEval/N.
+# See scripts/fc15_25_anomaly_testset.json + scripts/fc15_25_rerun_diff.py.
+_HE_PLUS_FC15_INDICES = {15, 32, 39, 76, 83, 84, 91, 95, 103, 115, 132, 139, 145, 156, 163}
+
+
+def select_he_plus_fc15(dataset):
+    """Filter HE+ dataset to the 15 fc15_25-p8 failing indices (recipe screen)."""
+    if not _HE_PLUS_FC15_INDICES:
+        raise ValueError("humaneval_plus_chat_fc15: indices not populated")
+    return dataset.select(sorted(_HE_PLUS_FC15_INDICES))
+
+
 # ─── Regression test ──────────────────────────────────────────────────────────
 # `python utils_chat.py` runs these. If you change `_clean_one`, run it.
 

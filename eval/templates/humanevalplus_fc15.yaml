@@ -1,0 +1,49 @@
+# HumanEval+ FC15 — the 15 HE+ problems the 62e v1-coder (fc15_25-p8) FAILS.
+#
+# Purpose: a recipe-fine-tuning REGRESSION screen, distinct in intent from
+# humanevalplus_15 (curated15). curated15 is a *discriminating* mix biased toward
+# rumination/recovery dynamics; FC15 is the exact failure set of the current
+# champion — re-run it on a candidate recipe and any PASS is a direct HE+ win.
+# Pair with scripts/fc15_25_rerun_diff.py to bucket each flip RUMINATION vs
+# CAPABILITY against scripts/fc15_25_anomaly_testset.json.
+#
+# The 15 (HumanEval/N == dataset position N for evalplus/humanevalplus):
+#   rumination (recipe-addressable, 3): 76, 84, 156
+#   capability (expert-survival, 12)  : 15 32 39 83 91 95 103 115 132 139 145 163
+# Generation budget matches humanevalplus_full (16384 / 12288 greedy) so a
+# ruminating candidate ruminates here too — do NOT lower it to "speed up" the
+# screen, that would mask the very behaviour this set exists to catch.
+#
+# Indices mirror utils_chat._HE_PLUS_FC15_INDICES (the shadow task's process_docs
+# filter is authoritative; selection.indices below is kept in sync as docs).
+name: humanevalplus_fc15
+backend: lm-eval
+task: humaneval_plus_chat_fc15   # shadow with hardcoded process_docs filter
+n: 15
+selection:
+  type: indices
+  indices: [15, 32, 39, 76, 83, 84, 91, 95, 103, 115, 132, 139, 145, 156, 163]
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: pass_at_1
+  filter: build_predictions
+  validated_against: evalplus/humanevalplus
+  validation_date: "2026-05-27"
+backend_args:
+  lm_eval_include_path: lm_eval_tasks/humaneval_chat
+  apply_chat_template: true
+  num_fewshot: 0
+  batch_size: 1
+  confirm_run_unsafe_code: true
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: humanevalplus_fc15
+reports:
+  token_stats: true
