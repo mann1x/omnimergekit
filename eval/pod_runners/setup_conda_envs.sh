@@ -70,7 +70,15 @@ ensure_omk_env() {
         _sce_accept_tos
         conda create -n "$name" python=3.11 -y 2>&1 | tail -3
         "$pfx/bin/pip" install --quiet --upgrade pip wheel setuptools
-        "$pfx/bin/pip" install --quiet --no-build-isolation -r "$REPO_ROOT/requirements.txt"      2>&1 | tail -5
+        # causal-conv1d / flash-linear-attention / bitsandbytes are Qwen3.5/3.6
+        # *merge-engine* deps (SSM CUDA kernels). They are never needed for a
+        # llama.cpp/vLLM eval pod, and their from-source build breaks pip
+        # metadata generation on a bare CUDA image (2026-05-27 causal-conv1d
+        # FATAL on pod 38081385). Filter per the EVAL_PROTOCOL pod-deps runbook.
+        local req_eval="$REPO_ROOT/.requirements_eval_filtered.txt"
+        grep -vE '^(causal-conv1d|flash-linear-attention|bitsandbytes)' \
+            "$REPO_ROOT/requirements.txt" > "$req_eval"
+        "$pfx/bin/pip" install --quiet --no-build-isolation -r "$req_eval"   2>&1 | tail -5
         "$pfx/bin/pip" install --quiet -r "$REPO_ROOT/requirements-eval.txt" 2>&1 | tail -3
     else
         _sce_log "$name env exists"
