@@ -291,6 +291,11 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=1024)
     ap.add_argument("--limit", type=int, default=0,
                     help="First N problems (0 = full split)")
+    ap.add_argument("--problems", default="",
+                    help="Comma-separated problem-name allowlist (e.g. "
+                         "HumanEval_65_circular_shift,HumanEval_89_encrypt). When "
+                         "set, ONLY these problems are generated and --limit is "
+                         "ignored. Used by the 21q rumination per-problem screen.")
     ap.add_argument("--concurrency", type=int, default=2,
                     help="Parallel requests (match server --parallel)")
     ap.add_argument("--cache-db", default=None,
@@ -314,6 +319,13 @@ def main():
           flush=True)
     ds = load_dataset("nuprl/MultiPL-E", cfg, split="test")
     docs = list(ds)
+    if args.problems:
+        keep = {p.strip() for p in args.problems.split(",") if p.strip()}
+        docs = [d for d in docs if d["name"] in keep]
+        missing = keep - {d["name"] for d in docs}
+        if missing:
+            print(f"[gen] WARN: {len(missing)} requested problems not found in {cfg}: "
+                  f"{sorted(missing)}", flush=True)
     if args.limit > 0:
         docs = docs[: args.limit]
     print(f"[gen] {cfg}: {len(docs)} problems  out_dir={out_dir}", flush=True)

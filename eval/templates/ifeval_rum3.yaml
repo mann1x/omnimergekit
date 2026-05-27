@@ -1,0 +1,40 @@
+# IFEval rum3 — the 3 IFEval RUMINATION prompts (keys 143, 1300, 1477) of the
+# 21q screen. Shadow task ifeval_rum3 (process_docs key-filter, scorers
+# re-exported from stock ifeval). Generation IDENTICAL to ifeval_100
+# (16384/12288 greedy) so a PASS here vs the baseline's known failure is a
+# rumination flip, not a budget change. Replaces the wasteful full ifeval_100
+# in the 21q screen: 3 prompts instead of 100.
+name: ifeval_rum3
+backend: lm-eval
+task: ifeval_rum3
+n: 3
+selection:
+  # Cosmetic for lm-eval (only --limit=n is honored; the ifeval_rum3 shadow's
+  # process_docs does the real key-filter to 143/1300/1477). Mirrors
+  # humanevalplus_rum3's [76,84,156]; values are the IFEval keys for clarity.
+  type: indices
+  indices: [143, 1300, 1477]
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: prompt_level_strict_acc
+  filter: none
+sanity:
+  min_p10_chars: 5
+backend_args:
+  lm_eval_include_path: lm_eval_tasks/ifeval_rum
+  apply_chat_template: true
+  num_fewshot: 0
+  batch_size: 1
+  num_concurrent: 2
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: ifeval_rum3
+reports:
+  token_stats: true

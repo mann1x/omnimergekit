@@ -1,0 +1,35 @@
+# ifeval_rum3 — IFEval slice (3q) of the 21q RUMINATION screen.
+# The 3 IFEval prompts the 62e v1-coder (fc15_25-p8) fails by RUMINATION
+# (google/IFEval train-split keys 143, 1300, 1477). Identical to the stock
+# `ifeval` task except process_docs pre-selects those 3 keys; the strict/loose
+# scorers are re-exported from lm_eval.tasks.ifeval.utils via utils_ifeval.
+task: ifeval_rum3
+dataset_path: google/IFEval
+dataset_name: null
+output_type: generate_until
+test_split: train
+num_fewshot: 0
+process_docs: !function utils_ifeval.select_ifeval_rum3
+doc_to_text: prompt
+doc_to_target: 0
+generation_kwargs:
+  until: []
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 16384
+process_results: !function utils_ifeval.process_results
+metric_list:
+  - metric: prompt_level_strict_acc
+    aggregation: mean
+    higher_is_better: true
+  - metric: inst_level_strict_acc
+    aggregation: !function utils_ifeval.agg_inst_level_acc
+    higher_is_better: true
+  - metric: prompt_level_loose_acc
+    aggregation: mean
+    higher_is_better: true
+  - metric: inst_level_loose_acc
+    aggregation: !function utils_ifeval.agg_inst_level_acc
+    higher_is_better: true
+metadata:
+  version: 4.0

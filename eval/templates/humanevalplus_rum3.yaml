@@ -1,0 +1,35 @@
+# HE+ rum3 — the 3 HE+ RUMINATION problems of the 21q screen (76, 84, 156).
+# Part of the 21q rumination fast-screen (HE+×3 + IFEval×3 + MPE×15). Re-run on
+# a candidate recipe; any PASS here = a rumination win. Full 16384/12288 greedy
+# budget so rumination manifests. Pair: scripts/fc15_25_rerun_diff.py.
+name: humanevalplus_rum3
+backend: lm-eval
+task: humaneval_plus_chat_rum3   # shadow with hardcoded process_docs filter
+n: 3
+selection:
+  type: indices
+  indices: [76, 84, 156]
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: pass_at_1
+  filter: build_predictions
+  validated_against: evalplus/humanevalplus
+  validation_date: "2026-05-27"
+backend_args:
+  lm_eval_include_path: lm_eval_tasks/humaneval_chat
+  apply_chat_template: true
+  num_fewshot: 0
+  batch_size: 1
+  confirm_run_unsafe_code: true
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: humanevalplus_rum3
+reports:
+  token_stats: true

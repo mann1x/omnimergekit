@@ -49,7 +49,11 @@ KNOWN_BACKENDS = {"lm-eval", "lcb_custom", "multipl_e"}
 #              --task-ids. Used by curated smoke subsets.
 #   langs    — multipl_e only: list[str] of MultiPL-E languages; n is the
 #              per-language problem count (first n of each split).
-KNOWN_SELECTION_TYPES = {"indices", "filter", "explicit", "langs"}
+#   problems — multipl_e only: {lang: [problem_name, ...]} per-problem allowlist.
+#              dispatch_multipl generates ONLY the named problems per language
+#              (overrides langs + first-N). n is the total across all languages.
+#              Used by the 21q rumination screen (multipl_e_rum15).
+KNOWN_SELECTION_TYPES = {"indices", "filter", "explicit", "langs", "problems"}
 REQUIRED_TOP_LEVEL = {"name", "backend", "task", "n", "selection", "generation", "scoring", "cache"}
 
 
@@ -134,6 +138,32 @@ def validate(t: dict[str, Any], path: Path) -> None:
             raise SystemExit(f"{path}: selection.langs must be a non-empty list[str]")
         if not isinstance(t["n"], int) or t["n"] <= 0:
             raise SystemExit(f"{path}: n must be a positive int (per-language count)")
+    elif sel["type"] == "problems":
+        # MultiPL-E per-problem allowlist (21q rumination screen): a
+        # {lang: [problem_name, ...]} map. dispatch_multipl generates ONLY the
+        # named problems per language (overrides langs + first-N). n is the
+        # total problem count across all languages. Bare problem names (no
+        # `lang::` prefix) — matched against the dataset's `name` field.
+        if t["backend"] != "multipl_e":
+            raise SystemExit(
+                f"{path}: selection.type=problems only supported for "
+                f"backend=multipl_e (got {t['backend']!r})"
+            )
+        probs = sel.get("problems")
+        if not isinstance(probs, dict) or not probs or not all(
+            isinstance(lang, str) and isinstance(pl, list) and pl
+            and all(isinstance(p, str) for p in pl)
+            for lang, pl in probs.items()
+        ):
+            raise SystemExit(
+                f"{path}: selection.problems must be a non-empty "
+                f"{{lang: [problem_name, ...]}} map"
+            )
+        total = sum(len(v) for v in probs.values())
+        if t["n"] != total:
+            raise SystemExit(
+                f"{path}: n={t['n']} disagrees with total problems={total}"
+            )
 
 
 def load(arg: str) -> dict[str, Any]:

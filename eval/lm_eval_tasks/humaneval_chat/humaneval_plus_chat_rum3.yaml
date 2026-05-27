@@ -1,0 +1,35 @@
+# humaneval_plus_chat_rum3 — the HE+ slice (3q) of the 21q RUMINATION screen.
+# The 3 HumanEval+ problems the 62e v1-coder (fc15_25-p8) fails by RUMINATION
+# (HumanEval/76, 84, 156) — loop/runaway/ruminate-fail, recipe-addressable.
+# Identical to humaneval_plus_chat except process_docs pre-selects rum3.
+# Full generation budget (set by humanevalplus_rum3.yaml omk template) so a
+# ruminating candidate still ruminates here. Scoring/diff: fc15_25_rerun_diff.py.
+task: humaneval_plus_chat_rum3
+dataset_path: evalplus/humanevalplus
+unsafe_code: true
+output_type: generate_until
+test_split: test
+process_docs: !function utils_chat.select_he_plus_rum3
+doc_to_text: "Write a complete Python function that solves the following problem. Output ONLY the function code inside a single ```python ... ``` markdown block.\n\n```python\n{{ prompt }}\n```"
+doc_to_target: "{{test}}\ncheck({{entry_point}})"
+generation_kwargs:
+  until:
+    - "\n```"
+    - "</s>"
+    - "<|endoftext|>"
+  max_gen_toks: 16384
+  do_sample: false
+metric_list:
+  - metric: !function utils_chat.pass_at_k
+    aggregation: mean
+    higher_is_better: true
+    k: [1]
+repeats: 1
+num_fewshot: 0
+filter_list:
+  - name: "extract_chat"
+    filter:
+      - function: "custom"
+        filter_fn: !function utils_chat.build_predictions_chat
+metadata:
+  version: 1.0

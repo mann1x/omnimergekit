@@ -627,7 +627,14 @@ def dispatch_multipl(template: dict, model_tag: str, base_url: str,
     g = template["generation"]
     sel = template["selection"]
     ba = template.get("backend_args", {}) or {}
-    langs = sel.get("langs") or ["rs", "java", "js"]
+    # Per-problem allowlist (21q rumination screen): selection.problems is a
+    # {lang: [problem_name, ...]} map. When present it overrides langs + first-N,
+    # generating ONLY the named problems per language. Falls back to langs+first-N.
+    problems_map = sel.get("problems") or None
+    if problems_map:
+        langs = list(problems_map.keys())
+    else:
+        langs = sel.get("langs") or ["rs", "java", "js"]
     n = int(template.get("n", 0))
     max_tokens = int(g.get("max_gen_toks", 1024))
     mode = g.get("mode", "completion")  # chat = /v1/chat/completions + code extraction
@@ -660,10 +667,12 @@ def dispatch_multipl(template: dict, model_tag: str, base_url: str,
                 "--model-name", model_tag,
                 "--out-dir", str(gen_dir),
                 "--max-tokens", str(max_tokens),
-                "--limit", str(n if n > 0 else 0),
+                "--limit", str(0 if problems_map else (n if n > 0 else 0)),
                 "--concurrency", str(concurrency),
                 "--cache-db", str(cache_db),
             ]
+            if problems_map:
+                gen_cmd += ["--problems", ",".join(problems_map[lang])]
             log(f"mpe gen [{lang}]: {' '.join(shlex.quote(c) for c in gen_cmd)}")
             grc = subprocess.call(gen_cmd)
             if grc != 0:

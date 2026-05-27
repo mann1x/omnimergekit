@@ -1,0 +1,45 @@
+# MultiPL-E rum15 — the 15 MPE problems of the 21q RUMINATION screen.
+# The 15 rs/java/js problems the 62e v1-coder (fc15_25-p8) fails by RUMINATION
+# (loop/runaway), the bulk (15/21) of the rumination set. Uses the NEW
+# selection.type=problems per-problem allowlist (omk_eval dispatch_multipl +
+# multipl_e_generate.py --problems). Generation config is IDENTICAL to
+# multipl_e_100 (chat, 1024, greedy) so a per-ID PASS/FAIL flip vs the baseline
+# reflects the recipe, NOT a budget change — apples-to-apples with the baseline's
+# existing mpe_100 samples. Score via scripts/fc15_25_rerun_diff.py.
+name: multipl_e_rum15
+backend: multipl_e
+task: multipl_e
+n: 15
+selection:
+  type: problems
+  problems:
+    java: [HumanEval_100_make_a_pile, HumanEval_19_sort_numbers, HumanEval_47_median,
+           HumanEval_65_circular_shift, HumanEval_86_anti_shuffle, HumanEval_89_encrypt]
+    js:   [HumanEval_10_make_palindrome, HumanEval_66_digitSum, HumanEval_93_encode,
+           HumanEval_95_check_dict_case]
+    rs:   [HumanEval_100_make_a_pile, HumanEval_65_circular_shift, HumanEval_70_strange_sort_list,
+           HumanEval_83_starts_one_ends, HumanEval_89_encrypt]
+generation:
+  mode: chat
+  max_gen_toks: 1024
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  scorer: multipl_e
+  metric: pass_at_1
+  aggregate: macro_mean_over_langs
+backend_args:
+  num_concurrent: 2
+  llama_parallel: 2
+  llama_ctx: 16384
+cache:
+  sqlite_prefix: mpe_rum15
+reports:
+  token_stats: true
+sanity:
+  min_p10_chars: 1
+dependencies:
+  python_modules: [datasets]
+  docker_images: [ghcr.io/nuprl/multipl-e-evaluation]

@@ -265,6 +265,20 @@ def select_he_plus_fc15(dataset):
     return dataset.select(sorted(_HE_PLUS_FC15_INDICES))
 
 
+# 21q RUMINATION fast-screen — the 3 HE+ problems the 62e v1-coder fc15_25-p8
+# fails by RUMINATION (loop/runaway/ruminate-fail), not capability. These are
+# the recipe-addressable HE+ slice of the 21q rumination set (the other 18 are
+# IFEval×3 + MPE×15). doc_id == HumanEval/N. See scripts/fc15_25_anomaly_testset.json.
+_HE_PLUS_RUM3_INDICES = {76, 84, 156}
+
+
+def select_he_plus_rum3(dataset):
+    """Filter HE+ dataset to the 3 fc15_25-p8 RUMINATION indices (21q screen)."""
+    if not _HE_PLUS_RUM3_INDICES:
+        raise ValueError("humaneval_plus_chat_rum3: indices not populated")
+    return dataset.select(sorted(_HE_PLUS_RUM3_INDICES))
+
+
 # ─── Regression test ──────────────────────────────────────────────────────────
 # `python utils_chat.py` runs these. If you change `_clean_one`, run it.
 
