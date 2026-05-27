@@ -32,17 +32,22 @@ if grep -q "refined 2026-05-21" "$TARGET"; then
     echo "[fix-a] already applied"; exit 0
 fi
 
-# Snapshot
+# Snapshot (restored if the apply fails to land the sentinel).
 cp -p "$TARGET" "$TARGET.pre-fix-a"
-# Apply with patch tool — fuzz allowed because lm-eval may have minor whitespace shifts
-patch -p1 --no-backup-if-mismatch --fuzz=3 -d "$(dirname "$LM_EVAL_DIR")" \
-    < "$PATCH_DIR/lm_eval_fix_a_reasoning_content_fallback.patch"
+# Apply via the robust string-replace patcher — NOT a context-diff. A `.patch`
+# assumes a known starting state; fresh lm-eval installs ship the STOCK 0.4.11
+# parse_generations form, which the unified diff can't match ("Hunk FAILED" —
+# the 2026-05-27 day-burn). fix_a_lm_eval_patch.py anchors on the stock line,
+# emits the refined Fix-A, and is idempotent. Pure-stdlib → any python works.
+PYBIN="${OMK_PYTHON:-$(command -v python3 || command -v python)}"
+"$PYBIN" "$PATCH_DIR/fix_a_lm_eval_patch.py" "$TARGET"
 
-# Verify the sentinel
+# Verify the sentinel landed; restore the snapshot on any failure.
 if grep -q "refined 2026-05-21" "$TARGET"; then
     echo "[fix-a] applied successfully"
+    rm -f "$TARGET.pre-fix-a"
 else
-    echo "[fix-a] ERROR: sentinel missing after patch — restoring backup" >&2
+    echo "[fix-a] ERROR: sentinel missing after apply — restoring backup" >&2
     mv "$TARGET.pre-fix-a" "$TARGET"
     exit 1
 fi

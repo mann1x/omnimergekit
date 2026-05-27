@@ -1,6 +1,6 @@
 --- a/lm_eval/models/openai_completions.py
 +++ b/lm_eval/models/openai_completions.py
-@@ -215,7 +215,21 @@ class LocalChatCompletion(LocalCompletionsAPI):
+@@ -215,7 +215,22 @@ class LocalChatCompletion(LocalCompletionsAPI):
                  tmp = [None] * len(out["choices"])
                  for choices in out["choices"]:
                      msg = choices["message"]
