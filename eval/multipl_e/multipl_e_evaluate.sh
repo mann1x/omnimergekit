@@ -31,6 +31,10 @@ MPE_HARNESS="${MPE_HARNESS:-/workspace/MultiPL-E}"
 
 [[ -d "$GEN_DIR" ]] || { echo "ERROR: $GEN_DIR not found" >&2; exit 1; }
 mkdir -p "$OUT_DIR"
+# docker -v requires absolute host paths; a relative path with '/' is read as a
+# named volume and rejected ("invalid characters for a local volume name").
+GEN_DIR="$(realpath "$GEN_DIR")"
+OUT_DIR="$(realpath "$OUT_DIR")"
 
 N=$(ls "$GEN_DIR"/*.json 2>/dev/null | wc -l)
 echo "[eval] mode=$MODE  generations: $N files in $GEN_DIR"
