@@ -199,6 +199,11 @@ for t in "${selected[@]}"; do
         >> "$bench_log"
     rc=${PIPESTATUS[0]}
     set +o pipefail
+    if [[ $rc -eq 7 ]]; then
+        log "[$t] FATAL: omk_eval hf-token pre-flight (exit 7) — '$t' uses a GATED dataset and no HF_TOKEN is set."
+        log "      export HF_TOKEN in the suite env (or: hf auth login), then re-run. ABORTING suite."
+        exit 7
+    fi
     bend=$(date +%s); bdur=$((bend - bstart))
     # ── per-template FINISH marker (suite log + bench log) ──────────────────
     echo "[$(date -Iseconds)] <<< OMK_TEMPLATE_FINISH template=$t rc=$rc dur_s=${bdur}" >> "$bench_log"

@@ -1112,6 +1112,56 @@ def _check_dependencies(template: dict) -> None:
     log(f"dep check OK ({len(required)} modules): {required}")
 
 
+# Tasks whose HF dataset is GATED → an authenticated token is mandatory.
+# Map the task-name substring to the gated dataset id (for a precise message).
+# Add new gated datasets here as the cohort grows.
+_GATED_TASK_DATASETS = {
+    "gpqa": "Idavidrein/gpqa",
+}
+
+
+def _hf_token_present() -> bool:
+    """True if an HF token is reachable via env or the huggingface_hub cache."""
+    for v in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HF_HUB_TOKEN"):
+        if os.environ.get(v):
+            return True
+    try:
+        from huggingface_hub import get_token
+        if get_token():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _check_hf_token(template: dict) -> None:
+    """Pre-flight: gated-dataset benches need an authenticated HF token.
+
+    Aborts (exit 7) BEFORE launching any server when the template needs a token
+    and none is reachable — so a chain fails fast at the gated bench with a clear
+    message instead of silently scoring 0 / empty on an unauthenticated dataset
+    load (the 2026-05-27 gpqa `Idavidrein/gpqa` DatasetNotFoundError trap).
+    A template may also force this via `requires_hf_token: true`.
+    """
+    task = (template.get("task") or "").lower()
+    declared = bool(template.get("requires_hf_token"))
+    gated_ds = next((ds for key, ds in _GATED_TASK_DATASETS.items() if key in task), None)
+    if not (declared or gated_ds):
+        return
+    if _hf_token_present():
+        log(f"hf-token check OK (template={template.get('name')} "
+            f"gated_dataset={gated_ds or 'declared'})")
+        return
+    log(f"HF-TOKEN CHECK FAIL: template={template.get('name')} task={template.get('task')}")
+    if gated_ds:
+        log(f"  dataset '{gated_ds}' is GATED on the HF Hub — an authenticated token is required.")
+    log("  no token in env (HF_TOKEN / HUGGING_FACE_HUB_TOKEN / HF_HUB_TOKEN) "
+        "or the huggingface_hub cache.")
+    log("  fix: export HF_TOKEN=<token>  (or: hf auth login)  before launching this bench.")
+    fatal(7, f"hf-token pre-flight failed: template '{template.get('name')}' "
+             f"needs an authenticated HF token (gated dataset {gated_ds or 'declared'})")
+
+
 def main() -> None:
     _t_start = time.time()  # wall-clock start; recorded as duration_s in summary.json
     ap = argparse.ArgumentParser()

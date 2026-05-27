@@ -326,6 +326,36 @@ fires <5% of the time.
 
 ---
 
+### 1.5 Gated datasets need HF_TOKEN — ENFORCED by omk_eval pre-flight (exit 7)
+
+Some benches load a **gated** HF dataset and silently fast-fail without an
+authenticated token, producing a 0-score / empty-samples run that looks like a
+model failure. Known gated bench in the cohort:
+
+| Bench template        | Gated dataset       |
+|-----------------------|---------------------|
+| `gpqa_diamond_full`   | `Idavidrein/gpqa`   |
+
+(`gpqa_diamond_full.yaml` carries `requires_hf_token: true`; the implicit map
+`_GATED_TASK_DATASETS` in `omk_eval.py` also matches any `gpqa*` task.)
+
+**Enforcement (so it can't happen again, origin 2026-05-27 pod 38081385/38081387):**
+`omk_eval.py` runs a token pre-flight **before launching any server**. If the
+template is gated (declared or by task) and no token is reachable
+(`HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` / `HF_HUB_TOKEN` env, or the
+`huggingface_hub` cache), it **aborts with exit 7** and a message naming the
+bench + dataset + fix — it does **not** run-and-silently-fail. The drivers
+honour exit 7 as fatal: `eval_suite_llama.sh` and the pod loop
+`scripts/pod_qwen_eval.sh` ABORT the whole run on rc=7 (they do not continue to
+the next bench).
+
+**To run a gated bench:** `export HF_TOKEN=<token>` in the eval env (or
+`hf auth login`). On pods, stage it once: `printf %s "$HF_TOKEN" | ssh <pod>
+'umask 077; cat > /workspace/.hf_token'` — the pod loop sources it. NEVER hardcode
+the token in a script or a `${VAR:-literal}` fallback (gitleaks gate / SECURITY).
+
+---
+
 ## 2. Sequencing rules
 
 ### 2.1 ALWAYS check llama.cpp build version

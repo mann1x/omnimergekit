@@ -10,6 +10,7 @@
 name: gpqa_diamond_full
 backend: lm-eval
 task: gpqa_diamond_cot_zeroshot
+requires_hf_token: true   # Idavidrein/gpqa is GATED — omk_eval aborts (exit 7) without an HF token
 n: 198
 selection:
   type: filter
