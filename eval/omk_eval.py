@@ -551,6 +551,9 @@ def dispatch_lm_eval(template: dict, model_tag: str, base_url: str,
         cmd += ["--include_path", inc]
     if limit is not None and limit > 0:
         cmd += ["--limit", str(limit)]
+    # LM_EVAL_REASONING_LOG-2026-05-29: sidecar per-sample reasoning length
+    _rlog = out_dir / "reasoning_log.jsonl"
+    os.environ["LM_EVAL_REASONING_LOG"] = str(_rlog)
     log(f"lm-eval: {' '.join(shlex.quote(c) for c in cmd)}")
     return subprocess.call(cmd)
 
