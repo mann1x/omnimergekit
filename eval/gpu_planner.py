@@ -337,3 +337,108 @@ def plan_ctx(parallel: int, thinking_budget: int, content_headroom: int,
                 f"+ headroom={content_headroom}))")
             ctx = required_ctx
     return parallel, ctx
+
+
+# ── Plan assembly ──────────────────────────────────────────────────────────
+
+
+@dataclass
+class GpuPlan:
+    """The launch decision produced once per eval and consumed by both backends.
+
+    `source` is the regression tell: "fallback" means the planner had no usable
+    GPU info (no nvidia-smi, or no GPU met the THRESHOLD) and the caller must
+    reproduce today's behavior exactly — no pin, template-default parallel.
+    """
+    gpu_ids: list[int]       # chosen physical nvidia-smi indices ([] = fallback)
+    replicas: int            # model copies to launch (fleet lands in P4; 1 here)
+    parallel: int            # per-replica request slots (after VRAM clamp)
+    ctx: int                 # context length after plan_ctx auto-bump
+    tensor_parallel: int     # >1 only when one copy must span GPUs
+    gpu_mem_util: float      # vLLM --gpu-memory-utilization (consumed in P3)
+    need_mib: int            # estimated per-copy weight VRAM (logging)
+    source: str              # "planner" | "fallback"
+
+    @property
+    def effective_concurrency(self) -> int:
+        """Total in-flight request slots across the fleet (replicas × parallel).
+
+        P5 feeds this to the lm-eval/dispatcher num_concurrent so every server
+        slot is kept busy. In P2/P3 (single server) replicas is 1.
+        """
+        return max(1, self.replicas) * max(1, self.parallel)
+
+    def cuda_visible(self) -> str | None:
+        """CUDA_VISIBLE_DEVICES value for the whole fleet, or None in fallback."""
+        return ",".join(str(i) for i in self.gpu_ids) if self.gpu_ids else None
+
+
+def build_plan(*, model_dir: str, backend: str, quant: str = "auto",
+               requested_gpus: str = "auto", requested_parallel: int | None = None,
+               requested_replicas: str = "auto", util_thresh: float = 0.15,
+               max_parallel: int = 8, thinking_budget: int = 0,
+               content_headroom: int = 4096, ctx_max: int = 262144,
+               requested_ctx: int = 32768, default_parallel: int = 2,
+               kv_dtype: str = "q8_0", default_gpu_mem_util: float = 0.92,
+               log=_noop) -> GpuPlan:
+    """Probe → select → size → plan parallel + ctx. Soft-fails to today's path.
+
+    The single source of truth for GPU selection and parallelism. Both the
+    llama and vLLM launch paths call this once and consume the returned plan, so
+    the auto-bump (plan_ctx) and free-GPU policy are identical across backends.
+    """
+    def _fallback(need: int) -> GpuPlan:
+        req = requested_parallel if requested_parallel else default_parallel
+        par, ctx = plan_ctx(req, thinking_budget, content_headroom,
+                            ctx_max, requested_ctx, log=log)
+        return GpuPlan(gpu_ids=[], replicas=1, parallel=par, ctx=ctx,
+                       tensor_parallel=1, gpu_mem_util=default_gpu_mem_util,
+                       need_mib=need, source="fallback")
+
+    gpus = probe_gpus(log)
+    if not gpus:
+        # No nvidia-smi / unreadable → exactly today's single-GPU path.
+        return _fallback(0)
+
+    need = estimate_model_mib(model_dir, backend, quant, log=log)
+    chosen = select_gpus(gpus, requested_gpus, need, util_thresh, log=log)
+    if not chosen:
+        log("gpu_planner: no GPU meets THRESHOLD (free/util) — falling back to "
+            "default launch path (no pin)")
+        return _fallback(need)
+
+    chosen_gpus = [g for g in gpus if g.index in chosen]
+    n_gpu = len(chosen)
+    min_free = min(g.mem_free_mib for g in chosen_gpus)
+
+    # replicas: one model copy per usable GPU unless the operator caps it.
+    rr = str(requested_replicas).strip().lower()
+    if rr in ("auto", ""):
+        replicas = n_gpu
+    else:
+        try:
+            replicas = max(1, min(int(rr), n_gpu))
+        except ValueError:
+            replicas = n_gpu
+
+    # Tensor-parallel split only when ONE copy can't fit a single chosen GPU.
+    tensor_parallel = 1
+    if need > min_free and n_gpu > 1:
+        tensor_parallel = n_gpu
+        replicas = 1  # the whole fleet is one split copy
+
+    # Per-replica parallel from the chosen GPU's free VRAM after the weights.
+    free_after = max(0, min_free * tensor_parallel - need)
+    kv = estimate_kv_mib_per_slot(model_dir, requested_ctx, kv_dtype, log=log)
+    parallel = plan_parallel(free_after, kv, requested_parallel, max_parallel)
+    parallel, ctx = plan_ctx(parallel, thinking_budget, content_headroom,
+                             ctx_max, requested_ctx, log=log)
+
+    # gpu_mem_util from the tightest chosen GPU's free fraction (vLLM, P3).
+    tightest = min(chosen_gpus, key=lambda g: g.mem_free_mib)
+    gpu_mem_util = round(
+        min(0.95, max(0.30, tightest.mem_free_mib / max(1, tightest.mem_total_mib))), 2)
+
+    return GpuPlan(gpu_ids=chosen, replicas=replicas, parallel=parallel, ctx=ctx,
+                   tensor_parallel=tensor_parallel, gpu_mem_util=gpu_mem_util,
+                   need_mib=need, source="planner")

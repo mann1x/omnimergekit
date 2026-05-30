@@ -350,12 +350,18 @@ def llama_bench_defaults(task: str) -> list[str]:
 
 def launch_llama(gguf: str, port: int, log_path: Path,
                  ctx: int = 32768, ngl: int = 99, parallel: int = 2,
-                 extra: list[str] | None = None) -> ServerHandle:
+                 extra: list[str] | None = None,
+                 gpu_id: int | None = None) -> ServerHandle:
     """Launch llama-server. For Q-quants (Q4_K_M, Q6_K, ...).
 
     `extra` is appended after the mandatory args; pass bench-typed flags
     via `llama_bench_defaults(template['task'])` from the caller, or set
     per-template `backend_args.llama_extra: [--flag, value, ...]`.
+
+    `gpu_id` pins this server to a single physical GPU via CUDA_VISIBLE_DEVICES
+    so it loads the FULL model there (no -ngl layer-split). None = inherit the
+    caller's env unchanged (today's behavior; -ngl 99 splits across whatever is
+    visible). The planner (gpu_planner.build_plan) decides the pin.
     """
     bin_path = os.environ.get("LLAMA_BIN",
                               "/opt/llama.cpp/build/bin") + "/llama-server"
@@ -368,11 +374,15 @@ def launch_llama(gguf: str, port: int, log_path: Path,
     ]
     if extra:
         cmd += extra
+    env = dict(os.environ)
+    if gpu_id is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     kill_port(port, label="pre-llama")
-    log(f"llama cmd: {' '.join(shlex.quote(c) for c in cmd)}")
+    log(f"llama cmd: {' '.join(shlex.quote(c) for c in cmd)}"
+        + (f" [CUDA_VISIBLE_DEVICES={gpu_id}]" if gpu_id is not None else ""))
     log_path.parent.mkdir(parents=True, exist_ok=True)
     f = open(log_path, "a")
-    proc = subprocess.Popen(cmd, stdout=f, stderr=f, preexec_fn=os.setpgrp)
+    proc = subprocess.Popen(cmd, stdout=f, stderr=f, env=env, preexec_fn=os.setpgrp)
     h = ServerHandle(proc=proc, port=port,
                      base_url=f"http://localhost:{port}/v1",
                      log_path=log_path, backend="llama")
@@ -1382,6 +1392,30 @@ def main() -> None:
                     "3090. Takes precedence over template backend_args.vllm_max_num_seqs.")
     ap.add_argument("--limit", type=int, default=0,
                     help="Pass --limit N to lm-eval (smoke runs). 0 = full set.")
+    # ── Native GPU selection + parallelism (gpu_planner). Templates stay
+    #    parallel-agnostic; the runner decides at launch. Precedence for each
+    #    knob: CLI flag > OMK_* env var > template hint > auto. ───────────────
+    ap.add_argument("--gpus", default="auto",
+                    help="GPU selection: auto|free|<ids csv>. auto/free pick all "
+                    "usable GPUs under the THRESHOLD policy (free VRAM >= model "
+                    "need AND util < --gpu-util-thresh); '0,1' restricts to those "
+                    "(busy ones are dropped with a logged reason). A preset "
+                    "CUDA_VISIBLE_DEVICES is only narrowed, never widened. "
+                    "Env: OMK_GPUS. nvidia-smi absent → today's single-GPU path.")
+    ap.add_argument("--parallel", default="auto",
+                    help="Per-server request slots: auto|<n>. auto = derive from "
+                    "free VRAM (capped by --max-parallel). Overrides the template "
+                    "llama_parallel hint. Env: OMK_PARALLEL.")
+    ap.add_argument("--replicas", default="auto",
+                    help="Model copies across free GPUs: auto|<n>. auto = one per "
+                    "usable GPU. Env: OMK_REPLICAS. (Fleet launch lands in P4; "
+                    "P2/P3 launch a single server on the first chosen GPU.)")
+    ap.add_argument("--gpu-util-thresh", type=float, default=None,
+                    help="A GPU counts as free when utilization < this fraction "
+                    "(default 0.15). Env: OMK_GPU_UTIL_THRESH.")
+    ap.add_argument("--max-parallel", type=int, default=None,
+                    help="Upper cap on per-server parallel slots (default 8). "
+                    "Env: OMK_MAX_PARALLEL.")
     args = ap.parse_args()
 
     # Resolve template
@@ -1435,6 +1469,24 @@ def main() -> None:
     if quant == "auto":
         quant = detect_native_quant(args.model)
         log(f"detected native quant: {quant}")
+
+    # Resolve GPU/parallel knobs (precedence: CLI > env > template-hint > auto).
+    # These feed gpu_planner.build_plan in the backend launch below. The
+    # template-hint layer is backend-specific (llama_parallel) and applied
+    # inside the llama branch; here we only resolve CLI > env > auto.
+    gpus_req = args.gpus if args.gpus != "auto" else os.environ.get("OMK_GPUS", "auto")
+    replicas_req = (args.replicas if args.replicas != "auto"
+                    else os.environ.get("OMK_REPLICAS", "auto"))
+    if args.parallel != "auto":
+        requested_parallel: int | None = int(args.parallel)
+    elif os.environ.get("OMK_PARALLEL"):
+        requested_parallel = int(os.environ["OMK_PARALLEL"])
+    else:
+        requested_parallel = None  # → template llama_parallel hint, else VRAM-auto
+    util_thresh = (args.gpu_util_thresh if args.gpu_util_thresh is not None
+                   else float(os.environ.get("OMK_GPU_UTIL_THRESH", "0.15")))
+    max_parallel = (args.max_parallel if args.max_parallel is not None
+                    else int(os.environ.get("OMK_MAX_PARALLEL", "8")))
 
     # Launch (or skip if --no-server)
     server = None
@@ -1496,29 +1548,49 @@ def main() -> None:
             env_extra = os.environ.get("LLAMA_EXTRA", "").strip()
             if env_extra:
                 llama_extra = shlex.split(env_extra)
-            parallel = int(ba.get("llama_parallel", 2))
             requested_ctx = int(ba.get("llama_ctx", 32768))
             # Per-slot ctx safety (ctx // parallel >= thinking_budget +
-            # content_headroom) lives in gpu_planner.plan_ctx so the llama and
-            # vLLM paths share identical auto-bump math. `llama_parallel` is the
-            # INPUT (throughput); ctx is bumped UP to fit; parallel is clamped
-            # down only as a last resort when even llama_ctx_max can't hold the
-            # requested parallel. See feedback_auto_bump_ctx_not_clamp_parallel.
+            # content_headroom) and GPU selection both live in
+            # gpu_planner.build_plan so the llama and vLLM paths share identical
+            # auto-bump + free-GPU policy. `llama_parallel` is the template HINT
+            # (throughput); CLI --parallel / OMK_PARALLEL override it; ctx is
+            # bumped UP to fit; parallel is clamped down only as a last resort.
+            # See feedback_auto_bump_ctx_not_clamp_parallel + the dual-server
+            # memory.
             gen = template.get("generation", {}) or {}
             thinking_budget = int(gen.get("thinking_token_budget", 0) or 0)
             content_headroom = int(ba.get("llama_content_headroom", 4096))
             ctx_max = int(ba.get("llama_ctx_max", 262144))
-            parallel, ctx = gpu_planner.plan_ctx(
-                parallel=parallel, thinking_budget=thinking_budget,
+            # Parallel request precedence: CLI/env (requested_parallel) > template
+            # llama_parallel hint > VRAM-auto (None).
+            par_hint = (requested_parallel if requested_parallel is not None
+                        else ba.get("llama_parallel"))
+            plan = gpu_planner.build_plan(
+                model_dir=args.model, backend="llama", quant=quant,
+                requested_gpus=gpus_req,
+                requested_parallel=(int(par_hint) if par_hint is not None else None),
+                requested_replicas=replicas_req, util_thresh=util_thresh,
+                max_parallel=max_parallel, thinking_budget=thinking_budget,
                 content_headroom=content_headroom, ctx_max=ctx_max,
                 requested_ctx=requested_ctx, log=log)
+            parallel, ctx = plan.parallel, plan.ctx
+            # Pin a single GPU only when one full copy fits it (tensor_parallel==1).
+            # If the model must span GPUs (tp>1) or the planner fell back, leave
+            # the env unpinned → -ngl 99 layer-splits across visible GPUs (today's
+            # behavior). The replica fleet (gpu_ids[1:]) lands in P4.
+            gpu_id = (plan.gpu_ids[0]
+                      if (plan.gpu_ids and plan.tensor_parallel == 1) else None)
+            log(f"GPU plan [llama]: source={plan.source} gpu_ids={plan.gpu_ids} "
+                f"pin={gpu_id} replicas={plan.replicas} tp={plan.tensor_parallel} "
+                f"need={plan.need_mib}MiB parallel={parallel} ctx={ctx} "
+                f"per_slot_ctx={ctx // parallel}")
             log(f"llama extras: {llama_extra} parallel={parallel} "
                 f"(thinking_budget={thinking_budget}, "
                 f"content_headroom={content_headroom}, ctx_max={ctx_max}) ctx={ctx} "
                 f"per_slot_ctx={ctx // parallel}")
             server = launch_llama(args.model, args.port, log_path,
                                   ctx=ctx, parallel=parallel,
-                                  extra=llama_extra)
+                                  extra=llama_extra, gpu_id=gpu_id)
         try:
             wait_ready(server, served_name=served_name)
         except SystemExit:
