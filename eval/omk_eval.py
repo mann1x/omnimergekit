@@ -1650,6 +1650,10 @@ def main() -> None:
 
     # Launch (or skip if --no-server)
     server = None
+    # In-flight concurrency the runner will request = server slots it launches
+    # (replicas × per-server parallel). Set per-backend below, injected into the
+    # template's num_concurrent before dispatch so templates stay parallel-agnostic.
+    effective_concurrency: int | None = None
     if not args.no_server:
         log_path = out_dir / "server.log"
         if args.backend == "vllm":
@@ -1659,9 +1663,14 @@ def main() -> None:
             # auto-bump ctx. For vLLM the auto-bump is single-request (max-model-len
             # >= max_gen_toks + headroom, NOT ×concurrency) and replicas map to
             # --data-parallel-size. requested_ctx floors at the CLI --max-model-len.
+            # Per-replica concurrency hint: CLI/env --parallel, else the template
+            # num_concurrent (vLLM's analogue of llama_parallel). The planner
+            # clamps it to free VRAM and replicates across GPUs via data-parallel.
+            vllm_par_hint = (requested_parallel if requested_parallel is not None
+                             else int(ba.get("num_concurrent", 2)))
             vllm_plan = gpu_planner.build_plan(
                 model_dir=args.model, backend="vllm", quant=quant,
-                requested_gpus=gpus_req, requested_parallel=requested_parallel,
+                requested_gpus=gpus_req, requested_parallel=vllm_par_hint,
                 requested_replicas=replicas_req, util_thresh=util_thresh,
                 max_parallel=max_parallel,
                 thinking_budget=int(gen.get("thinking_token_budget", 0) or 0),
@@ -1669,9 +1678,11 @@ def main() -> None:
                 content_headroom=int(ba.get("vllm_content_headroom", 4096)),
                 ctx_max=int(ba.get("vllm_max_model_len_cap", 262144)),
                 requested_ctx=args.max_model_len, log=log)
+            effective_concurrency = vllm_plan.effective_concurrency
             log(f"GPU plan [vllm]: source={vllm_plan.source} gpu_ids={vllm_plan.gpu_ids} "
                 f"dp={vllm_plan.replicas} tp={vllm_plan.tensor_parallel} "
                 f"need={vllm_plan.need_mib}MiB max_model_len={vllm_plan.ctx} "
+                f"parallel={vllm_plan.parallel} eff_concurrency={effective_concurrency} "
                 f"gpu_mem_util_auto={vllm_plan.gpu_mem_util}")
             server = launch_vllm(
                 args.model, args.port, quant, log_path,
@@ -1766,6 +1777,7 @@ def main() -> None:
                 content_headroom=content_headroom, ctx_max=ctx_max,
                 requested_ctx=requested_ctx, log=log)
             parallel, ctx = plan.parallel, plan.ctx
+            effective_concurrency = plan.effective_concurrency
             # Pin a single GPU only when one full copy fits it (tensor_parallel==1).
             # If the model must span GPUs (tp>1) or the planner fell back, leave
             # the env unpinned → -ngl 99 layer-splits across visible GPUs (today's
@@ -1800,6 +1812,16 @@ def main() -> None:
             server.kill()
             raise
     base_url = f"http://localhost:{args.port}/v1"
+
+    # Parallel-agnostic templates: set in-flight concurrency to the slots the
+    # runner actually launched (replicas × per-server parallel), overriding any
+    # template num_concurrent so every slot — single server, llama fleet, or vLLM
+    # data-parallel — is fed. Skipped under --no-server (external server: honor
+    # the template as-is). Every dispatcher reads backend_args.num_concurrent.
+    if effective_concurrency is not None:
+        template.setdefault("backend_args", {})["num_concurrent"] = effective_concurrency
+        log(f"effective num_concurrent = {effective_concurrency} "
+            f"(replicas × per-server parallel)")
 
     # Dispatch eval
     rc = 0
