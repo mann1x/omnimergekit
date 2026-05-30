@@ -207,7 +207,9 @@ def kill_port(port: int, label: str = "") -> None:
 
 @dataclass
 class ServerHandle:
-    proc: subprocess.Popen
+    # proc is None for a fleet FRONT (a round-robin proxy over N backend
+    # ServerHandles stored in extra["backends"]); see launch_llama_fleet.
+    proc: subprocess.Popen | None
     port: int
     base_url: str
     log_path: Path
@@ -215,7 +217,12 @@ class ServerHandle:
     extra: dict[str, Any] = field(default_factory=dict)
 
     def alive(self) -> bool:
-        return self.proc.poll() is None
+        if self.proc is not None:
+            return self.proc.poll() is None
+        backends = self.extra.get("backends")
+        if backends is not None:  # fleet front: alive while all backends are
+            return bool(backends) and all(b.alive() for b in backends)
+        return False
 
     def kill(self) -> None:
         """Kill the server AND its process group so EngineCore / llama-server
@@ -227,6 +234,23 @@ class ServerHandle:
             _LIVE_SERVERS.remove(self)
         except ValueError:
             pass
+        # Fleet front: shut the proxy, then tear down each backend server.
+        backends = self.extra.get("backends")
+        if self.proc is None and backends is not None:
+            httpd = self.extra.get("httpd")
+            if httpd is not None:
+                try:
+                    httpd.shutdown()
+                    httpd.server_close()
+                except Exception:
+                    pass
+            for b in backends:
+                try:
+                    b.kill()
+                except Exception:
+                    pass
+            kill_port(self.port, label=f"post-kill {self.backend}")
+            return
         if self.alive():
             log(f"stopping {self.backend} pid={self.proc.pid} (pgid={os.getpgid(self.proc.pid)})")
             try:
@@ -404,6 +428,126 @@ def launch_llama(gguf: str, port: int, log_path: Path,
                      log_path=log_path, backend="llama")
     _LIVE_SERVERS.append(h)
     return h
+
+
+def _make_llama_proxy(front_port: int, backend_ports: list[int],
+                      request_timeout: int = 1800):
+    """A stdlib round-robin reverse proxy over N llama-server backends.
+
+    One full-model server per GPU + this proxy = a single endpoint on
+    `front_port` that fans concurrent eval requests across all GPUs (the
+    implementation of the dual-server win — see feedback_dual_llama_server_per_gpu).
+
+    stdlib-only (http.server + urllib) on purpose: omk_eval is launched with
+    bare python3 by the suite shells / pod bootstrap, so aiohttp is not
+    guaranteed. lm-eval issues NON-streaming chat/completions, so we buffer the
+    full backend response (Content-Length set) — no chunked/streaming needed.
+    Each POST is dispatched to the next backend round-robin; GETs (/v1/models)
+    go to the first backend.
+    """
+    import http.server
+    import itertools
+    import threading
+    import urllib.error
+    import urllib.request
+
+    rr = itertools.cycle(backend_ports)
+    rr_lock = threading.Lock()
+
+    def _next_port() -> int:
+        with rr_lock:
+            return next(rr)
+
+    def _relay(handler, status: int, ctype: str, data: bytes) -> None:
+        handler.send_response(status)
+        handler.send_header("Content-Type", ctype)
+        handler.send_header("Content-Length", str(len(data)))
+        handler.end_headers()
+        handler.wfile.write(data)
+
+    class _Proxy(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):  # silence per-request stderr spam
+            return
+
+        def _forward(self, port: int, method: str, body: bytes | None) -> None:
+            url = f"http://127.0.0.1:{port}{self.path}"
+            headers = {"Content-Type": self.headers.get("Content-Type",
+                                                         "application/json")}
+            req = urllib.request.Request(url, data=body, method=method,
+                                         headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=request_timeout) as resp:
+                    data = resp.read()
+                    _relay(self, resp.status,
+                           resp.headers.get("Content-Type", "application/json"),
+                           data)
+            except urllib.error.HTTPError as e:           # backend 4xx/5xx
+                data = e.read()
+                _relay(self, e.code,
+                       e.headers.get("Content-Type", "application/json"), data)
+            except Exception as e:                        # connect/timeout
+                _relay(self, 502, "application/json",
+                       json.dumps({"error": f"proxy: {e}"}).encode())
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            body = self.rfile.read(length) if length else b""
+            self._forward(_next_port(), "POST", body)
+
+        def do_GET(self):
+            self._forward(backend_ports[0], "GET", None)
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", front_port), _Proxy)
+    httpd.daemon_threads = True
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    return httpd, thread
+
+
+def launch_llama_fleet(gguf: str, front_port: int, gpu_ids: list[int],
+                       log_path: Path, ctx: int = 32768, ngl: int = 99,
+                       parallel: int = 2, extra: list[str] | None = None,
+                       served_name: str = "", request_timeout: int = 1800,
+                       ready_timeout: int = 720) -> ServerHandle:
+    """One full-model llama-server per GPU + a round-robin proxy on front_port.
+
+    Backends bind front_port+1..+N, each pinned to one GPU (full model, no
+    -ngl split). They're removed from _LIVE_SERVERS so the returned FRONT handle
+    solely owns teardown (front.kill() shuts the proxy + kills every backend).
+    """
+    backends: list[ServerHandle] = []
+    backend_ports: list[int] = []
+    for i, gid in enumerate(gpu_ids):
+        bport = front_port + 1 + i
+        blog = log_path.parent / f"server.gpu{gid}.{bport}.log"
+        h = launch_llama(gguf, bport, blog, ctx=ctx, ngl=ngl, parallel=parallel,
+                         extra=extra, gpu_id=gid)
+        backends.append(h)
+        backend_ports.append(bport)
+    # Block until every backend's /v1/models answers (no per-backend warmup —
+    # the front's wait_ready warms through the proxy, proving end-to-end).
+    for h in backends:
+        wait_ready(h, served_name=served_name, timeout=ready_timeout,
+                   warmup=False)
+    # Hand teardown ownership to the front: drop backends from the registry.
+    for h in backends:
+        try:
+            _LIVE_SERVERS.remove(h)
+        except ValueError:
+            pass
+    kill_port(front_port, label="pre-fleet-proxy")
+    httpd, thread = _make_llama_proxy(front_port, backend_ports, request_timeout)
+    log(f"llama fleet: {len(backends)} servers on GPUs {gpu_ids} "
+        f"(ports {backend_ports}) behind round-robin proxy :{front_port}")
+    front = ServerHandle(proc=None, port=front_port,
+                         base_url=f"http://localhost:{front_port}/v1",
+                         log_path=log_path, backend="llama_fleet",
+                         extra={"backends": backends, "httpd": httpd,
+                                "thread": thread, "backend_ports": backend_ports})
+    _LIVE_SERVERS.append(front)
+    return front
 
 
 def wait_ready(server: ServerHandle, served_name: str = "",
@@ -1636,9 +1780,20 @@ def main() -> None:
                 f"(thinking_budget={thinking_budget}, "
                 f"content_headroom={content_headroom}, ctx_max={ctx_max}) ctx={ctx} "
                 f"per_slot_ctx={ctx // parallel}")
-            server = launch_llama(args.model, args.port, log_path,
-                                  ctx=ctx, parallel=parallel,
-                                  extra=llama_extra, gpu_id=gpu_id)
+            if plan.gpu_ids and plan.replicas > 1 and plan.tensor_parallel == 1:
+                # Multi-GPU: one full-model server per GPU behind a round-robin
+                # proxy on --port (backends on --port+1..+N). num_concurrent must
+                # be replicas×parallel to feed every slot — wired in P5.
+                rt = int((template.get("backend_args", {}) or {})
+                         .get("llama_request_timeout", 1800))
+                server = launch_llama_fleet(
+                    args.model, args.port, plan.gpu_ids, log_path,
+                    ctx=ctx, parallel=parallel, extra=llama_extra,
+                    served_name=served_name, request_timeout=rt)
+            else:
+                server = launch_llama(args.model, args.port, log_path,
+                                      ctx=ctx, parallel=parallel,
+                                      extra=llama_extra, gpu_id=gpu_id)
         try:
             wait_ready(server, served_name=served_name)
         except SystemExit:
