@@ -255,6 +255,9 @@ def launch_vllm(model: str, port: int, quant: str, log_path: Path,
                 max_num_batched_tokens: int = 4096,
                 reasoning_parser: str | None = None,
                 default_chat_template_kwargs: dict | str | None = None,
+                gpu_ids: list[int] | None = None,
+                data_parallel_size: int = 1,
+                tensor_parallel_size: int = 1,
                 extra: list[str] | None = None) -> ServerHandle:
     """Launch vllm OpenAI-compatible api server. Quant 'bf16'/'fp16' →
     unquantized; 'nvfp4a16'/'awq'/'gptq' → loaded as-is from config; 'auto'
@@ -279,6 +282,14 @@ def launch_vllm(model: str, port: int, quant: str, log_path: Path,
         "--max-num-batched-tokens", str(max_num_batched_tokens),
         "--trust-remote-code",
     ]
+    # Replicas (data-parallel) and/or split (tensor-parallel). DP gives one
+    # full model copy per GPU behind a single endpoint (the vLLM analogue of
+    # the llama fleet) — the right choice when the model fits one GPU. TP>1 is
+    # only for a model that must span GPUs. The planner sets these.
+    if data_parallel_size and data_parallel_size > 1:
+        cmd += ["--data-parallel-size", str(data_parallel_size)]
+    if tensor_parallel_size and tensor_parallel_size > 1:
+        cmd += ["--tensor-parallel-size", str(tensor_parallel_size)]
     if enforce_eager:
         cmd += ["--enforce-eager"]
     if reasoning_parser:
@@ -304,9 +315,14 @@ def launch_vllm(model: str, port: int, quant: str, log_path: Path,
         "LD_PRELOAD",
         "/root/anaconda3/envs/vllm/lib/libstdc++.so.6",
     )
+    if gpu_ids:
+        # Restrict vLLM to the planner-chosen GPUs. DP/TP sizes index into this
+        # set, so e.g. gpu_ids=[1] + DP=1 runs entirely on physical GPU1.
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_ids)
     # Pre-flight: clear any orphan/zombie on the port (EngineCore survivors)
     kill_port(port, label="pre-vllm")
-    log(f"vllm cmd: {' '.join(shlex.quote(c) for c in cmd)}")
+    log(f"vllm cmd: {' '.join(shlex.quote(c) for c in cmd)}"
+        + (f" [CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}]" if gpu_ids else ""))
     log_path.parent.mkdir(parents=True, exist_ok=True)
     f = open(log_path, "a")
     proc = subprocess.Popen(cmd, stdout=f, stderr=f, env=env, preexec_fn=os.setpgrp)
@@ -1494,12 +1510,36 @@ def main() -> None:
         log_path = out_dir / "server.log"
         if args.backend == "vllm":
             ba = template.get("backend_args", {}) or {}
+            gen = template.get("generation", {}) or {}
+            # Same planner as the llama path: select free GPU(s), size parallelism,
+            # auto-bump ctx. For vLLM the auto-bump is single-request (max-model-len
+            # >= max_gen_toks + headroom, NOT ×concurrency) and replicas map to
+            # --data-parallel-size. requested_ctx floors at the CLI --max-model-len.
+            vllm_plan = gpu_planner.build_plan(
+                model_dir=args.model, backend="vllm", quant=quant,
+                requested_gpus=gpus_req, requested_parallel=requested_parallel,
+                requested_replicas=replicas_req, util_thresh=util_thresh,
+                max_parallel=max_parallel,
+                thinking_budget=int(gen.get("thinking_token_budget", 0) or 0),
+                max_gen_toks=int(gen.get("max_gen_toks", 0) or 0),
+                content_headroom=int(ba.get("vllm_content_headroom", 4096)),
+                ctx_max=int(ba.get("vllm_max_model_len_cap", 262144)),
+                requested_ctx=args.max_model_len, log=log)
+            log(f"GPU plan [vllm]: source={vllm_plan.source} gpu_ids={vllm_plan.gpu_ids} "
+                f"dp={vllm_plan.replicas} tp={vllm_plan.tensor_parallel} "
+                f"need={vllm_plan.need_mib}MiB max_model_len={vllm_plan.ctx} "
+                f"gpu_mem_util_auto={vllm_plan.gpu_mem_util}")
             server = launch_vllm(
                 args.model, args.port, quant, log_path,
-                served_name, max_model_len=args.max_model_len,
-                # gpu_memory_utilization override precedence: CLI > template > 0.92.
+                served_name, max_model_len=vllm_plan.ctx,
+                # gpu_memory_utilization precedence: CLI > template > planner
+                # free-fraction. Template values are deliberate HARD reservations
+                # (e.g. 0.55 for 26B MoE, 0.65 for dense 31B — see the memory
+                # note), so they win over the auto fraction.
                 gpu_mem_util=(args.gpu_mem_util if args.gpu_mem_util is not None
-                              else float(ba.get("vllm_gpu_memory_utilization", 0.92))),
+                              else float(ba["vllm_gpu_memory_utilization"])
+                              if "vllm_gpu_memory_utilization" in ba
+                              else vllm_plan.gpu_mem_util),
                 # Per-template override (e.g. for a bench that needs eager
                 # to dodge a graph-capture crash). Default is False = CUDA
                 # graphs ON, which the 90.91% LCB-55 result proved safe.
@@ -1514,6 +1554,14 @@ def main() -> None:
                 # vLLM applies these on every chat-completions call unless the
                 # request overrides them. Verified end-to-end on 2026-05-12.
                 default_chat_template_kwargs=ba.get("vllm_default_chat_template_kwargs"),
+                # Planner-chosen GPUs + replica/split sizes. gpu_ids pins
+                # CUDA_VISIBLE_DEVICES; data_parallel_size = one full copy per
+                # free GPU (the vLLM analogue of the llama fleet); tensor_parallel
+                # only when a copy can't fit one GPU. All default to single-GPU /
+                # DP1 / TP1 when the planner falls back.
+                gpu_ids=(vllm_plan.gpu_ids or None),
+                data_parallel_size=vllm_plan.replicas,
+                tensor_parallel_size=vllm_plan.tensor_parallel,
                 # max_num_seqs precedence: CLI > template > vLLM default (~256).
                 # Folded into `extra` (no dedicated launch_vllm kwarg). Capping
                 # to e.g. 4 trims the cudagraph capture set proportionally,

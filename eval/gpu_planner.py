@@ -377,20 +377,44 @@ def build_plan(*, model_dir: str, backend: str, quant: str = "auto",
                requested_gpus: str = "auto", requested_parallel: int | None = None,
                requested_replicas: str = "auto", util_thresh: float = 0.15,
                max_parallel: int = 8, thinking_budget: int = 0,
-               content_headroom: int = 4096, ctx_max: int = 262144,
-               requested_ctx: int = 32768, default_parallel: int = 2,
-               kv_dtype: str = "q8_0", default_gpu_mem_util: float = 0.92,
-               log=_noop) -> GpuPlan:
+               max_gen_toks: int = 0, content_headroom: int = 4096,
+               ctx_max: int = 262144, requested_ctx: int = 32768,
+               default_parallel: int = 2, kv_dtype: str = "q8_0",
+               default_gpu_mem_util: float = 0.92, log=_noop) -> GpuPlan:
     """Probe → select → size → plan parallel + ctx. Soft-fails to today's path.
 
     The single source of truth for GPU selection and parallelism. Both the
     llama and vLLM launch paths call this once and consume the returned plan, so
-    the auto-bump (plan_ctx) and free-GPU policy are identical across backends.
+    the free-GPU policy and auto-bump are shared. The auto-bump is BACKEND-AWARE
+    because the two engines treat context differently:
+
+      * llama.cpp `-c` is ONE KV arena shared across `--parallel` slots, so
+        per-slot ctx = ctx // parallel must hold the reasoning budget → ctx is
+        bumped parallel-multiplied (plan_ctx). This is the SAT_COLLAPSE fix.
+      * vLLM `--max-model-len` is PER-REQUEST (PagedAttention); concurrency
+        comes from data-parallel replicas + --max-num-seqs, NOT from dividing
+        max-model-len. So vLLM is bumped only to fit the largest SINGLE request
+        (prompt + full generation incl. thinking) — never ×concurrency — which
+        is what prevents vLLM's HTTP-400-on-long-reasoning failure.
     """
+    def _par_ctx(parallel_req: int | None,
+                 free_after: int | None = None,
+                 kv: int | None = None) -> tuple[int, int]:
+        if free_after is not None and kv is not None:
+            par = plan_parallel(free_after, kv, parallel_req, max_parallel)
+        else:
+            par = parallel_req if parallel_req else default_parallel
+        if backend == "vllm":
+            base = max_gen_toks or thinking_budget
+            ctx = requested_ctx
+            if base > 0:
+                ctx = min(max(requested_ctx, base + content_headroom), ctx_max)
+            return par, ctx
+        return plan_ctx(par, thinking_budget, content_headroom, ctx_max,
+                        requested_ctx, log=log)
+
     def _fallback(need: int) -> GpuPlan:
-        req = requested_parallel if requested_parallel else default_parallel
-        par, ctx = plan_ctx(req, thinking_budget, content_headroom,
-                            ctx_max, requested_ctx, log=log)
+        par, ctx = _par_ctx(requested_parallel)
         return GpuPlan(gpu_ids=[], replicas=1, parallel=par, ctx=ctx,
                        tensor_parallel=1, gpu_mem_util=default_gpu_mem_util,
                        need_mib=need, source="fallback")
@@ -430,9 +454,7 @@ def build_plan(*, model_dir: str, backend: str, quant: str = "auto",
     # Per-replica parallel from the chosen GPU's free VRAM after the weights.
     free_after = max(0, min_free * tensor_parallel - need)
     kv = estimate_kv_mib_per_slot(model_dir, requested_ctx, kv_dtype, log=log)
-    parallel = plan_parallel(free_after, kv, requested_parallel, max_parallel)
-    parallel, ctx = plan_ctx(parallel, thinking_budget, content_headroom,
-                             ctx_max, requested_ctx, log=log)
+    parallel, ctx = _par_ctx(requested_parallel, free_after, kv)
 
     # gpu_mem_util from the tightest chosen GPU's free fraction (vLLM, P3).
     tightest = min(chosen_gpus, key=lambda g: g.mem_free_mib)
