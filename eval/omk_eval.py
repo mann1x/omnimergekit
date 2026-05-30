@@ -1386,6 +1386,8 @@ def main() -> None:
 
     # Resolve template
     sys.path.insert(0, str(TEMPLATES_DIR))
+    sys.path.insert(0, str(REPO_ROOT / "eval"))
+    import gpu_planner  # type: ignore
     from template_loader import load as load_template  # type: ignore
     template = load_template(args.template)
     log(f"loaded template {template['name']} (n={template['n']}, backend={template['backend']})")
@@ -1496,40 +1498,20 @@ def main() -> None:
                 llama_extra = shlex.split(env_extra)
             parallel = int(ba.get("llama_parallel", 2))
             requested_ctx = int(ba.get("llama_ctx", 32768))
-            # SAFETY: per-slot ctx (ctx // parallel) must be >= thinking_budget
-            # + content_headroom, or the model can't complete a clean
-            # think+answer cycle and IFEval/long-reasoning benches collapse into
-            # bulleted-think SAT_COLLAPSE artifacts (Gemma 4 26B-A4B, ifeval_100,
-            # 2026-05-29, bench-recovery RCA). `llama_parallel` is the INPUT;
-            # ctx is auto-bumped UP to the smallest size that keeps per-slot ctx
-            # >= thinking_budget + content_headroom. Headroom default 4096
-            # covers prompt + final answer; override via
-            # `backend_args.llama_content_headroom`. Cap with `llama_ctx_max`
-            # (default 262144) to prevent runaway KV cache allocation; if the
-            # requested parallel × per-slot would exceed ctx_max, fall back to
-            # clamping parallel down.
+            # Per-slot ctx safety (ctx // parallel >= thinking_budget +
+            # content_headroom) lives in gpu_planner.plan_ctx so the llama and
+            # vLLM paths share identical auto-bump math. `llama_parallel` is the
+            # INPUT (throughput); ctx is bumped UP to fit; parallel is clamped
+            # down only as a last resort when even llama_ctx_max can't hold the
+            # requested parallel. See feedback_auto_bump_ctx_not_clamp_parallel.
             gen = template.get("generation", {}) or {}
             thinking_budget = int(gen.get("thinking_token_budget", 0) or 0)
             content_headroom = int(ba.get("llama_content_headroom", 4096))
             ctx_max = int(ba.get("llama_ctx_max", 262144))
-            ctx = requested_ctx
-            if thinking_budget > 0:
-                required_per_slot = thinking_budget + content_headroom
-                required_ctx = parallel * required_per_slot
-                if required_ctx > ctx_max:
-                    safe_parallel = max(1, ctx_max // required_per_slot)
-                    log(f"WARNING: llama_parallel={parallel} requires ctx "
-                        f"{required_ctx} > ctx_max {ctx_max}; clamping parallel "
-                        f"to {safe_parallel} (per-slot {ctx_max // safe_parallel} "
-                        f">= thinking_budget {thinking_budget} + headroom "
-                        f"{content_headroom})")
-                    parallel = safe_parallel
-                    required_ctx = parallel * required_per_slot
-                if required_ctx > ctx:
-                    log(f"AUTO-BUMP llama_ctx: template={ctx} → required={required_ctx} "
-                        f"(parallel={parallel} × (thinking_budget={thinking_budget} "
-                        f"+ headroom={content_headroom}))")
-                    ctx = required_ctx
+            parallel, ctx = gpu_planner.plan_ctx(
+                parallel=parallel, thinking_budget=thinking_budget,
+                content_headroom=content_headroom, ctx_max=ctx_max,
+                requested_ctx=requested_ctx, log=log)
             log(f"llama extras: {llama_extra} parallel={parallel} "
                 f"(thinking_budget={thinking_budget}, "
                 f"content_headroom={content_headroom}, ctx_max={ctx_max}) ctx={ctx} "
