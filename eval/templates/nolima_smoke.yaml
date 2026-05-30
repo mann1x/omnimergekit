@@ -1,0 +1,45 @@
+# NoLiMa smoke — 3 needle rows × 1 test × 3 depths @ 1024-token haystack.
+#
+# Purpose: end-to-end plumbing test for the omk nolima backend before running
+# the full standard family. Runs in ~30s on a small model + chat server.
+# Expect non-zero accuracy on the smoke set — needles are easy at 1k ctx.
+#
+# License: NoLiMa is Adobe Research (non-commercial research only). Data
+# pulled from amodaresi/NoLiMa at runtime; nothing vendored into omk.
+name: nolima_smoke
+backend: nolima
+task: nolima
+n: 9                              # 3 rows × 1 test × 3 depths × 1 shift
+selection:
+  type: filter
+  needle_set: needle_set          # 10-row default file
+  haystack_tier: rand_shuffle
+  haystack_book: 1
+  ctx_tokens: 1024
+  depth_intervals: 3              # 0%, 50%, 100%
+  hop_mode: onehop
+  tests_per_row: 1
+  row_limit: 3
+  shifts: 1
+generation:
+  max_gen_toks: 192               # upstream cap; NoLiMa answers are character names
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 600.0
+scoring:
+  scorer: nolima_helpers
+  metric: pass_at_1
+  filter: null
+cache:
+  sqlite_prefix: nolima_smoke
+backend_args:
+  metric: contains                # NoLiMa-internal metric
+  num_concurrent: 2
+reports:
+  token_stats: true
+dependencies:
+  python_modules: [huggingface_hub, transformers]
+sanity:
+  min_p10_chars: 1                # answers are short — relax the default 60-char gate

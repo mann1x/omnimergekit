@@ -2094,3 +2094,135 @@ indices 18/31/50/59 would require teaching the runner to honor
 the canary path. The standalone canary script bypasses that limitation
 and ships today; folding it into anchor30 + omk_canary.py is a future
 cleanup, not a blocker.
+
+---
+
+## v2.10 — RULER native variants (§8 — 2026-05-28)
+
+The omk eval stack now ships a `ruler_native` backend over NVIDIA/RULER
+(arXiv:2404.06654, Apache-2.0) for long-context synthetic benchmarks. See
+[`eval/ruler_native/README.md`](ruler_native/README.md) for the full reference.
+
+### v2.10.1 Why a new backend rather than extending lm-eval
+
+lm-eval bundles RULER under `lm_eval/tasks/ruler/`, but its `niah_single_*` /
+`vt` / etc. YAMLs hardcode `metric_list` tiers at
+`[4096, 8192, 16384, 32768, 65536, 131072]` — capped at 128k. The python
+utilities themselves accept arbitrary `max_seq_lengths`, but unlocking >128k
+requires duplicating ~13 YAMLs plus a `process_results` edit in site-packages.
+Both changes get clobbered on the next `pip install -U lm-eval` and double
+the patch surface that `apply_lmeval_patches` already maintains for
+`unbound` + `fix-a`.
+
+A native runner over the upstream RULER repo (runtime-cloned at
+`/workspace/RULER` / `/shared/dev/RULER`, same pattern as `/opt/llama.cpp`)
+has no upper-tier cap — `prepare.py --max_seq_length 524288` works as-is.
+This unblocks the 256k / 512k tiers needed for the YaRN-extension validation
+triad (T87 cascade) without polluting the lm-eval site-packages.
+
+### v2.10.2 Scorer path — inline, not subprocess
+
+Despite the runtime-clone of upstream code for input generation
+(`prepare.py`), we **inline** the scorer (`string_match_all`) from upstream's
+`scripts/eval/synthetic/constants.py:25` into
+`eval/ruler_native/ruler_helpers.py`. The reason is operational: upstream's
+`scripts/eval/evaluate.py` imports
+`from nemo.collections.asr.parts.utils.manifest_utils import ...`, which
+forces a `pip install nemo-toolkit[all]` cascade. That cascade silently
+downgrades torch / transformers / safetensors / nvidia-modelopt out from
+under the canonical omk env pins (verified live 2026-05-28 on
+linode-blackswan-2):
+
+- torch 2.10.0+cu128 → 2.12.0+cu130 (breaks vLLM 0.20.2 wheel)
+- transformers 5.5.0 → 4.57.6 (removes Gemma4Config)
+- nvidia-modelopt 0.43.0 → 0.37.0 (breaks NVFP4A16 pin)
+- safetensors 0.7.0 → 0.8.0-rc.0
+
+The scorer itself is 3 lines of stdlib substring matching — inlining is
+mathematically byte-identical to upstream. Apache-2.0 attribution is in the
+header of `ruler_helpers.string_match_all`.
+
+**Generalized principle** (lands as a new feedback memory): when an upstream
+scorer is pure-Python ≤20 LOC and the upstream wrapper drags an
+env-clobbering dep (transformers/torch/cuda downgrades), inline the scorer
+with explicit attribution. Subprocess into upstream's wrapper only when the
+scorer has non-trivial dependencies (numpy/scipy/regex tables) that the
+runner can't trivially replicate.
+
+### v2.10.3 Templates + ctx-tier sweep convention
+
+| Template | Task | Ctx | n | Use case |
+|---|---|---|---|---|
+| `ruler_native_smoke` | vt | 4096 | 5 | Plumbing sanity, ≤2 min |
+| `ruler_native_vt_32k` | vt | 32768 | 50 | Reference anchor vs lm-eval `ruler_vt` |
+| `ruler_native_vt_256k` | vt | 262144 | 50 | YaRN β-boundary probe at native |
+| `ruler_native_vt_512k` | vt | 524288 | 50 | YaRN factor=2.0 extension |
+| `ruler_native_mk1_256k` | niah_multikey_1 | 262144 | 50 | High-freq tracking probe |
+| `ruler_native_mk1_512k` | niah_multikey_1 | 524288 | 50 | High-freq probe @ 512k |
+
+The remaining 8 RULER tasks (cwe, fwe, qa_1, qa_2, niah_single_*,
+niah_multikey_2/3, niah_multiquery, niah_multivalue) are runner-supported
+via `selection.ruler_task`. New templates land as
+`eval/templates/ruler_native_<task>_<ctx>.yaml`.
+
+### v2.10.4 Composes with NoLiMa as the YaRN validation triad
+
+Google's 2026-05-28 recommendation: validate any long-context extension
+(YaRN, LongRoPE, SelfExtend) on three complementary signals:
+
+1. **NoLiMa** — mscale / attention_factor tuning (latent-association probe).
+   omk template family: `nolima_*`.
+2. **RULER VT** — β_fast / β_slow boundary fidelity at long context
+   (strict-sequence-tracking probe).
+   omk templates: `ruler_native_vt_{256k,512k}`.
+3. **RULER Multi-Key NIAH** — high-frequency rope dim integrity
+   (pass-through dim probe).
+   omk templates: `ruler_native_mk1_{256k,512k}`.
+
+A YaRN extension is healthy when (a) NoLiMa hits ≥80% on the model's
+mscale-tuned tier, (b) VT @ 512k stays within 5-10pp of VT @ 256k, and
+(c) MK1 @ 512k stays within 5-10pp of MK1 @ 256k. Anomalies in just one
+of the three localize the problem:
+
+- NoLiMa drop only → mscale / attention_factor wrong
+- VT drop only → low-freq extrapolation broken (β_slow misplaced)
+- MK1 drop only → high-freq pass-through corrupted (β_fast misplaced)
+
+### v2.10.5 Bootstrap + reference anchor
+
+Pods that will run `ruler_native` must be bootstrapped with `--with-ruler`:
+
+```
+bash eval/pod_eval_bootstrap.sh --with-ruler [other flags]
+```
+
+This clones NVIDIA/RULER to `/workspace/RULER` and pre-fetches nltk's
+`punkt` + `punkt_tab` corpora (~50 MB combined). Without `--with-ruler` the
+ruler_native runner fails at startup with a "cannot locate NVIDIA/RULER"
+error — fail-loud rather than silently producing zero scores.
+
+**Reference anchor (ship gate)**: before relying on any `ruler_native_*`
+score for cohort comparison, run `ruler_native_vt_32k` once on a known
+model (128e Q6_K llama-server is the canonical reference) and compare to
+lm-eval's bundled `ruler_vt` at 32k on the same model. The two should agree
+within ±5pp. Wider drift = ruler_runner.py has a bug; STOP and bisect
+against the upstream RULER repo's expected scores for Llama-3.1-8B
+(paper Table 1).
+
+### v2.10.6 Disk budget
+
+Each `(task, ctx)` cell writes ~520 KB/sample to `<stage>/data/<task>/`
+`validation.jsonl`. The 6-template family at default n=50 totals ~150 MB on
+disk plus the per-cell sqlite resume DBs (≤10 MB each). Not in the "TB
+territory" some other long-ctx benches hit (e.g. an unbounded NIAH sweep
+across the full 50-percentile depth grid × 500 samples × 13 tasks would
+land in TB; we don't run that without explicit budget approval).
+
+### v2.10.7 Greedy enforced at the runner level
+
+`ruler_runner.chat_complete()` sets `temperature=0.0`, `top_p=1.0`,
+`max_tokens=<template>` **regardless of template generation block**, so
+even if a future template accidentally ships with sampling on, the runner
+overrides. RULER tasks are deterministic substring matches — sampling adds
+noise and breaks cross-cohort comparison the same way it does on the
+9-bench suite (see `feedback_canonical_eval_sampler_is_greedy`).

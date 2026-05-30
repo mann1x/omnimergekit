@@ -1,0 +1,66 @@
+# ruler_native_vt_32k — reference anchor for the omk ruler_native backend.
+#
+# Task: vt (Variable Tracking) at 32k ctx × 50 samples. This template is the
+# **calibration anchor** against lm-eval's bundled `ruler_vt` at 32k — both
+# implementations call the same upstream `prepare.py` + `string_match_all`
+# scorer math, so scores MUST agree within ±5pp on the same served model. If
+# they diverge wider than that, ruler_runner.py has a bug — STOP and bisect.
+#
+# Expected wall-clock: ~30 min on solidpc 3090 with a 128e Q6_K llama-server
+# (50 samples × 32k prompts, ~30-60s/sample greedy).
+#
+# Greedy enforced (template + runner-level both). Sample size matches the
+# RULER paper's per-tier 50.
+
+name: ruler_native_vt_32k
+backend: ruler_native
+task: ruler
+n: 50
+
+selection:
+  type: filter
+  ruler_task: vt
+  ctx_tokens: 32768
+  num_samples: 50
+
+generation:
+  max_gen_toks: 30              # MATCHES lm-eval bundled vt.yaml:7 exactly. 30
+                                # is the paper-canonical RULER VT cap (see
+                                # NVIDIA/RULER variable_tracking.py:24 example
+                                # invocation; the parser default of 120 is
+                                # unused in published baselines). The smoke
+                                # template (ruler_native_smoke.yaml) keeps 120
+                                # because it's a plumbing smoke that needs to
+                                # pass on Gemma-4 instruct's preamble. This
+                                # anchor template, by contrast, is the
+                                # ship-gate for runner methodology equivalence
+                                # — same gen_kwargs as lm-eval means scores
+                                # must agree within ±5pp on the same served
+                                # model. For actual quality measurement of
+                                # instruct models at long ctx use a separate
+                                # template with a wider max_gen_toks (TBD).
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 900.0           # 15 min ceiling — comfortable for 32k
+
+scoring:
+  scorer: ruler_helpers
+  metric: pass_at_1
+  filter: null
+
+cache:
+  sqlite_prefix: ruler_vt_32k
+
+backend_args:
+  num_concurrent: 2
+  model_template_type: base
+  tokenizer_type: hf
+  random_seed: 42
+
+reports:
+  token_stats: true
+
+sanity:
+  min_p10_chars: 1

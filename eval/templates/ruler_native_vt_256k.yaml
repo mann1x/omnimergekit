@@ -1,0 +1,58 @@
+# ruler_native_vt_256k — Variable Tracking at native Gemma 4 max position.
+#
+# YaRN validation triad anchor — this is the **β_fast/β_slow boundary probe**
+# at the model's native max_position_embeddings (262144 for Gemma 4 31B / 26B-
+# A4B post-extension). VT requires strict sequence tracking through long
+# prompts, which is where YaRN's NTK-by-parts boundary collapses if
+# `partial_rotary_factor=0.25` truncation hits the wrong frequency bin.
+#
+# Greedy, 50 samples. Expected ~45-60 min on bs2 Blackwell 96GB with vLLM
+# NVFP4A16 or Q6_K llama-server.
+
+name: ruler_native_vt_256k
+backend: ruler_native
+task: ruler
+n: 50
+
+selection:
+  type: filter
+  ruler_task: vt
+  ctx_tokens: 262144
+  num_samples: 50
+
+generation:
+  max_gen_toks: 120
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 1500.0          # 25 min/sample worst-case at 256k
+
+scoring:
+  scorer: ruler_helpers
+  metric: pass_at_1
+  filter: null
+
+cache:
+  sqlite_prefix: ruler_vt_256k
+
+backend_args:
+  num_concurrent: 2
+  model_template_type: base
+  tokenizer_type: hf
+  random_seed: 42
+
+reports:
+  token_stats: true
+
+sanity:
+  min_p10_chars: 1
+
+# Per-backend overrides for the long-ctx server tuning.
+backend_overrides:
+  vllm:
+    generation:
+      http_timeout: 1800.0      # 30 min hard cap on 256k vLLM
+  llama:
+    generation:
+      http_timeout: 1800.0

@@ -1,0 +1,57 @@
+# ruler_native_mk1_256k — Multi-Key NIAH at 256k ctx.
+#
+# Multi-Key NIAH (`niah_multikey_1`) is the **high-frequency tracking probe**
+# in the YaRN validation triad. It stresses rope's high-frequency dims that
+# YaRN's ramp passes through unchanged — if those dims are corrupted (wrong
+# β_fast or wrong head_dim split), Multi-Key catches it where VT (which
+# stresses the low-freq extrapolated dims) might not.
+#
+# Greedy, 50 samples. NIAH answers are short ID strings — 128 max_tokens is
+# more than enough.
+
+name: ruler_native_mk1_256k
+backend: ruler_native
+task: ruler
+n: 50
+
+selection:
+  type: filter
+  ruler_task: niah_multikey_1
+  ctx_tokens: 262144
+  num_samples: 50
+
+generation:
+  max_gen_toks: 128
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 1500.0
+
+scoring:
+  scorer: ruler_helpers
+  metric: pass_at_1
+  filter: null
+
+cache:
+  sqlite_prefix: ruler_mk1_256k
+
+backend_args:
+  num_concurrent: 2
+  model_template_type: base
+  tokenizer_type: hf
+  random_seed: 42
+
+reports:
+  token_stats: true
+
+sanity:
+  min_p10_chars: 1
+
+backend_overrides:
+  vllm:
+    generation:
+      http_timeout: 1800.0
+  llama:
+    generation:
+      http_timeout: 1800.0

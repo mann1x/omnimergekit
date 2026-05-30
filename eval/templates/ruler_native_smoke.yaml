@@ -1,0 +1,64 @@
+# ruler_native_smoke — minimal end-to-end smoke for the omk ruler_native backend.
+#
+# Task: vt (Variable Tracking) at 4k ctx × 5 samples. Should run in under 2
+# minutes end-to-end on solidpc 3090 with a 128e Q6_K llama-server, score
+# 80-100% (VT at 4k is easy). Verifies:
+#   - upstream prepare.py subprocess works (nltk corpus + tokenizer load)
+#   - sqlite resume cache writes properly
+#   - /v1/completions raw-text continuation produces text on the prefix
+#   - inline string_match_all scorer produces a non-zero score
+#
+# This is NOT a published-results template — see ruler_native_vt_32k for the
+# reference anchor against lm-eval's bundled ruler_vt.
+
+name: ruler_native_smoke
+backend: ruler_native
+task: ruler                     # opaque to omk_eval; runner reads `ruler_task` below
+n: 5
+
+selection:
+  type: filter
+  ruler_task: vt                # one of: vt, cwe, fwe, qa_1, qa_2,
+                                # niah_single_1..3, niah_multikey_1..3,
+                                # niah_multiquery, niah_multivalue
+  ctx_tokens: 4096
+  num_samples: 5
+
+generation:
+  max_gen_toks: 120             # upstream variable_tracking.py parser default;
+                                # the 30 in the docstring example is misleading —
+                                # instruct-tuned models (Gemma 4 et al.) spend
+                                # ~30 tokens restating "Answer: According to …,
+                                # they are: " before listing variable names, so
+                                # 30 caps mid-preamble. Empirically 120 lets
+                                # Gemma 4 instruct emit all 5 names + EOS.
+  temperature: 0.0              # greedy (enforced by runner regardless — see header)
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 600.0           # 4k ctx is fast; 10 min is generous
+
+scoring:
+  scorer: ruler_helpers         # inline string_match_all from upstream
+  metric: pass_at_1             # canonical omk roll-up key
+  filter: null                  # ruler_helpers picks string_match_all
+                                # automatically per task; this is just for the
+                                # omk_eval score extractor.
+
+cache:
+  sqlite_prefix: ruler_vt_4k_smoke
+
+backend_args:
+  num_concurrent: 2
+  model_template_type: base     # upstream template family; do not change without
+                                # re-baselining against published RULER numbers
+  tokenizer_type: hf
+  random_seed: 42               # matches RULER paper's seed
+
+reports:
+  token_stats: true
+
+# Not blocking — vt at 4k can hit `0` chars when the model just emits the answer
+# tokens without padding, and that's a valid passing response.
+sanity:
+  min_p10_chars: 1

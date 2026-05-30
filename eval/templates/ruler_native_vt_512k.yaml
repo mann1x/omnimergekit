@@ -1,0 +1,58 @@
+# ruler_native_vt_512k — Variable Tracking at the YaRN factor=2.0 target.
+#
+# This is the **YaRN extension validation** template. Scores at 512k should
+# stay within 5-10pp of the 256k anchor when the YaRN extension is healthy.
+# A larger gap signals one of:
+#   - YaRN mscale / attention_factor mis-tuned (NoLiMa picks this up first)
+#   - β_fast / β_slow boundary misplaced for partial_rotary_factor=0.25
+#   - MoE routing entropy collapse on far-position tokens
+#
+# Greedy, 50 samples. Expected ~90 min on bs2 Blackwell 96GB with TP=2 vLLM
+# NVFP4A16 (dense 31B doesn't fit a single Blackwell at 512k ctx).
+
+name: ruler_native_vt_512k
+backend: ruler_native
+task: ruler
+n: 50
+
+selection:
+  type: filter
+  ruler_task: vt
+  ctx_tokens: 524288
+  num_samples: 50
+
+generation:
+  max_gen_toks: 120
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 1800.0
+
+scoring:
+  scorer: ruler_helpers
+  metric: pass_at_1
+  filter: null
+
+cache:
+  sqlite_prefix: ruler_vt_512k
+
+backend_args:
+  num_concurrent: 1             # single-flight at 512k — KV pressure
+  model_template_type: base
+  tokenizer_type: hf
+  random_seed: 42
+
+reports:
+  token_stats: true
+
+sanity:
+  min_p10_chars: 1
+
+backend_overrides:
+  vllm:
+    generation:
+      http_timeout: 2700.0      # 45 min/sample is plausible at 512k vLLM TP=2
+  llama:
+    generation:
+      http_timeout: 2700.0

@@ -60,6 +60,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATES_DIR = REPO_ROOT / "eval" / "templates"
 LCB_DIR = REPO_ROOT / "eval" / "lcb"
 MPE_DIR = REPO_ROOT / "eval" / "multipl_e"
+NOLIMA_DIR = REPO_ROOT / "eval" / "nolima"
+RULER_DIR = REPO_ROOT / "eval" / "ruler_native"
 
 
 def log(msg: str) -> None:
@@ -613,6 +615,137 @@ def dispatch_lcb(template: dict, model_tag: str, base_url: str,
     return subprocess.call(cmd)
 
 
+def dispatch_nolima(template: dict, model_tag: str, base_url: str,
+                    out_dir: Path, tokenizer: str | None) -> int:
+    """Run the omk-native NoLiMa runner against the chat-completions endpoint.
+
+    Same shape as dispatch_lcb: build a subprocess.call into
+    eval/nolima/nolima_runner.py with selection + generation + cache fields
+    mapped to its CLI surface. The runner writes nolima_result.json which
+    extract_canonical_score reads to populate summary.json. License: Adobe
+    Research non-commercial research only; data pulled at runtime from
+    amodaresi/NoLiMa, never vendored.
+    """
+    g = template["generation"]
+    sel = template["selection"]
+    ba = template.get("backend_args", {}) or {}
+
+    cache_dir = out_dir / "sqlite_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    prefix = template.get("cache", {}).get("sqlite_prefix", template["name"])
+    cache_db = cache_dir / f"{prefix}_{model_tag}.db"
+
+    py = os.environ.get("OMK_PYTHON") or (
+        "/root/anaconda3/envs/omnimergekit/bin/python"
+        if os.path.exists("/root/anaconda3/envs/omnimergekit/bin/python")
+        else sys.executable)
+
+    # Tokenizer source: explicit `tokenizer:` field on the template wins
+    # (used when the served model dir lacks a tokenizer, e.g. NVFP4A16 quant
+    # serving the it tokenizer separately); otherwise fall back to the omk
+    # tokenizer arg (--tokenizer or --model). Sized for accurate haystack
+    # token counts.
+    tok = sel.get("tokenizer") or tokenizer
+    if not tok:
+        log("ERROR: nolima needs --tokenizer (or selection.tokenizer in template)")
+        return 11
+
+    cmd = [
+        py, str(NOLIMA_DIR / "nolima_runner.py"),
+        "--name", model_tag,
+        "--base-url", base_url.replace("/v1", ""),
+        "--needle-set", sel.get("needle_set", "needle_set"),
+        "--haystack-tier", sel.get("haystack_tier", "rand_shuffle"),
+        "--haystack-book", str(sel.get("haystack_book", 1)),
+        "--ctx-tokens", str(int(sel["ctx_tokens"])),
+        "--depth-intervals", str(int(sel.get("depth_intervals", 26))),
+        "--shifts", str(int(sel.get("shifts", 1))),
+        "--hop-mode", sel.get("hop_mode", "onehop"),
+        "--tests-per-row", str(int(sel.get("tests_per_row", 1))),
+        "--row-limit", str(int(sel.get("row_limit", 0))),
+        "--metric", ba.get("metric", "contains"),
+        "--tokenizer", tok,
+        "--num-concurrent", str(int(ba.get("num_concurrent", 2))),
+        "--max-tokens", str(int(g.get("max_gen_toks", 192))),
+        "--http-timeout", str(float(g.get("http_timeout", 900.0))),
+        "--cache-db", str(cache_db),
+        "--output", str(out_dir / "nolima_result.json"),
+    ]
+    log(f"nolima runner: {' '.join(shlex.quote(c) for c in cmd)}")
+    return subprocess.call(cmd)
+
+
+def dispatch_ruler_native(template: dict, model_tag: str, base_url: str,
+                          out_dir: Path, tokenizer: str | None) -> int:
+    """Run the omk-native RULER runner against the chat-completions endpoint.
+
+    Same shape as dispatch_nolima: build a subprocess.call into
+    eval/ruler_native/ruler_runner.py with selection + generation + cache fields
+    mapped to its CLI surface. The runner writes ruler_result.json which
+    extract_canonical_score reads to populate summary.json. License: NVIDIA/RULER
+    Apache-2.0; runtime-cloned at /workspace/RULER (pod) or /shared/dev/RULER
+    (solidpc), never vendored. The upstream string_match_all scorer
+    (eval/synthetic/constants.py:25) is inlined verbatim into ruler_helpers.py
+    — see ruler_helpers.py header for the inline-vs-subprocess RCA.
+    """
+    g = template["generation"]
+    sel = template["selection"]
+    ba = template.get("backend_args", {}) or {}
+
+    cache_dir = out_dir / "sqlite_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    prefix = template.get("cache", {}).get("sqlite_prefix", template["name"])
+    cache_db = cache_dir / f"{prefix}_{model_tag}.db"
+
+    # Stage dir (upstream prepare.py output). Lives under out_dir so eval-pod
+    # purge sweeps it with the rest of the run; idempotent re-launches reuse it.
+    stage_dir = out_dir / "ruler_stage"
+
+    py = os.environ.get("OMK_PYTHON") or (
+        "/root/anaconda3/envs/omnimergekit/bin/python"
+        if os.path.exists("/root/anaconda3/envs/omnimergekit/bin/python")
+        else sys.executable)
+
+    # Tokenizer source: same precedence as NoLiMa — explicit template field wins,
+    # then the omk tokenizer arg. RULER's prepare.py needs the model's OWN
+    # tokenizer so the staged inputs land at the right token count.
+    tok = sel.get("tokenizer") or tokenizer
+    if not tok:
+        log("ERROR: ruler_native needs --tokenizer (or selection.tokenizer in template)")
+        return 11
+
+    task = sel.get("ruler_task")
+    if not task:
+        log("ERROR: ruler_native template missing selection.ruler_task "
+            "(e.g. 'vt', 'niah_multikey_1', 'cwe', …)")
+        return 11
+
+    cmd = [
+        py, str(RULER_DIR / "ruler_runner.py"),
+        "--name", model_tag,
+        "--base-url", base_url.replace("/v1", ""),
+        "--task", task,
+        "--ctx-tokens", str(int(sel["ctx_tokens"])),
+        "--num-samples", str(int(sel.get("num_samples", template.get("n", 50)))),
+        "--tokenizer", tok,
+        "--tokenizer-type", ba.get("tokenizer_type", "hf"),
+        "--model-template-type", ba.get("model_template_type", "base"),
+        "--stage-dir", str(stage_dir),
+        "--num-concurrent", str(int(ba.get("num_concurrent", 2))),
+        "--max-tokens", str(int(g.get("max_gen_toks", 128))),
+        "--http-timeout", str(float(g.get("http_timeout", 1200.0))),
+        "--cache-db", str(cache_db),
+        "--output", str(out_dir / "ruler_result.json"),
+        "--random-seed", str(int(ba.get("random_seed", 42))),
+    ]
+    if ba.get("ruler_root"):
+        cmd += ["--ruler-root", str(ba["ruler_root"])]
+    if ba.get("system_prompt"):
+        cmd += ["--system-prompt", str(ba["system_prompt"])]
+    log(f"ruler_native runner: {' '.join(shlex.quote(c) for c in cmd)}")
+    return subprocess.call(cmd)
+
+
 def dispatch_multipl(template: dict, model_tag: str, base_url: str,
                      out_dir: Path) -> int:
     """MultiPL-E backend: per-language generate (against the running
@@ -975,6 +1108,54 @@ def extract_canonical_score(template: dict, out_dir: Path) -> tuple[float | None
             "pass_at_1": d.get("pass_at_1"),
             "n_pass": d.get("n_pass"),
             "n": d.get("n"),
+        }
+        return (float(score) if score is not None else None), score_dict
+
+    if backend == "nolima":
+        rj = out_dir / "nolima_result.json"
+        if not rj.exists():
+            return None, {}
+        try:
+            d = json.loads(rj.read_text())
+        except Exception as e:  # pragma: no cover
+            return None, {"error": f"nolima_result.json parse: {e}"}
+        score = d.get("pass_at_1") if d.get("pass_at_1") is not None else d.get("accuracy")
+        score_dict = {
+            "pass_at_1": d.get("pass_at_1"),
+            "accuracy": d.get("accuracy"),
+            "n_pass": d.get("n_pass"),
+            "n": d.get("n"),
+            "ctx_tokens": d.get("ctx_tokens"),
+            "metric": d.get("metric"),
+            "needle_set": d.get("needle_set"),
+            "hop_mode": d.get("hop_mode"),
+        }
+        return (float(score) if score is not None else None), score_dict
+
+    if backend == "ruler_native":
+        rj = out_dir / "ruler_result.json"
+        if not rj.exists():
+            return None, {}
+        try:
+            d = json.loads(rj.read_text())
+        except Exception as e:  # pragma: no cover
+            return None, {"error": f"ruler_result.json parse: {e}"}
+        # Headline = pass_at_1 (omk canonical 0-1 scale). RULER also records
+        # the raw 0-100 `score` under that key — keep both in the dict for
+        # provenance against published RULER numbers.
+        score = d.get("pass_at_1") if d.get("pass_at_1") is not None else d.get("accuracy")
+        score_dict = {
+            "pass_at_1": d.get("pass_at_1"),
+            "accuracy": d.get("accuracy"),
+            "score": d.get("score"),           # 0-100 (RULER convention)
+            "n": d.get("n"),
+            "missing": d.get("missing"),
+            "task": d.get("task"),
+            "ctx_tokens": d.get("ctx_tokens"),
+            "num_samples": d.get("num_samples"),
+            "metric": d.get("metric"),         # "string_match_all"/"string_match_part"
+            "fresh_empty": d.get("fresh_empty"),
+            "fresh_lenhit": d.get("fresh_lenhit"),
         }
         return (float(score) if score is not None else None), score_dict
 
@@ -1379,6 +1560,10 @@ def main() -> None:
             rc = dispatch_lcb(template, served_name, base_url, out_dir)
         elif template["backend"] == "multipl_e":
             rc = dispatch_multipl(template, served_name, base_url, out_dir)
+        elif template["backend"] == "nolima":
+            rc = dispatch_nolima(template, served_name, base_url, out_dir, tokenizer)
+        elif template["backend"] == "ruler_native":
+            rc = dispatch_ruler_native(template, served_name, base_url, out_dir, tokenizer)
         else:
             fatal(10, f"unknown template backend: {template['backend']}")
     finally:
@@ -1388,7 +1573,9 @@ def main() -> None:
     # Post-run token stats + sanity
     samples_candidates = list(out_dir.glob("**/samples_*.jsonl")) + \
                          list(out_dir.glob("**/lcb_result.samples.jsonl")) + \
-                         list(out_dir.glob("**/mpe_result.samples.jsonl"))
+                         list(out_dir.glob("**/mpe_result.samples.jsonl")) + \
+                         list(out_dir.glob("**/nolima_result.samples.jsonl")) + \
+                         list(out_dir.glob("**/ruler_result.samples.jsonl"))
     # Pick the most recently modified samples file. Multiple may co-exist
     # under the same out_dir (re-runs, shadow-task re-tasking, smoke vs full)
     # and the stale ones can have radically different row counts than the
