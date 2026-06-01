@@ -1,0 +1,53 @@
+# Qwen-tuned variant (T177 RCA 2026-06-01): METHOD-IDENTICAL to the
+# canonical bench (same few-shot, greedy sampler, thinking budget) with the
+# plain-text "Question:"/"Problem:" stop REMOVED. Qwen3.x reasoning verbalizes
+# that delimiter early in its CoT, tripping the few-shot-completion until=>
+# empty content => [invalid] => 0%. Redundant for chat models (turn ends on
+# <|im_end|>). Gemma-4 CoT never emits it, so this is Qwen-family only.
+# No process_docs subset: omk --limit N takes first-N, bit-identical doc set.
+tag:
+- math_word_problems
+task: gsm8k_qwen
+dataset_path: openai/gsm8k
+dataset_name: main
+output_type: generate_until
+training_split: train
+fewshot_split: train
+test_split: test
+doc_to_text: 'Question: {{question}}
+
+  Answer:'
+doc_to_target: '{{answer}}'
+metric_list:
+- metric: exact_match
+  aggregation: mean
+  higher_is_better: true
+  ignore_case: true
+  ignore_punctuation: false
+  regexes_to_ignore:
+  - ','
+  - \$
+  - '(?s).*#### '
+  - \.$
+generation_kwargs:
+  until:
+  - </s>
+  - <|im_end|>
+  do_sample: false
+  temperature: 0.0
+repeats: 1
+num_fewshot: 5
+filter_list:
+- name: strict-match
+  filter:
+  - function: regex
+    regex_pattern: '#### (\-?[0-9\.\,]+)'
+  - function: take_first
+- name: flexible-extract
+  filter:
+  - function: regex
+    group_select: -1
+    regex_pattern: (-?[$0-9.,]{2,})|(-?[0-9]+)
+  - function: take_first
+metadata:
+  version: 3.0

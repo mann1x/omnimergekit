@@ -1,0 +1,38 @@
+# Qwen-tuned variant (T177 RCA 2026-06-01): METHOD-IDENTICAL to the
+# canonical bench (same few-shot, greedy sampler, thinking budget) with the
+# plain-text "Question:"/"Problem:" stop REMOVED. Qwen3.x reasoning verbalizes
+# that delimiter early in its CoT, tripping the few-shot-completion until=>
+# empty content => [invalid] => 0%. Redundant for chat models (turn ends on
+# <|im_end|>). Gemma-4 CoT never emits it, so this is Qwen-family only.
+# No process_docs subset: omk --limit N takes first-N, bit-identical doc set.
+tag:
+- math_word_problems
+task: minerva_math500_qwen
+dataset_path: HuggingFaceH4/MATH-500
+dataset_name: default
+output_type: generate_until
+training_split: null
+test_split: test
+process_docs: !function utils_math500_qwen.process_docs
+doc_to_text: !function utils_math500_qwen.doc_to_text
+process_results: !function utils_math500_qwen.process_results
+doc_to_target: '{{answer if few_shot is undefined else solution}}'
+generation_kwargs:
+  until:
+  - </s>
+  - <|im_end|>
+  do_sample: false
+  temperature: 0
+metric_list:
+- metric: exact_match
+  aggregation: mean
+  higher_is_better: true
+- metric: math_verify
+  aggregation: mean
+  higher_is_better: true
+num_fewshot: 4
+metadata:
+  version: 3.0
+fewshot_config:
+  sampler: first_n
+  samples: !function utils_math500_qwen.list_fewshot_samples
