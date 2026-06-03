@@ -1,0 +1,40 @@
+# redist toolkit — operator config (TEMPLATE).
+#
+# Copy this to `redist_config.sh` IN THIS SAME DIRECTORY and edit the paths for
+# your host. `redist_config.sh` is gitignored/uncommitted; this `.example` is the
+# tracked template. Every redist_*.sh runner sources `redist_config.sh` if present.
+#
+# SECURITY: this file holds PATHS ONLY. NEVER put a token/key/secret here, and
+# NEVER use a `${VAR:-<literal-secret>}` fallback. The omnimergekit repo is PUBLIC
+# and gitleaks-gated. (See docs/SECURITY.md.)
+#
+# Convention: REDIST_* values that name a *host/user input* (models, corpora,
+# imatrix) have NO safe default — the runner fails loud via `${VAR:?}` when unset.
+# Toolchain/infra values use `:-` defaults and rarely need editing.
+
+# ── required host/user inputs (no default — runners hard-fail if unset) ─────────
+export REDIST_TEACHER="/path/to/gemma-4-26B-A4B-it"                      # 128e teacher dir
+export REDIST_STUDENT="/path/to/gemma-4-A4B-62e-fc15_25-p8-pes120-it"    # pruned 62e (A2) dir
+export REDIST_KEEP_META="/path/to/a2_keep_metadata.json"                 # A2 survivor keep-map
+export REDIST_SAMPLE="/path/to/loop_screen_sample.jsonl"                 # 200-prompt loop screen set
+
+# capability-driver corpora (only the runner you invoke needs its corpus set)
+export REDIST_CALIB_MULTILINGUAL="/path/to/redist_calib_multilingual.jsonl"  # rankprobe
+export REDIST_CALIB_CODE="/path/to/redist_calib_code.jsonl"                  # code closed-form fold
+export REDIST_KD_CORPUS_CODE="/path/to/kd_corpus_code.jsonl"                 # code trainable-KD
+
+# imatrix for the GGUF quant runners (A2's imatrix.dat — preserve it!)
+export REDIST_IMATRIX="/path/to/gemma-4-A4B-62e-...-GGUF/imatrix.dat"
+
+# ── toolchain / infra (safe `:-` defaults in each runner; override only if needed) ─
+# export REDIST_PY="/path/to/envs/omnimergekit/bin/python"   # default: python (on PATH)
+# export REDIST_SCRIPTS_DIR="$REPO_ROOT/scripts"             # default: repo scripts/
+# export OMK_EVAL="$REPO_ROOT/eval/omk_eval.py"              # default: repo eval/omk_eval.py
+# export LLAMA_QUANTIZE="/opt/llama.cpp/build/bin/llama-quantize"   # default: $(command -v llama-quantize)
+# export CONVERT_HF_TO_GGUF="/path/to/llama.cpp/convert_hf_to_gguf.py"  # default: $(command -v convert_hf_to_gguf.py)
+# export REDIST_ENV_BIN="/path/to/envs/omnimergekit/bin"     # optional: prepended to PATH (omk env tools for omk_eval)
+
+# ── outputs (NEVER /tmp; CWD-relative defaults — set to a big disk for real runs) ─
+# export REDIST_WORK="$PWD/redist_work"            # capture .pt, rank-probe json
+# export REDIST_RESULTS="$PWD/eval_results_redist" # loop_screen + code-eval summaries
+# export REDIST_OUT_BASE="$PWD/redist_models"      # built bf16 62e dirs + GGUFs (large)
