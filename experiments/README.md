@@ -287,6 +287,22 @@ Recipes/scripts:
 - `scripts/apply_t18_single_knob_c6.sh` (isolation runner, T30)
 - Docs: `docs/T18_moe_router_recovery.md`
 
+### 62e aggressive prune + capability redistribution (PARKED 2026-06-03)
+
+Pushed the prune to **62e** (A2 = `gemma-4-A4B-62e-fc15_25-p8-pes120-it`, ~12 GB
+VRAM) and asked whether the experts dropped at 62e can be **redistributed** back
+into the survivors. Full log — selection-exhaustion (T175/T187-189), closed-form
+fold (HC-SMoE/MergeMoE/REAM) and trainable KD (E-RankProbe/E-ExpertKD/code-KD),
+on both diffuse-multilingual and localized-code drivers — in
+**[`gemma4_62e_redist.md`](gemma4_62e_redist.md)**.
+
+Verdict: **no redistribution lever beats the A2 baseline.** A fixed router can't
+independently gate folded function (REAP Thm 1); trainable KD reconstructs (ML) or
+noise-trades (code, +0.6 pp HE+ but constrained-loops double). Capability recovery
+at a fixed budget is a **selection** problem (v5/v6-coder beat A2 by keep-set
+choice), not a redistribution problem. Council-confirmed structural + publishable
+(`csl-2026-06-02-2050-c4f7`). A2 stays unshipped pending a budget/scope decision.
+
 ### Open questions / next steps
 
 1. LCB-55 verdict on C6+shared (in flight, ETA 18:10 CEST 2026-05-17).
