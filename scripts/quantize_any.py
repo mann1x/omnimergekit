@@ -47,19 +47,26 @@ METHODS = {"nvfp4a16", "awq", "gptq",
            "w4a16_lc", "w4a8_lc", "nvfp4_lc", "int4_awq",
            "mxfp4", "nvfp4_awq_lite"}
 
-# Per-method conda env to run the quantizer in.
+# Per-method conda env to run the quantizer in. Host-independent: each tool's
+# env path can be overridden via an env var (MODELOPT_ENV / VLLM_ENV /
+# LLMCOMP_ENV); the defaults below are the canonical solidPC paths, so existing
+# hosts are unaffected. Override on a host whose envs live elsewhere, e.g.
+#   MODELOPT_ENV=/srv/ml/envs/envs/modelopt_dev python quantize_any.py ...
+_MODELOPT_ENV = os.environ.get("MODELOPT_ENV", "/root/anaconda3/envs/modelopt")
+_VLLM_ENV     = os.environ.get("VLLM_ENV",     "/root/anaconda3/envs/vllm")
+_LLMCOMP_ENV  = os.environ.get("LLMCOMP_ENV",  "/root/anaconda3/envs/llmcomp")
 METHOD_ENV = {
-    "nvfp4a16": "/root/anaconda3/envs/modelopt",
-    "awq": "/root/anaconda3/envs/vllm",  # legacy autoawq — DOES NOT support Gemma 4
-    "gptq": "/root/anaconda3/envs/modelopt",
+    "nvfp4a16": _MODELOPT_ENV,
+    "awq": _VLLM_ENV,  # legacy autoawq — DOES NOT support Gemma 4
+    "gptq": _MODELOPT_ENV,
     # modelopt INT4_AWQ_CFG — works on Gemma 4 fused MoE experts (tensor-level).
-    "int4_awq": "/root/anaconda3/envs/modelopt",
-    "mxfp4":    "/root/anaconda3/envs/modelopt",
-    "nvfp4_awq_lite": "/root/anaconda3/envs/modelopt",
+    "int4_awq": _MODELOPT_ENV,
+    "mxfp4":    _MODELOPT_ENV,
+    "nvfp4_awq_lite": _MODELOPT_ENV,
     # llm-compressor (vLLM Project) successor to autoawq.
-    "w4a16_lc": "/root/anaconda3/envs/llmcomp",
-    "w4a8_lc":  "/root/anaconda3/envs/llmcomp",
-    "nvfp4_lc": "/root/anaconda3/envs/llmcomp",
+    "w4a16_lc": _LLMCOMP_ENV,
+    "w4a8_lc":  _LLMCOMP_ENV,
+    "nvfp4_lc": _LLMCOMP_ENV,
 }
 
 
