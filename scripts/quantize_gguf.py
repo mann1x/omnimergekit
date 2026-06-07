@@ -296,12 +296,25 @@ def _cd_file_base_ftype(quant: str) -> str:
 # Legacy Q8_0/Q4_0/Q4_1 (no "_K") stay imatrix-free (no meaningful benefit).
 IMATRIX_QUANTS = {q for q in ALL_QUANTS if q.startswith("IQ") or q.startswith("UD-IQ") or "_K" in q}
 
-# Per-tier EXCEPTIONS: tiers that match the rule above by name but where imatrix
-# measurably HURTS quality, so they are built imatrix-FREE. IMATRIX_QUANTS (the
-# rule) and IMATRIX_EXCLUDE (the exceptions) are the two explicit halves of the
-# policy — the "with imatrix" list and the "without imatrix" list.
-#   Q4_K_M (v6-coder, 2026-05-25): imatrix HE+ 90.85% vs plain 92.07% (-1.22pp).
-IMATRIX_EXCLUDE = {"Q4_K_M"}
+# Per-tier EXCEPTIONS: K-quant tiers AT/ABOVE the imatrix bit-depth CROSSOVER, built
+# imatrix-FREE. IMATRIX_QUANTS (the rule) and IMATRIX_EXCLUDE (the exceptions) are the
+# two explicit halves of the policy. The crossover is a property of the quant GRID
+# coarseness, not a specific model: at a fine grid (>= Q4 band) the calibration bias
+# outweighs importance-weighting so imatrix is neutral-to-harmful; below it (Q3/Q2/IQ)
+# imatrix is the difference between a good quant and a broken one. Measure ONCE per
+# model family via a Q2->Q6 HE+/MPE ladder — do NOT retest per quant.
+#   v7-coder 98e (2026-06-07, full ladder): Q6_K imatrix -0.6pp, Q5/Q4 wash (within
+#     noise), Q3 +4.0pp, Q2 noimat COLLAPSES to HE+ 0.128 (imatrix mandatory).
+#     Crossover sits between the Q4 and Q3 bands.
+#   v6-coder (2026-05-25): Q4_K_M imatrix HE+ 90.85% vs plain 92.07% (-1.22pp) — same band.
+# So everything at/above the Q4 band is imatrix-free; Q3_K_*/Q2_K_*/IQ*/CD-* keep it
+# (the rule + the CD i-quant mandate handle those). Q8_0/Q4_0/Q4_1 are already free
+# (no "_K", not in IMATRIX_QUANTS).
+IMATRIX_EXCLUDE = {
+    "Q4_K_S", "Q4_K_M", "Q4_K_L",
+    "Q5_K_S", "Q5_K_M", "Q5_K_L",
+    "Q6_K", "Q6_K_L",
+}
 
 
 def _uses_imatrix_by_rule(quant: str) -> bool:
