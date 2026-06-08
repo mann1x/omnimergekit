@@ -79,6 +79,23 @@ def fatal(code: int, msg: str) -> "None":
     sys.exit(code)
 
 
+def _enforce_gpu_plan(plan, backend: str) -> None:
+    """Abort (exit 8) when the GPU planner refused under contention.
+
+    gpu_planner returns source="contended" when GPUs exist but none meets the
+    free-VRAM + util THRESHOLD, AND the operator did NOT opt into an unpinned
+    launch. Launching anyway inherits whatever GPUs are visible and OOMs/crashes
+    under a co-tenant — the 2026-06-08 T87 mk1_256k unpinned-TP=2 exit=20. Fail
+    loudly here instead of feeding the broken plan into launch_{vllm,llama}.
+    """
+    if getattr(plan, "source", None) == "contended":
+        fatal(8, f"GPU contention: gpu_planner found no free GPU for the {backend} "
+                 "launch and refused an unpinned fallback (which OOMs under "
+                 "contention). Free a GPU, set OMK_GPU_WAIT_S=<seconds> to wait "
+                 "for one, or OMK_ALLOW_UNPINNED=1 to force the legacy unpinned "
+                 "launch.")
+
+
 # ── Quant detection ───────────────────────────────────────────────────────
 
 
@@ -1475,6 +1492,38 @@ def _check_dependencies(template: dict) -> None:
     log(f"dep check OK ({len(required)} modules): {required}")
 
 
+def _check_ruler_native(template: dict) -> None:
+    """Pre-flight for the ruler_native backend: RULER clone + synthetic-generator
+    python modules + nltk punkt corpora + the selected task's haystack/qa corpus.
+
+    Aborts (exit 6) BEFORE serving a model so a chain fails fast at the broken
+    bench instead of losing the whole run to prepare.py's exit-0-masked child
+    crash or a deep FileNotFoundError. The generic `_check_dependencies` can't
+    catch these — ruler_native templates carry `task: ruler`, which maps to no
+    `_TASK_DEPS` entry, and the haystack corpus is a data file, not a module.
+    Origin: 2026-06-08 T87 niah_multikey_1 → missing PaulGrahamEssays.json.
+    """
+    if (template.get("backend") or "") != "ruler_native":
+        return
+    task = ((template.get("selection") or {}).get("ruler_task") or "").strip()
+    if not task:
+        return  # dispatch_ruler_native already errors clearly on a missing task
+    sys.path.insert(0, str(RULER_DIR))
+    try:
+        from ruler_helpers import ruler_native_readiness
+    except Exception as e:
+        fatal(6, f"ruler_native preflight: cannot import ruler_helpers from "
+                 f"{RULER_DIR}: {e}")
+    problems = ruler_native_readiness(task)
+    if problems:
+        log(f"RULER NATIVE PREFLIGHT FAIL: template={template.get('name')} task={task}")
+        for p in problems:
+            log(f"  - {p}")
+        fatal(6, f"ruler_native preflight failed for task '{task}': "
+                 f"{len(problems)} problem(s) — see log above for fix commands")
+    log(f"ruler_native preflight OK (task={task})")
+
+
 # Tasks whose HF dataset is GATED → an authenticated token is mandatory.
 # Map the task-name substring to the gated dataset id (for a precise message).
 # Add new gated datasets here as the cohort grows.
@@ -1711,6 +1760,10 @@ def main() -> None:
 
     # Pre-flight: dependency check BEFORE launching any server.
     _check_dependencies(template)
+    # ruler_native needs its own preflight (RULER clone + synthetic-generator
+    # modules + nltk punkt + the task's haystack/qa corpus) — the generic check
+    # above can't see data-file deps. No-op for every other backend.
+    _check_ruler_native(template)
 
     # Resolve served name + tokenizer + out dir
     served_name = args.served_name or Path(args.model).name
@@ -1786,6 +1839,7 @@ def main() -> None:
                 content_headroom=int(ba.get("vllm_content_headroom", 4096)),
                 ctx_max=_ctx_cap, kv_dtype="bf16",
                 requested_ctx=args.max_model_len, log=log)
+            _enforce_gpu_plan(vllm_plan, "vllm")
             effective_concurrency = vllm_plan.effective_concurrency
             log(f"GPU plan [vllm]: source={vllm_plan.source} gpu_ids={vllm_plan.gpu_ids} "
                 f"dp={vllm_plan.replicas} tp={vllm_plan.tensor_parallel} "
@@ -1890,6 +1944,7 @@ def main() -> None:
                 max_parallel=max_parallel, thinking_budget=thinking_budget,
                 content_headroom=content_headroom, ctx_max=ctx_max,
                 requested_ctx=requested_ctx, log=log)
+            _enforce_gpu_plan(plan, "llama")
             parallel, ctx = plan.parallel, plan.ctx
             effective_concurrency = plan.effective_concurrency
             # Pin a single GPU only when one full copy fits it (tensor_parallel==1).

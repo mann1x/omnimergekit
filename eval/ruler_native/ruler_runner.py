@@ -56,6 +56,7 @@ import requests
 # Allow `ruler_helpers` from the same directory regardless of cwd.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ruler_helpers import (  # noqa: E402
+    ensure_haystack_data,
     ensure_nltk_data,
     load_validation_jsonl,
     locate_ruler_root,
@@ -224,6 +225,11 @@ def main():
           flush=True)
 
     ensure_nltk_data()
+    # Hard-stop BEFORE prepare if this task needs an external corpus we don't
+    # have (essay → PaulGrahamEssays.json, qa → squad/hotpotqa). Upstream
+    # niah.py raises FileNotFoundError that prepare.py masks with rc=0, so the
+    # only other signal is a confusing "validation.jsonl does not exist".
+    ensure_haystack_data(ruler_root, args.task)
 
     # ── PHASE 1: prepare ────────────────────────────────────────────────────
     # Pass --save_dir <stage>/data (NOT <stage>/data/<task>); upstream

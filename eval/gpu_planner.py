@@ -31,12 +31,29 @@ import math
 import os
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 
 def _noop(_msg: str) -> None:
     pass
+
+
+def _env_truthy(name: str) -> bool:
+    """True when an env var is set to a truthy literal (1/true/yes/on)."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_float(name: str, default: float) -> float:
+    """Parse a float env var, falling back to `default` on unset/garbage."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
 
 
 # ── GPU discovery ──────────────────────────────────────────────────────────
@@ -413,23 +430,65 @@ def build_plan(*, model_dir: str, backend: str, quant: str = "auto",
         return plan_ctx(par, thinking_budget, content_headroom, ctx_max,
                         requested_ctx, log=log)
 
-    def _fallback(need: int) -> GpuPlan:
+    def _terminal(need: int, source: str) -> GpuPlan:
         par, ctx = _par_ctx(requested_parallel)
         return GpuPlan(gpu_ids=[], replicas=1, parallel=par, ctx=ctx,
                        tensor_parallel=1, gpu_mem_util=default_gpu_mem_util,
-                       need_mib=need, source="fallback")
+                       need_mib=need, source=source)
+
+    def _fallback(need: int) -> GpuPlan:
+        return _terminal(need, "fallback")
 
     gpus = probe_gpus(log)
     if not gpus:
-        # No nvidia-smi / unreadable → exactly today's single-GPU path.
+        # No nvidia-smi / unreadable → exactly today's single-GPU path. This is
+        # a CAPABILITY gap (we can't see GPUs), not contention, so we keep the
+        # legacy unpinned launch rather than refusing — refusing here would break
+        # CPU-only / non-nvidia hosts that work fine today.
         return _fallback(0)
 
     need = estimate_model_mib(model_dir, backend, quant, log=log)
     chosen = select_gpus(gpus, requested_gpus, need, util_thresh, log=log)
     if not chosen:
-        log("gpu_planner: no GPU meets THRESHOLD (free/util) — falling back to "
-            "default launch path (no pin)")
-        return _fallback(need)
+        # GPUs exist but none meets the THRESHOLD policy (free VRAM + util) right
+        # now — the box is under CONTENTION. Silently launching UNPINNED here
+        # inherits whatever GPUs are visible and reliably OOMs/crashes the moment
+        # a co-tenant (another eval, an ollama model, a quant sweep) is resident.
+        # That is exactly the T87 mk1_256k crash (2026-06-08): a 14.5 GB ollama
+        # model on GPU0 → unpinned TP=2 vLLM serve → exit=20. So: optionally WAIT
+        # for a GPU to free, then REFUSE loudly (source="contended") unless the
+        # operator explicitly opts into the legacy unpinned fallback.
+        wait_s = _env_float("OMK_GPU_WAIT_S", 0.0)
+        allow_unpinned = _env_truthy("OMK_ALLOW_UNPINNED")
+        if wait_s > 0:
+            poll = min(10.0, max(2.0, wait_s / 10.0))
+            log(f"gpu_planner: no GPU meets THRESHOLD (need≈{need}MiB free, "
+                f"util<{util_thresh}) — waiting up to {wait_s:.0f}s for one to "
+                f"free (poll {poll:.0f}s; set OMK_GPU_WAIT_S to tune)")
+            deadline = time.monotonic() + wait_s
+            while time.monotonic() < deadline:
+                time.sleep(poll)
+                gpus = probe_gpus(log)
+                if not gpus:
+                    break
+                chosen = select_gpus(gpus, requested_gpus, need, util_thresh, log=log)
+                if chosen:
+                    log(f"gpu_planner: GPU(s) {sorted(chosen)} freed after waiting "
+                        "— proceeding with a pinned launch")
+                    break
+        if not chosen:
+            if allow_unpinned:
+                log("gpu_planner: no free GPU, but OMK_ALLOW_UNPINNED=1 — falling "
+                    "back to UNPINNED launch (today's path; may OOM/crash under "
+                    "contention)")
+                return _fallback(need)
+            log("gpu_planner: REFUSING to launch — no GPU meets THRESHOLD "
+                f"(need≈{need}MiB free + util<{util_thresh}) after waiting "
+                f"{wait_s:.0f}s. An unpinned launch under contention crashes "
+                "(T87 mk1_256k, exit=20). Free a GPU, raise OMK_GPU_WAIT_S to "
+                "wait longer, or set OMK_ALLOW_UNPINNED=1 to force the legacy "
+                "unpinned fallback.")
+            return _terminal(need, "contended")
 
     chosen_gpus = [g for g in gpus if g.index in chosen]
     n_gpu = len(chosen)
