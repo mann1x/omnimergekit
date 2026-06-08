@@ -44,7 +44,6 @@ backend_args:
   # matches arc_challenge_full (parser='', enable_thinking=false), keeping
   # the suite at 2 fingerprint groups (math-set + non-reasoning-set).
   vllm_default_chat_template_kwargs: {enable_thinking: false}
-  num_concurrent: 2
 cache:
   sqlite_prefix: lcb_med_55
 reports:

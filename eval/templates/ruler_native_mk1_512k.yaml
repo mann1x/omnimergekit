@@ -34,6 +34,9 @@ cache:
   sqlite_prefix: ruler_mk1_512k
 
 backend_args:
+  # FORCE override: single-flight at 512k — KV can't hold two 512k contexts.
+  # Deliberate per-bench cap (not host tuning); omk_eval honors it as a hard
+  # ceiling on total in-flight. CLI --parallel still wins. See ruler_native_vt_512k.
   num_concurrent: 1
   model_template_type: base
   tokenizer_type: hf

@@ -37,7 +37,6 @@ backend_args:
   apply_chat_template: true
   # NO parser, NO enable_thinking — matches the 128e lcb_medium_55 recipe.
   vllm_default_chat_template_kwargs: {enable_thinking: false}
-  num_concurrent: 2
 cache:
   sqlite_prefix: lcb_med_100
 reports:

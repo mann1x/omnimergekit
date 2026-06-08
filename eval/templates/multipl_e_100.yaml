@@ -31,8 +31,6 @@ scoring:
   metric: pass_at_1
   aggregate: macro_mean_over_langs
 backend_args:
-  num_concurrent: 2          # generator threads (match llama_parallel)
-  llama_parallel: 2
   llama_ctx: 16384
 cache:
   sqlite_prefix: mpe_100

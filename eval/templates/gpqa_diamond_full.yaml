@@ -38,7 +38,6 @@ backend_args:
   # llama-server: 16384 max_gen + 8k thinking + ~2k prompt = ~26k worst case.
   # parallel=2 with -c 65536 = 32768/slot. Per v4-MTP card: ~5h wall for 198q.
   llama_ctx: 65536
-  llama_parallel: 2
   max_length: 65536
 cache:
   sqlite_prefix: gpqa_diamond

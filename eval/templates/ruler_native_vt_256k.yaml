@@ -37,7 +37,6 @@ cache:
   sqlite_prefix: ruler_vt_256k
 
 backend_args:
-  num_concurrent: 2
   model_template_type: base
   tokenizer_type: hf
   random_seed: 42

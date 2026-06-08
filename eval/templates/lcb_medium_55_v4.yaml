@@ -45,7 +45,6 @@ backend_args:
   apply_chat_template: true
   vllm_reasoning_parser: gemma4
   vllm_default_chat_template_kwargs: {enable_thinking: true}
-  num_concurrent: 2
 cache:
   sqlite_prefix: lcb_med_55_v4
 reports:

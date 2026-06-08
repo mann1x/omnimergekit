@@ -36,7 +36,6 @@ cache:
   sqlite_prefix: nolima_smoke
 backend_args:
   metric: contains                # NoLiMa-internal metric
-  num_concurrent: 2
 reports:
   token_stats: true
 dependencies:

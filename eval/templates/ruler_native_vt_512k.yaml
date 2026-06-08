@@ -38,7 +38,12 @@ cache:
   sqlite_prefix: ruler_vt_512k
 
 backend_args:
-  num_concurrent: 1             # single-flight at 512k — KV pressure
+  # FORCE override: single-flight at 512k — KV can't hold two 512k contexts.
+  # This is a deliberate per-bench cap, NOT host tuning. omk_eval honors a
+  # present num_concurrent/llama_parallel as a hard ceiling on total in-flight
+  # (CLI --parallel still wins). Parallel-agnostic templates omit this key and
+  # let the GPU planner decide.
+  num_concurrent: 1
   model_template_type: base
   tokenizer_type: hf
   random_seed: 42
