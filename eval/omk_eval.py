@@ -1525,6 +1525,61 @@ def _check_hf_token(template: dict) -> None:
              f"needs an authenticated HF token (gated dataset {gated_ds or 'declared'})")
 
 
+def _parse_metadata(items: list[str]) -> dict[str, dict]:
+    """Parse --metadata into a {section: {key: value}} runtime override map.
+
+    Accepts repeatable ``KEY=VALUE`` pairs and/or a single JSON object. Values
+    are JSON-coerced (so ``261120`` is an int, ``true`` a bool, ``base`` a str).
+    Unprefixed keys target the ``selection`` section (the common case); use a
+    dotted ``section.key`` to reach another section, e.g.
+    ``generation.max_gen_toks=200`` or ``backend_args.num_concurrent=1``.
+    ``ctx`` is an alias for ``ctx_tokens``.
+
+    This lets ONE canonical template serve multiple operating points without a
+    clone — e.g. RULER vt_256k at ctx_tokens=261120 for the base (native 262144
+    ceiling, needs answer headroom) vs 262144 for the YaRN-extended model.
+    """
+    out: dict[str, dict] = {}
+
+    def _put(section: str, key: str, val: Any) -> None:
+        if key == "ctx":
+            key = "ctx_tokens"
+        out.setdefault(section, {})[key] = val
+
+    def _route(flat_key: str, val: Any) -> None:
+        section, dot, key = flat_key.partition(".")
+        if dot:
+            _put(section, key, val)
+        else:
+            _put("selection", section, val)
+
+    for raw in items:
+        it = raw.strip()
+        if not it:
+            continue
+        if it.startswith("{"):
+            try:
+                obj = json.loads(it)
+            except json.JSONDecodeError as e:
+                raise SystemExit(f"--metadata: invalid JSON object {it!r}: {e}")
+            if not isinstance(obj, dict):
+                raise SystemExit(f"--metadata JSON must be an object, got {type(obj).__name__}")
+            for k, v in obj.items():
+                _route(str(k), v)
+            continue
+        if "=" not in it:
+            raise SystemExit(f"--metadata expects KEY=VALUE or a JSON object, got: {it!r}")
+        k, v = it.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        try:
+            val = json.loads(v)
+        except json.JSONDecodeError:
+            val = v  # bare string (e.g. ruler_task=vt)
+        _route(k, val)
+    return out
+
+
 def main() -> None:
     _t_start = time.time()  # wall-clock start; recorded as duration_s in summary.json
     ap = argparse.ArgumentParser()
@@ -1542,6 +1597,16 @@ def main() -> None:
     ap.add_argument("--no-server", action="store_true",
                     help="use an already-running server on --port")
     ap.add_argument("--max-model-len", type=int, default=32768)
+    ap.add_argument("--metadata", action="append", default=[], metavar="KEY=VALUE",
+                    help="Runtime template override (repeatable), KEY=VALUE or a JSON "
+                         "object. Unprefixed keys target template['selection'] (ctx is "
+                         "an alias for ctx_tokens); use 'generation.KEY' / "
+                         "'backend_args.KEY' to reach other sections. Applied AFTER "
+                         "backend_overrides, so it wins. E.g. "
+                         "--metadata ctx_tokens=261120 lets one RULER template serve "
+                         "multiple ctx points (base vs YaRN-extended) without a clone. "
+                         "NOTE: this overrides the eval prompt's token target only; the "
+                         "vLLM serve window is still --max-model-len.")
     ap.add_argument("--gpu-mem-util", type=float, default=None,
                     help="Override vLLM --gpu-memory-utilization. Takes precedence over "
                     "template backend_args.vllm_gpu_memory_utilization.")
@@ -1611,6 +1676,21 @@ def main() -> None:
                     base[k] = v
         _deep_merge(template, _engine_override)
         log(f"applied backend_overrides[{args.backend}]: {_engine_override}")
+
+    # Runtime field overrides (--metadata). Applied LAST so the CLI is the most
+    # authoritative layer (above template defaults and backend_overrides). Lets
+    # one canonical template serve multiple operating points — the motivating
+    # case is RULER vt_256k at ctx_tokens=261120 for the base (native 262144
+    # ceiling needs answer headroom) vs 262144 for the YaRN-extended model.
+    _md = _parse_metadata(args.metadata)
+    if _md:
+        for _section, _kv in _md.items():
+            _dst = template.setdefault(_section, {})
+            if not isinstance(_dst, dict):
+                fatal(2, f"--metadata section '{_section}' is not a mapping in "
+                         f"template '{template['name']}' (found {type(_dst).__name__})")
+            _dst.update(_kv)
+        log(f"applied --metadata overrides: {_md}")
 
     # Pre-flight: dependency check BEFORE launching any server.
     _check_dependencies(template)
@@ -1765,9 +1845,15 @@ def main() -> None:
             content_headroom = int(ba.get("llama_content_headroom", 4096))
             ctx_max = int(ba.get("llama_ctx_max", 262144))
             # Parallel request precedence: CLI/env (requested_parallel) > template
-            # llama_parallel hint > VRAM-auto (None).
+            # FORCE > planner VRAM-auto (None). The template FORCE is read from
+            # `llama_parallel`, falling back to `num_concurrent` as the universal
+            # alias — so a bench that forces num_concurrent (e.g. ruler 512k
+            # single-flight) also drives the llama plan instead of being ignored
+            # here and then clobbered at the injection step below. A
+            # parallel-agnostic template carries neither key and the planner
+            # decides purely from host VRAM + thinking_budget.
             par_hint = (requested_parallel if requested_parallel is not None
-                        else ba.get("llama_parallel"))
+                        else ba.get("llama_parallel", ba.get("num_concurrent")))
             plan = gpu_planner.build_plan(
                 model_dir=args.model, backend="llama", quant=quant,
                 requested_gpus=gpus_req,
@@ -1815,13 +1901,30 @@ def main() -> None:
 
     # Parallel-agnostic templates: set in-flight concurrency to the slots the
     # runner actually launched (replicas × per-server parallel), overriding any
-    # template num_concurrent so every slot — single server, llama fleet, or vLLM
-    # data-parallel — is fed. Skipped under --no-server (external server: honor
-    # the template as-is). Every dispatcher reads backend_args.num_concurrent.
+    # leftover template num_concurrent so every slot — single server, llama
+    # fleet, or vLLM data-parallel — is fed. Skipped under --no-server (external
+    # server: honor the template as-is). Every dispatcher reads
+    # backend_args.num_concurrent.
+    #
+    # Exception — explicit per-bench FORCE: a template that deliberately carries
+    # num_concurrent / llama_parallel (e.g. ruler 512k single-flight under KV
+    # pressure) means "cap total in-flight at exactly this number." Honor it as a
+    # hard ceiling so the planner's replica fan-out cannot exceed it. CLI/env
+    # --parallel still wins: when requested_parallel is set it already drove the
+    # plan, so we do NOT re-cap here. Absent any force key, the planner decides
+    # freely (the common, parallel-agnostic case).
     if effective_concurrency is not None:
-        template.setdefault("backend_args", {})["num_concurrent"] = effective_concurrency
-        log(f"effective num_concurrent = {effective_concurrency} "
-            f"(replicas × per-server parallel)")
+        ba_inj = template.setdefault("backend_args", {})
+        capped = False
+        if requested_parallel is None:
+            force = ba_inj.get("num_concurrent", ba_inj.get("llama_parallel"))
+            if force is not None and int(force) < effective_concurrency:
+                effective_concurrency = int(force)
+                capped = True
+        ba_inj["num_concurrent"] = effective_concurrency
+        log(f"effective num_concurrent = {effective_concurrency}"
+            + (" (template force ceiling)" if capped
+               else " (replicas × per-server parallel)"))
 
     # Dispatch eval
     rc = 0
