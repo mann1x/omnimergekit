@@ -103,6 +103,47 @@ TASK_METRICS: dict[str, str] = {
 }
 
 
+# Per-task haystack source — verbatim from upstream `scripts/synthetic.yaml`
+# (`type_haystack:` for each `niah*` entry; vt/cwe/fwe/qa carry none). Only the
+# `essay` haystack needs an EXTERNAL data file — the Paul Graham Essays corpus,
+# fetched once by `scripts/data/synthetic/json/download_paulgraham_essay.py`.
+# `noise`/`needle` are self-contained string constants inside niah.py, and the
+# `qa_*` tasks pull SQuAD/HotpotQA via `download_qa_dataset.sh`. Keep this in
+# lock-step with synthetic.yaml when upstream adds a task (the runner refuses
+# unknown tasks at startup). This map is what lets the launcher preflight the
+# haystack file BEFORE serving, instead of niah.py raising FileNotFoundError
+# deep inside prepare.py — which masks the child crash with rc=0 (2026-06-08
+# T87 niah_multikey_1 / PaulGrahamEssays.json trap).
+TASK_HAYSTACK: dict[str, str] = {
+    "niah_single_1":  "noise",
+    "niah_single_2":  "essay",
+    "niah_single_3":  "essay",
+    "niah_multikey_1": "essay",
+    "niah_multikey_2": "needle",
+    "niah_multikey_3": "needle",
+    "niah_multiquery": "essay",
+    "niah_multivalue": "essay",
+    "vt":  "noise",
+    "cwe": "none",   # common-words extraction: generated word lists, no corpus
+    "fwe": "none",   # frequent-words extraction: generated word lists, no corpus
+    "qa_1": "qa",    # SQuAD dev-v2.0       (download_qa_dataset.sh → squad.json)
+    "qa_2": "qa",    # HotpotQA distractor  (download_qa_dataset.sh → hotpotqa.json)
+}
+
+# Python modules upstream's synthetic generators import at runtime (niah.py →
+# wonderwords/html2text, prepare.py → tenacity, cwe/fwe/qa → nltk). When any is
+# missing, prepare.py's child subprocess crashes while prepare.py ITSELF still
+# exits 0 — the staged validation.jsonl never appears and the only signal is a
+# downstream FileNotFoundError. Preflighting them converts that into a loud,
+# actionable launch-time abort.
+RULER_RUNTIME_MODULES: tuple[str, ...] = ("tenacity", "nltk", "wonderwords", "html2text")
+
+# Where upstream keeps downloadable corpora, relative to the RULER clone root.
+_JSON_SUBDIR = Path("scripts") / "data" / "synthetic" / "json"
+_ESSAY_FILE = "PaulGrahamEssays.json"
+_QA_FILES = {"qa_1": "squad.json", "qa_2": "hotpotqa.json"}
+
+
 def metric_for_task(task: str) -> str:
     """Return the upstream scorer name for a RULER task. KeyError on unknown."""
     if task not in TASK_METRICS:
@@ -165,6 +206,125 @@ def ensure_nltk_data() -> None:
         except LookupError:
             print(f"[ruler] nltk.download({corpus})", flush=True)
             nltk.download(corpus, quiet=True)
+
+
+def haystack_for_task(task: str) -> str:
+    """Return the haystack source for a RULER task (noise/needle/essay/qa/none).
+
+    KeyError on an unknown task — same contract as `metric_for_task`, so a
+    template that selects a task we haven't registered fails loudly instead of
+    silently picking a default haystack.
+    """
+    if task not in TASK_HAYSTACK:
+        raise KeyError(
+            f"unknown RULER task: {task!r}. Known: {sorted(TASK_HAYSTACK)}. "
+            "If upstream added a task, register it in ruler_helpers.TASK_HAYSTACK "
+            "(and TASK_METRICS) — copy its `task:` + `type_haystack:` from "
+            "scripts/synthetic.yaml."
+        )
+    return TASK_HAYSTACK[task]
+
+
+def required_data_file(ruler_root: Path, task: str) -> "tuple[Path | None, str | None]":
+    """The external corpus a task needs, plus the command that fetches it.
+
+    Returns ``(path, fix_command)`` for `essay`/`qa_*` tasks, or ``(None, None)``
+    for self-contained tasks (noise/needle haystack, or the cwe/fwe word-list
+    generators). The path is where upstream's generators look — niah.py loads
+    ``json/PaulGrahamEssays.json``; qa.py loads ``json/squad.json`` /
+    ``json/hotpotqa.json``.
+    """
+    hay = haystack_for_task(task)
+    json_dir = ruler_root / _JSON_SUBDIR
+    if hay == "essay":
+        return json_dir / _ESSAY_FILE, (
+            f"cd {json_dir} && python download_paulgraham_essay.py   "
+            "(needs: pip install beautifulsoup4 html2text tqdm)")
+    if hay == "qa":
+        fname = _QA_FILES.get(task)
+        if fname:
+            return json_dir / fname, f"cd {json_dir} && bash download_qa_dataset.sh"
+    return None, None
+
+
+def ruler_native_readiness(task: str) -> "list[str]":
+    """Preflight a ruler_native task end-to-end WITHOUT serving a model.
+
+    Returns a list of human-readable problem strings (empty list = ready),
+    checking, in order: the RULER clone is present, the synthetic-generator
+    python modules import, the nltk punkt corpora are downloaded, and the
+    task's external haystack/qa corpus is on disk. `omk_eval` calls this at
+    launch and aborts on any problem, so a chain fails fast at the broken bench
+    instead of losing the whole run to prepare.py's exit-0-masked child crash or
+    a deep FileNotFoundError (the 2026-06-08 T87 PaulGrahamEssays.json trap).
+    """
+    import importlib.util
+
+    problems: "list[str]" = []
+
+    # 1. RULER clone present (env $RULER_ROOT / pod / solidpc canonical paths).
+    try:
+        ruler_root = locate_ruler_root()
+    except SystemExit as e:
+        return [str(e)]
+
+    # 2. Runtime python modules the generators import (prepare.py masks their
+    #    absence with rc=0, so importlib.find_spec is the only reliable signal).
+    missing = [m for m in RULER_RUNTIME_MODULES
+               if importlib.util.find_spec(m) is None]
+    if missing:
+        problems.append(
+            f"missing python modules for RULER synthetic generators: {missing} — "
+            f"fix: pip install {' '.join(missing)}")
+
+    # 3. nltk punkt corpora (cwe/fwe/qa sentence tokenization).
+    if importlib.util.find_spec("nltk") is not None:
+        try:
+            import nltk
+            for corpus in ("punkt", "punkt_tab"):
+                try:
+                    nltk.data.find(f"tokenizers/{corpus}")
+                except LookupError:
+                    problems.append(
+                        f"nltk corpus '{corpus}' not downloaded — fix: "
+                        f"python -c \"import nltk; nltk.download('{corpus}')\"")
+        except Exception as e:  # pragma: no cover - defensive
+            problems.append(f"nltk present but unusable: {e}")
+
+    # 4. External haystack/qa corpus for this specific task.
+    try:
+        data_path, fix = required_data_file(ruler_root, task)
+    except KeyError as e:
+        return [str(e)]
+    if data_path is not None and not (
+            data_path.is_file() and data_path.stat().st_size > 0):
+        problems.append(
+            f"RULER corpus file missing: {data_path} (task '{task}' uses the "
+            f"'{haystack_for_task(task)}' haystack) — fix: {fix}")
+
+    return problems
+
+
+def ensure_haystack_data(ruler_root: Path, task: str) -> None:
+    """Runner-side defense-in-depth: hard-stop BEFORE run_prepare when the task's
+    external corpus is absent.
+
+    niah.py loads ``json/PaulGrahamEssays.json`` the moment it builds an `essay`
+    haystack and raises FileNotFoundError, which prepare.py then masks with
+    rc=0 — leaving only a downstream "validation.jsonl does not exist" error.
+    Catching it here (called by ruler_runner.py right after ensure_nltk_data)
+    surfaces a loud, actionable message even when the runner is invoked directly,
+    not via omk_eval's launch-time preflight.
+    """
+    try:
+        data_path, fix = required_data_file(ruler_root, task)
+    except KeyError as e:
+        raise SystemExit(f"ruler_native: {e}") from e
+    if data_path is not None and not (
+            data_path.is_file() and data_path.stat().st_size > 0):
+        raise SystemExit(
+            f"ruler_native: required corpus missing for task '{task}' "
+            f"({haystack_for_task(task)} haystack):\n  {data_path}\n  fix: {fix}")
 
 
 def run_prepare(*, ruler_root: Path, task: str, max_seq_length: int,
