@@ -406,7 +406,20 @@ def phase_calibrate(args: argparse.Namespace) -> int:
 
         # Save back
         print(f"[calibrate] writing {shard_path}...")
-        save_file(var_tensors, str(shard_path), metadata=meta or None)
+        # ATOMIC WRITE via .tmp + replace — breaks hardlinks (cp -al variant dirs)
+        # See feedback_canary_script_bug_invalidated_eac_arc.md (2026-05-28).
+        tmp_path = shard_path.with_suffix(shard_path.suffix + ".eac_write_tmp")
+        if tmp_path.exists():
+            tmp_path.unlink()
+        save_file(var_tensors, str(tmp_path), metadata=meta or None)
+        try:
+            nlink_before = shard_path.stat().st_nlink
+        except OSError:
+            nlink_before = -1
+        tmp_path.replace(shard_path)
+        if nlink_before > 1:
+            print(f"  [defensive] broke hardlink on {shard_path.name} "
+                  f"(was st_nlink={nlink_before}, now isolated)")
         print(f"  rewrote {shard_path.name}")
 
     print("\n[calibrate] DONE")
