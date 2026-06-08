@@ -1525,6 +1525,23 @@ def _check_hf_token(template: dict) -> None:
              f"needs an authenticated HF token (gated dataset {gated_ds or 'declared'})")
 
 
+def _read_max_position_embeddings(model_dir: str, fallback: int = 262144) -> int:
+    """The model's max_position_embeddings — the hard ceiling vLLM enforces on
+    --max-model-len. Read from config.json (Gemma 4 nests it under text_config).
+    Falls back to 262144 if the field is missing/unreadable, which is also the
+    historical default cap, so behaviour is unchanged for older models."""
+    try:
+        cfg = json.loads((Path(model_dir) / "config.json").read_text())
+    except Exception:
+        return fallback
+    tc = cfg.get("text_config", cfg)
+    val = tc.get("max_position_embeddings", cfg.get("max_position_embeddings"))
+    try:
+        return int(val) if val else fallback
+    except (TypeError, ValueError):
+        return fallback
+
+
 def _parse_metadata(items: list[str]) -> dict[str, dict]:
     """Parse --metadata into a {section: {key: value}} runtime override map.
 
@@ -1748,6 +1765,17 @@ def main() -> None:
             # clamps it to free VRAM and replicates across GPUs via data-parallel.
             vllm_par_hint = (requested_parallel if requested_parallel is not None
                              else int(ba.get("num_concurrent", 2)))
+            # ctx ceiling = the model's own max_position_embeddings (vLLM rejects
+            # max-model-len beyond it), capped further by an explicit template
+            # cap. The old hard 262144 default silently clamped a 524288-capable
+            # model down to 256k. Serving KV is bf16 for vLLM (model served
+            # --dtype bfloat16; nvfp4a16 keeps bf16 KV) → the planner sizes KV +
+            # the capacity-TP trigger in bf16, not the q8_0 default that
+            # underestimated KV ~45% and hid the 512k single-GPU OOM.
+            _model_max_pos = _read_max_position_embeddings(args.model)
+            _tmpl_cap = ba.get("vllm_max_model_len_cap")
+            _ctx_cap = (_model_max_pos if _tmpl_cap is None
+                        else min(int(_tmpl_cap), _model_max_pos))
             vllm_plan = gpu_planner.build_plan(
                 model_dir=args.model, backend="vllm", quant=quant,
                 requested_gpus=gpus_req, requested_parallel=vllm_par_hint,
@@ -1756,7 +1784,7 @@ def main() -> None:
                 thinking_budget=int(gen.get("thinking_token_budget", 0) or 0),
                 max_gen_toks=int(gen.get("max_gen_toks", 0) or 0),
                 content_headroom=int(ba.get("vllm_content_headroom", 4096)),
-                ctx_max=int(ba.get("vllm_max_model_len_cap", 262144)),
+                ctx_max=_ctx_cap, kv_dtype="bf16",
                 requested_ctx=args.max_model_len, log=log)
             effective_concurrency = vllm_plan.effective_concurrency
             log(f"GPU plan [vllm]: source={vllm_plan.source} gpu_ids={vllm_plan.gpu_ids} "

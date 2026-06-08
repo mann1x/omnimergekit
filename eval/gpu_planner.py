@@ -434,6 +434,11 @@ def build_plan(*, model_dir: str, backend: str, quant: str = "auto",
     chosen_gpus = [g for g in gpus if g.index in chosen]
     n_gpu = len(chosen)
     min_free = min(g.mem_free_mib for g in chosen_gpus)
+    tightest = min(chosen_gpus, key=lambda g: g.mem_free_mib)
+
+    # gpu_mem_util from the tightest chosen GPU's free fraction (vLLM, P3).
+    gpu_mem_util = round(
+        min(0.95, max(0.30, tightest.mem_free_mib / max(1, tightest.mem_total_mib))), 2)
 
     # replicas: one model copy per usable GPU unless the operator caps it.
     rr = str(requested_replicas).strip().lower()
@@ -445,21 +450,34 @@ def build_plan(*, model_dir: str, backend: str, quant: str = "auto",
         except ValueError:
             replicas = n_gpu
 
-    # Tensor-parallel split only when ONE copy can't fit a single chosen GPU.
+    # KV for ONE request slot at the requested ctx, in the SERVING KV dtype (the
+    # caller passes the right one per backend: bf16 for a vLLM bf16/nvfp4a16 serve,
+    # q8_0/q4 for a llama.cpp quantized KV arena).
+    kv = estimate_kv_mib_per_slot(model_dir, requested_ctx, kv_dtype, log=log)
+
+    # Tensor-parallel split when ONE serving copy can't fit a single GPU. A copy
+    # overflows one card two ways:
+    #   (1) the WEIGHTS alone exceed free VRAM, OR
+    #   (2) weights + the KV for a single request at the requested ctx exceed the
+    #       gpu_mem_util budget vLLM is given — the long-context case the old
+    #       weights-only trigger was BLIND to. A 26B (~52GB) model fits one 96GB
+    #       GPU, but its 512k KV (~42GB bf16) does not: 52+42 > 0.92×96 → vLLM
+    #       OOMs at KV-block alloc on a single card. Splitting across GPUs (TP)
+    #       pools the VRAM so the one copy + KV fit. This is the 512k-serve fix.
+    usable_one = int(tightest.mem_total_mib * gpu_mem_util)
+    one_copy_mib = need + kv
     tensor_parallel = 1
-    if need > min_free and n_gpu > 1:
+    if n_gpu > 1 and (need > min_free or one_copy_mib > usable_one):
         tensor_parallel = n_gpu
         replicas = 1  # the whole fleet is one split copy
+        log(f"gpu_planner: TP={n_gpu} — one copy {one_copy_mib}MiB (weights "
+            f"{need} + kv@{requested_ctx}tok {kv}) exceeds one-GPU budget "
+            f"{usable_one}MiB (util {gpu_mem_util}); splitting across {n_gpu} GPUs")
 
-    # Per-replica parallel from the chosen GPU's free VRAM after the weights.
+    # Per-replica parallel from the COMBINED VRAM after weights (TP pools VRAM
+    # across the fleet; min_free × tensor_parallel is the shared pool).
     free_after = max(0, min_free * tensor_parallel - need)
-    kv = estimate_kv_mib_per_slot(model_dir, requested_ctx, kv_dtype, log=log)
     parallel, ctx = _par_ctx(requested_parallel, free_after, kv)
-
-    # gpu_mem_util from the tightest chosen GPU's free fraction (vLLM, P3).
-    tightest = min(chosen_gpus, key=lambda g: g.mem_free_mib)
-    gpu_mem_util = round(
-        min(0.95, max(0.30, tightest.mem_free_mib / max(1, tightest.mem_total_mib))), 2)
 
     return GpuPlan(gpu_ids=chosen, replicas=replicas, parallel=parallel, ctx=ctx,
                    tensor_parallel=tensor_parallel, gpu_mem_util=gpu_mem_util,

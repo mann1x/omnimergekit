@@ -346,16 +346,30 @@ def main():
                     fresh_empty += 1
                 if rec.get("finish_reason") == "length":
                     fresh_lenhit += 1
+                # Abort ONLY on silent-empty (the real server failure — the Gemma 4
+                # vLLM closure bug returns content=""). A high length-cap rate is NOT
+                # a failure: a base-completion model rarely emits EOS, so it runs to
+                # max_tokens on ~90% of RULER samples — yet the answer prefix is
+                # present and string_match_all scores it correctly (VT@32k
+                # max_tokens=30 → ~90% length_cap, score 0.95). The old branch also
+                # aborted on length_cap≥0.8, false-failing every clean base-model
+                # RULER tier with rc=60. length_cap is now a one-shot NOTE, not fatal.
                 if (args.early_abort_after
                         and fresh_total >= args.early_abort_after
-                        and (fresh_empty / fresh_total >= 0.8
-                             or fresh_lenhit / fresh_total >= 0.8)):
+                        and fresh_empty / fresh_total >= 0.8):
                     print(f"\n[ruler] EARLY ABORT after {fresh_total} fresh "
-                          f"samples: empty={fresh_empty}/{fresh_total} "
-                          f"length_cap={fresh_lenhit}/{fresh_total} — "
-                          f"check server (silent-empty or token starvation).",
-                          flush=True)
+                          f"samples: empty={fresh_empty}/{fresh_total} — "
+                          f"silent-empty server failure (e.g. the Gemma 4 vLLM "
+                          f"closure bug). Aborting.", flush=True)
                     abort_flag.set()
+                elif (args.early_abort_after
+                        and fresh_total == args.early_abort_after
+                        and fresh_lenhit / fresh_total >= 0.8):
+                    print(f"\n[ruler] NOTE: {fresh_lenhit}/{fresh_total} samples hit "
+                          f"the max_tokens cap — EXPECTED for a base-completion model "
+                          f"that does not emit EOS; the answer prefix is still scored "
+                          f"by string_match_all. NOT aborting (length-cap is benign).",
+                          flush=True)
             if idx % 10 == 0 or idx == len(rows):
                 print(f"[ruler]   [{idx}/{len(rows)}] elapsed={time.time()-t0:.0f}s",
                       flush=True)
