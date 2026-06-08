@@ -56,8 +56,19 @@ Thumbs.db
 results_*/
 samples_*/
 eval_results/
+# eval_results_ruler_anchor/, _smoke/, etc. — `eval_results/` alone misses these.
+# (gitignore has no inline comments — keep this note on its own line.)
+eval_results_*/
 logs/
 runs/
+
+# claude-hooks session/consultant state (sessions.json, transcripts) — NEVER
+# commit to this PUBLIC repo. Local agent state, not project code.
+.claude-hooks/
+
+# atomic-write temp from router_eac_calibrate.py / router_shared_upweight.py
+# (.tmp + os.replace pattern that breaks hardlinks). Should never be staged.
+*.eac_write_tmp
 
 # imatrix.dat ARCHIVAL EXCEPTION:
 # imatrix files MUST be kept WITH their quants when published, but we don't

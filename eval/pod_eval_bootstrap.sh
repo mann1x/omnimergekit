@@ -45,6 +45,8 @@ SYMLINK_FARM=0
 TOKENIZER_LINK=""              # SRC:DST
 HF_PULL=""                     # "repo:dir repo:dir ..."
 HF_PULL_PATTERNS="*.safetensors *.json tokenizer* *.model *.jinja"
+WITH_RULER=0                   # clone NVIDIA/RULER + pre-fetch nltk corpora
+RULER_REPO_URL="https://github.com/NVIDIA/RULER.git"
 DRY_RUN=0
 
 CONDA_ROOT=/workspace/miniconda
@@ -80,6 +82,9 @@ Flags:
   --tokenizer-link S:D    symlink tokenizer dir S -> D (with --symlink-farm)
   --hf-pull "R:D ..."     HF downloads, space-separated repo:localdir pairs (needs HF_TOKEN)
   --hf-pull-patterns "P"  include patterns for --hf-pull (default weights+config+tokenizer)
+  --with-ruler            clone NVIDIA/RULER to /workspace/RULER + nltk punkt/punkt_tab
+                          (needed by the omk ruler_native backend; off by default
+                          so eval pods that don't use ruler_native don't grow)
   --dry-run               print resolved config + planned steps, touch nothing
   -h, --help              this help
 EOF
@@ -109,6 +114,7 @@ while [ $# -gt 0 ]; do
         --tokenizer-link)   TOKENIZER_LINK="$2"; shift 2 ;;
         --hf-pull)          HF_PULL="$2"; shift 2 ;;
         --hf-pull-patterns) HF_PULL_PATTERNS="$2"; shift 2 ;;
+        --with-ruler)       WITH_RULER=1; shift ;;
         --dry-run)          DRY_RUN=1; shift ;;
         -h|--help)          usage; exit 0 ;;
         *) echo "unknown flag: $1" >&2; usage >&2; exit 2 ;;
@@ -136,6 +142,7 @@ modelopt env     : $([ "$WANT_MODELOPT" = 1 ] && echo yes || echo no)
 symlink farm     : $([ "$SYMLINK_FARM" = 1 ] && echo "yes${TOKENIZER_LINK:+ tokenizer=$TOKENIZER_LINK}" || echo no)
 hf-pull          : ${HF_PULL:-(none)}
 hf-pull-patterns : $HF_PULL_PATTERNS
+with-ruler       : $([ "$WITH_RULER" = 1 ] && echo "yes (clone /workspace/RULER + nltk)" || echo no)
 env lib          : $ENV_LIB $([ -f "$ENV_LIB" ] && echo "(found)" || echo "(MISSING!)")
 HF_TOKEN         : $([ -n "${HF_TOKEN:-}" ] && echo set || echo "(unset)")
 EOF
@@ -152,8 +159,14 @@ export DEBIAN_FRONTEND=noninteractive
 log "1. apt deps"
 apt-get update -qq
 # sqlite3 is mandatory: EVAL_PROTOCOL §3.1 launch-check decodes the lm-eval cache.
-apt-get install -y -qq cmake ninja-build build-essential git rsync wget curl ca-certificates sqlite3 ${APT_EXTRA} >/dev/null
-log "   cmake $(cmake --version | head -1) | sqlite3 $(sqlite3 --version | awk '{print $1}')"
+# docker.io is needed by eval/multipl_e/multipl_e_evaluate.sh (the nuprl
+# `multipl-e-evaluation` container). On pod images where docker-in-docker
+# can't run (unprivileged vast.ai workers), the runner auto-falls-back to
+# MPE_MODE=native — installing the CLI here is harmless in either case.
+# Origin: T141 on linode-blackswan-2 (2026-05-28), 4 cells × multipl_e_100
+# unscored with "docker: command not found".
+apt-get install -y -qq cmake ninja-build build-essential git rsync wget curl ca-certificates sqlite3 docker.io ${APT_EXTRA} >/dev/null
+log "   cmake $(cmake --version | head -1) | sqlite3 $(sqlite3 --version | awk '{print $1}') | docker $(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',' || echo missing)"
 
 # ── 2. miniconda ─────────────────────────────────────────────────────────────
 if [ ! -x "$CONDA_ROOT/bin/conda" ]; then
@@ -240,6 +253,7 @@ case "$DEPS" in
             "lm-eval[${LMEVAL_EXTRAS}]==${LMEVAL_VERSION}" \
             'antlr4-python3-runtime==4.11.0' 'sympy>=1.13' 'math-verify>=0.9.0' \
             'langdetect>=1.0.9' 'immutabledict>=4.2.0' 'nltk>=3.9.1' \
+            'sqlitedict>=2.1.0' \
             'tenacity==9.1.4' 'human-eval>=1.0.3' 'gguf==0.18.0' 'pyyaml>=6.0' 2>&1 | tail -3
         apply_lmeval_patches "$ENV_PY" "$PATCHES"
         ;;
@@ -310,6 +324,20 @@ if [ -n "$HF_PULL" ]; then
     done
 fi
 
+# ── 8.5. NVIDIA/RULER clone + nltk corpora (only with --with-ruler) ──────────
+if [ "$WITH_RULER" = 1 ]; then
+    log "8.5. clone NVIDIA/RULER → /workspace/RULER"
+    if [ -d /workspace/RULER/.git ]; then
+        log "   /workspace/RULER already cloned — git pull --ff-only"
+        git -C /workspace/RULER pull --ff-only --quiet 2>&1 | tail -3 || true
+    else
+        git clone --depth 1 "$RULER_REPO_URL" /workspace/RULER 2>&1 | tail -3
+    fi
+    log "   pre-fetch nltk punkt + punkt_tab (omk ruler_native dep)"
+    "$ENV_PY" -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('punkt_tab', quiet=True); print('   nltk corpora ready')"
+    log "   RULER_ROOT will be /workspace/RULER (omk ruler_native locates it automatically)"
+fi
+
 # ── 9. verify ────────────────────────────────────────────────────────────────
 log "9. verify"
 ok=1
@@ -327,5 +355,10 @@ fi
 if [ "$SYMLINK_FARM" = 1 ] && [ -n "$TOKENIZER_LINK" ]; then
     tk_dst="${TOKENIZER_LINK##*:}"
     test -e "$tk_dst/tokenizer.json" && echo "  OK   tokenizer reachable" || { echo "  MISS tokenizer.json"; ok=0; }
+fi
+if [ "$WITH_RULER" = 1 ]; then
+    test -f /workspace/RULER/scripts/data/prepare.py && echo "  OK   /workspace/RULER" \
+        || { echo "  MISS /workspace/RULER/scripts/data/prepare.py"; ok=0; }
+    "$ENV_PY" -c "import nltk; nltk.data.find('tokenizers/punkt'); nltk.data.find('tokenizers/punkt_tab'); print('  OK   nltk punkt + punkt_tab')" || ok=0
 fi
 [ "$ok" = 1 ] && log "BOOTSTRAP COMPLETE (GREEN)" || { log "BOOTSTRAP COMPLETE WITH ISSUES — see MISS above"; exit 1; }

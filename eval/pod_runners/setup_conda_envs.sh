@@ -70,13 +70,21 @@ ensure_omk_env() {
         _sce_accept_tos
         conda create -n "$name" python=3.11 -y 2>&1 | tail -3
         "$pfx/bin/pip" install --quiet --upgrade pip wheel setuptools
-        # causal-conv1d / flash-linear-attention / bitsandbytes are Qwen3.5/3.6
-        # *merge-engine* deps (SSM CUDA kernels). They are never needed for a
-        # llama.cpp/vLLM eval pod, and their from-source build breaks pip
-        # metadata generation on a bare CUDA image (2026-05-27 causal-conv1d
-        # FATAL on pod 38081385). Filter per the EVAL_PROTOCOL pod-deps runbook.
+        # causal-conv1d / flash-linear-attention are Qwen3.5/3.6 *merge-engine*
+        # deps (SSM CUDA kernels) that build from source and BREAK pip metadata
+        # generation on a bare CUDA image (2026-05-27 causal-conv1d FATAL on
+        # pod 38081385). Never needed for llama.cpp/vLLM eval — keep filtered.
+        #
+        # bitsandbytes USED TO be filtered alongside them as if it were an
+        # SSM kernel — that was a category error. It ships as clean pip wheels
+        # (no from-source build), and Router-KD's PagedAdamW8bit + the NF4
+        # 4-bit student loading both REQUIRE it. Removing it from the filter
+        # so eval-stack pods can run Router-KD without manual pip-install.
+        # Origin: T141 on linode-blackswan-2 (2026-05-28) — Router-KD chain
+        # exited 0 GPU-seconds in with `FATAL: python module bitsandbytes
+        # missing`.
         local req_eval="$REPO_ROOT/.requirements_eval_filtered.txt"
-        grep -vE '^(causal-conv1d|flash-linear-attention|bitsandbytes)' \
+        grep -vE '^(causal-conv1d|flash-linear-attention)' \
             "$REPO_ROOT/requirements.txt" > "$req_eval"
         "$pfx/bin/pip" install --quiet --no-build-isolation -r "$req_eval"   2>&1 | tail -5
         "$pfx/bin/pip" install --quiet -r "$REPO_ROOT/requirements-eval.txt" 2>&1 | tail -3

@@ -36,6 +36,17 @@ nltk>=3.9.1
 tenacity==9.1.4
 human-eval>=1.0.3                # optional, only for the original HumanEval scorer
 
+# Response cache. lm-eval 0.4.11 declares `sqlitedict` as a CORE (unconditional)
+# dependency for its CachingLM `--use_cache` path, and our own eval/cache_sqlite.py,
+# eval/lcb/lcb_llama_server.py resume store, and run_lcb100_mpe_chain.sh import it
+# directly. A clean `pip install -r requirements-eval.txt` pulls it transitively,
+# but a `--no-deps` / partial lm-eval install drops it silently — and EVERY omk_eval
+# llama run passes `--use_cache`, so CachingLM then crashes at construction with
+# `ModuleNotFoundError: sqlitedict`. Pin it explicitly so it survives, exactly like
+# the langdetect/immutabledict/nltk re-pins above. Caught on the solidpc omk env
+# 2026-05-30 (gsm8k_30 P5 verification). See memory/feedback_lm_eval_pod_deps.md.
+sqlitedict>=2.1.0
+
 # LiveCodeBench scorer (vendored runner is in eval/lcb/lcb_llama_server.py)
 # pip install -e <livecodebench-repo> separately if you need the v3+ scorer
 
