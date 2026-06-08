@@ -3,9 +3,10 @@
 #
 # WHY: the released base (max_position_embeddings=262144, NO rope_scaling) is the
 # long-context CEILING the YaRN-extended model must MATCH at <=256k before we can
-# trust its 512k numbers. This produces that anchor: native RULER (vt) at 32k and
-# 256k on the untouched base. 512k is deliberately ABSENT — the base physically
-# cannot serve it (that's the whole point of the extension).
+# trust its 512k numbers. This produces that anchor on BOTH RULER axes: VT
+# (tracking) at 32k+256k and NIAH/Multi-Key (retrieval) at 256k, on the untouched
+# base. 384k/512k are deliberately ABSENT — the base physically cannot serve past
+# its 262144 native ceiling (that's the whole point of the extension).
 #
 # WHY native RULER (not lm-eval): there is no lm-eval RULER template above 256k,
 # and we want one runner for both the base anchor here and the extended ladder
@@ -37,14 +38,17 @@ TMPL_DIR="${TMPL_DIR:-/srv/ml/repos/omnimergekit/eval/templates}"
 # The 3rd field is an optional --metadata override (empty for smoke/32k).
 #   smoke   4k x5  -> 8192  (plumbing gate)
 #   vt_32k  32768  -> 33792 (32768 + 1024)
-#   vt_256k served at native 262144, but the RULER prompt target is trimmed to
-#           261120 via --metadata ctx_tokens=261120 so the 120-token answer fits
-#           under the base's native ceiling. Uses the CANONICAL vt_256k template
-#           (same one the extended model runs at full 262144) — no clone.
+#   vt_256k  served at native 262144, RULER prompt target trimmed to 261120 via
+#            --metadata ctx_tokens=261120 so the answer fits under the base's
+#            native ceiling. CANONICAL vt_256k template — no clone.
+#   mk1_256k NIAH/Multi-Key retrieval at the base's 256k ceiling — the retrieval-
+#            rate anchor for the extended NIAH ladder. Same 261120 trim, serve
+#            262144. (Base can't reach 384k/512k — native cap; extended-only.)
 TIERS=(
   "ruler_native_smoke:8192:"
   "ruler_native_vt_32k:33792:"
   "ruler_native_vt_256k:262144:ctx_tokens=261120"
+  "ruler_native_mk1_256k:262144:ctx_tokens=261120"
 )
 
 mkdir -p "$RESULTS"
