@@ -1,0 +1,4 @@
+[
+  {"name": "minp_t0.9", "params": {"temperature": 0.9, "top_p": 0.95, "top_k": 64, "min_p": 0.05, "repeat_penalty": 1.1}},
+  {"name": "minp_t0.8", "params": {"temperature": 0.8, "top_p": 0.95, "top_k": 64, "min_p": 0.05, "repeat_penalty": 1.1}}
+]

@@ -1,0 +1,10 @@
+# agentic-loop-harness runtime dependencies.
+#
+# The harness core (detect / replay / server) is pure Python standard library on
+# purpose -- the HTTP driver uses urllib, the detector uses re + collections -- so
+# it runs anywhere with a plain CPython >= 3.8 and needs no GPU / torch / numpy.
+#
+# The ONLY third-party dependency is a YAML parser for the run profile. If you
+# prefer zero dependencies, write the profile as JSON instead of YAML and you can
+# skip this file entirely.
+PyYAML>=6.0

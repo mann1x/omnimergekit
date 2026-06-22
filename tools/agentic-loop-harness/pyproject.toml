@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-loop-harness"
+version = "0.1.0"
+description = "Measure how often a chat-served LLM falls into a degenerate agentic loop, isolating the effect of the chat template, sampler, and reasoning settings."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+dependencies = ["PyYAML>=6.0"]
+
+[project.scripts]
+agentic-loop-harness = "agentic_loop_harness.cli:main"
+
+[tool.setuptools]
+packages = ["agentic_loop_harness"]
+
+[tool.setuptools.package-data]
+agentic_loop_harness = []
+
+# The fixtures / matrices / profiles / templates ship as data files alongside the
+# package so `agentic-loop-harness --profile profiles/gemma4.example.yaml` works
+# from a checkout. They are referenced by relative path from the profile, not
+# imported, so they live at the repo root rather than inside the package.

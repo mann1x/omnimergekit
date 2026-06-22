@@ -1,0 +1,102 @@
+# =============================================================================
+# agentic-loop-harness run profile  (EVERYTHING under test lives in this file)
+# =============================================================================
+#
+# Run it:
+#     agentic-loop-harness --profile profiles/gemma4.example.yaml
+#   or
+#     python -m agentic_loop_harness --profile profiles/gemma4.example.yaml
+#
+# What it measures: how often a chat-served model degenerates into an agentic
+# loop (a thinking-channel "Actually... wait... actually..." cycle, or an answer
+# that runs away to the token cap) when replaying a frozen agentic coding
+# conversation. The ONLY thing you change between cells is the chat template (and,
+# if you want, the sampler / reasoning settings) -- so the loop rate isolates the
+# template's effect.
+#
+# Paths are resolved relative to THIS file (then the package root, then cwd), so
+# the example below runs out-of-the-box against the bundled templates + fixtures
+# once you point `model.gguf` at a GGUF.
+# -----------------------------------------------------------------------------
+
+model:
+  # The GGUF to test. For Gemma-4-12B-it, an F16 GGUF converted from the official
+  # HF weights (see README "Getting a model"). Any chat model with an embedded
+  # chat template works.
+  gguf: /path/to/gemma-4-12B-it-F16.gguf
+
+  # Chat template(s) to compare. Each entry relaunches the server with that
+  # template, so one run produces a per-template loop-rate table.
+  #   - null / "embedded"  -> the template baked into the GGUF (no override)
+  #   - a single .jinja path
+  #   - a list (paths, or {name, path} for nicer row labels)
+  #
+  # The example below is the 4-cell comparison this harness was built for:
+  #   1. embedded       -> the GGUF's own (current upstream) template
+  #   2. reinject-off   -> our fix: history-turn reasoning re-injection disabled
+  #   3. pr35           -> Google PR #35 template, default mode
+  #   4. pr35-ptfalse   -> Google PR #35 template, pass-thinking=false mode
+  chat_template:
+    - { name: embedded,     path: null }
+    - { name: reinject-off, path: templates/v7_reinject_disabled.jinja }
+    - { name: pr35,         path: templates/google_pr35.jinja }
+    - { name: pr35-ptfalse, path: templates/google_pr35_ptfalse.jinja }
+
+server:
+  backend: llama            # "llama" = launch+manage llama-server (this file's job).
+                            # "endpoint" = use an already-running OpenAI-compatible
+                            #   URL (set `endpoint:` below); template sweeps are then
+                            #   not possible (template is fixed server-side).
+  llama_server_bin: auto    # path to llama-server, or "auto" (uses $LLAMA_SERVER_BIN
+                            #   then a `llama-server` on PATH; install.sh can build a
+                            #   pinned one and export LLAMA_SERVER_BIN for you).
+  endpoint: null            # backend=endpoint only, e.g. http://127.0.0.1:8000
+  gpu: 0                    # CUDA_VISIBLE_DEVICES for backend=llama (null = inherit)
+  port: 8080
+  alias: agentic-loop
+  n_gpu_layers: 99
+  # parallel = llama-server slots = how many seeds the harness replays CONCURRENTLY.
+  # Each slot needs its own window (prompt + max_tokens + headroom), and ctx_size is
+  # the TOTAL pool split across slots -- so size ctx_size >= parallel x window.
+  # e.g. window ~24000 (5.5k prompt + 16384 gen + headroom): parallel 8 -> ctx 192000.
+  # One 12B F16 + 8-slot KV ~= 64 GB, so 8-way fits a single 95 GB Blackwell and
+  # turns a ~7 GPU-hour serial run into ~1 hour. parallel: 1 = fully serial.
+  parallel: 8
+  ctx_size: 192000
+  flash_attn: true          # emits `-fa on`
+  cache_type_k: q8_0
+  cache_type_v: q8_0
+
+  # --- Gemma-4 reasoning flags (llama.cpp). Google: set these to YOUR settings. ---
+  # reasoning_format deepseek surfaces a separate reasoning_content channel (lets the
+  # detector watch the thinking channel). reasoning_budget bounds the thinking phase;
+  # null = unbounded (thinking runs until the model closes it or hits max_tokens) --
+  # which is what the Gemma-4-12B card config uses. Set reasoning_format null too for a
+  # non-reasoning template / plain chat.
+  reasoning_format: deepseek
+  reasoning_budget: null
+
+  extra_args: []            # any extra llama-server flags, e.g. ["--temp", "0"]
+
+sampling:
+  # The per-request sampler matrix: a JSON list of {name, params}. Every config is
+  # swept against the one resident server (sampler params are per-request), so this
+  # is cheap. Bundled matrices:
+  #   matrices/gemma4_card.json          -> Gemma-4 card sampler (temp 1.0, top_p 0.95,
+  #                                         top_k 64; no min_p / no repeat_penalty) -- the
+  #                                         faithful deployment test (DEFAULT here).
+  #   matrices/gemma4_card_antiloop.json -> card sampler + min_p 0.05 + repeat_penalty 1.1
+  #                                         (does adding anti-loop params reduce looping?)
+  #   matrices/minp_2temp.json           -> loop-prone vendor min-p @ t0.9 / t0.8 -- amplifies
+  #                                         a template's effect when you want loops more visible.
+  # Replace with your own deployment sampler any time.
+  matrix: matrices/gemma4_card.json
+
+run:
+  fixtures:                 # frozen agentic conversations to replay (one cell each)
+    - fixtures/solar_build_start.json
+  # Seeds: a list, or {start, end} (inclusive), or {count, base}.
+  seeds: { start: 1000, end: 1047 }   # 48 seeds, matching the project's loop gate
+  max_tokens: 16384         # generation cap per turn (override fixture base_params)
+  timeout_s: 1800           # per-request HTTP timeout
+  out_dir: results          # per-cell result JSON + summary.json land here

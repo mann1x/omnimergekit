@@ -1,0 +1,10 @@
+# local install / build / run artifacts — never committed
+.venv/
+.llama.cpp/
+.env
+results/
+*.egg-info/
+__pycache__/
+*.pyc
+# local GGUFs / model files a user drops in to test
+*.gguf
