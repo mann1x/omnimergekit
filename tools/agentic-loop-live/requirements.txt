@@ -1,0 +1,8 @@
+# Core (proxy + classifier + orchestrator) is Python stdlib only — nothing is required.
+#
+# Optional: PyYAML, only if you want to write the config in YAML instead of JSON.
+#   pip install PyYAML
+#
+# External runtime prerequisites (NOT pip-installable — install separately):
+#   - opencode            (the agentic client under test)  https://opencode.ai
+#   - a model server      (one of: ollama | a llamafile binary | llama.cpp llama-server)

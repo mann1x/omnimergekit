@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-loop-live"
+version = "0.1.0"
+description = "Live multi-turn agentic-loop measurement harness (opencode x ollama/llamafile/llama.cpp)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+authors = [{ name = "OmniMergeKit" }]
+dependencies = []                 # core (proxy/classifier/orchestrator) is stdlib-only
+
+[project.optional-dependencies]
+yaml = ["PyYAML>=5.1"]            # only needed to use YAML configs (JSON works with no deps)
+
+[project.scripts]
+agentic-loop-live = "agentic_loop_live.cli:main"
+
+[tool.setuptools]
+packages = ["agentic_loop_live"]
+
+[tool.setuptools.package-data]
+# fixtures live one level up from the package; shipped via MANIFEST for sdist + included here
+agentic_loop_live = []

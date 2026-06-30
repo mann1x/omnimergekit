@@ -1,0 +1,75 @@
+# agentic-loop-live — example config. Copy, edit, then:  python -m agentic_loop_live run --config my.yaml
+# Every value is also overridable on the CLI (see `python -m agentic_loop_live run -h`).
+# YAML needs PyYAML; otherwise write the same structure as JSON.
+
+opencode_bin: opencode          # path to the opencode CLI (the agent under test)
+# opencode_log: ~/.local/share/opencode/log/opencode.log  # optional session-id fallback
+out_dir: ./runs                 # session artifacts + sessions/INDEX.jsonl land here
+proxy_port: 8090                # the logging proxy the agent talks to
+n_sessions: 15                  # sessions per run
+per_turn_timeout_s: 600         # wall budget per agent turn
+fixture: snake-adversarial      # bundled id, or a path to your own fixture .json
+# n_followups: 7                # cap follow-ups (default: all in the fixture)
+label: my-run                   # run label (groups rows in the loop table)
+
+backend:
+  # --- pick ONE kind and fill its fields. The agent sends NO sampler params, so the
+  #     SERVER-SIDE default sampler below is what the model actually uses. ---
+
+  kind: llamacpp                # llamacpp | llamafile | ollama | external
+  bin: /opt/llama.cpp/build/bin/llama-server   # server binary (llamacpp/llamafile); ollama: `ollama`
+  model: /models/model-Q6_K.gguf               # GGUF path; for ollama this is the Modelfile FROM source
+  model_name: model-under-test                 # id the agent sends; -a / served-model-name / ollama tag
+  host: 127.0.0.1
+  port: 8101                    # the model server port (proxy forwards here)
+  ctx: 32768
+  gpu: "0"                      # CUDA_VISIBLE_DEVICES value (optional; "" or null = inherit)
+  ngl: 99
+  flash_attn: true
+  sampler:                      # server-side default sampler (omit a key to leave it at the server default)
+    temperature: 1.0
+    top_k: 64
+    top_p: 0.95
+    min_p: 0.0
+    # repeat_penalty: 1.0
+  stop: []                      # ollama-only PARAMETER stop strings, e.g. ["<turn|>"]
+  extra_args: []                # extra server CLI args
+  boot_timeout_s: 360
+
+# ---------------------------------------------------------------------------
+# Alternative backends (replace the `backend:` block above with one of these):
+#
+# llamafile (Mozilla / opencoti binary):
+#   backend:
+#     kind: llamafile
+#     bin: /path/to/model.llamafile        # or a standalone llamafile runtime
+#     model: /models/model-Q6_K.gguf
+#     model_name: model-under-test
+#     port: 8101
+#     ctx: 131072
+#     gpu: "0"
+#     sampler: {temperature: 1.0, top_k: 64, top_p: 0.95, min_p: 0.0}
+#     # cache_ram: 0          # llamafile large-ctx knobs (defaults are safe)
+#     # ctx_checkpoints: 0
+#
+# ollama (sampler + num_ctx pinned via a generated Modelfile):
+#   backend:
+#     kind: ollama
+#     bin: ollama
+#     model: /models/model-Q6_K.gguf        # FROM source (gguf path or an existing tag)
+#     model_name: model-under-test          # the ollama tag this run creates
+#     host: 127.0.0.1
+#     port: 11434                           # ollama's OpenAI-compatible port
+#     ctx: 32768
+#     sampler: {temperature: 1.0, top_k: 64, top_p: 0.95, min_p: 0.0}
+#     stop: ["<turn|>"]
+#     # ollama_serve: true                  # spawn `ollama serve` bound to host:port
+#
+# external (a server you already started — we only probe + record it):
+#   backend:
+#     kind: external
+#     host: 127.0.0.1
+#     port: 8101
+#     model_name: model-under-test
+#     ctx: 32768
+#     sampler: {temperature: 1.0, top_k: 64, top_p: 0.95}   # recorded for provenance only
