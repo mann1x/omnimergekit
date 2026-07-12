@@ -1,104 +1,142 @@
 #!/usr/bin/env python3
-"""Pick the v8b winner: diff each candidate drop-map vs fkbroad and score
-science/multilingual restored vs code/lcb lost, using the competence map ranks.
+"""v8b_pick.py — diff candidate drop-maps against the fkbroad baseline and
+classify the swap, so the v8b winner can be picked with ZERO GPU.
 
-Usage: v8b_pick.py <code_map.json> <fkbroad_drop.json> <v7coder_drop.json> <cand1.json> [cand2 ...]
+For each candidate (and any reference keep-set, e.g. v8b-safe) we compute,
+per layer:
+  keep = {0..127} - dropped
+  swapped_IN  = keep_cand - keep_fkbroad   (experts v8b restores)
+  swapped_OUT = keep_fkbroad - keep_cand   (experts v8b evicts)
+then classify every swapped expert with the SAME competence data fkbroad used:
+  * dominant class  = argmax_c wnorm rank (science_headroom's `dom`)
+  * agentic t106 rank (loop-driver test): rank > 16 => LOOP-SAFE to restore
+  * generic_code / targeted_lcb_medium_55 rank: <= STRONG_K => load-bearing code
 
-A candidate is good when its swapped-IN experts (dropped by fkbroad, kept now)
-rank high in generic_science/multilingual, while its swapped-OUT experts
-(kept by fkbroad, dropped now) do NOT rank high in generic_code/targeted_lcb.
+Readout per candidate:
+  sci_in       loop-safe science/ml restored  (dom in {science,multilingual} & ag>16)
+  ml_in        of those, multilingual
+  risky_in     science/ml restored that are LOOP-DRIVERS (ag<=16) -- MUST be ~0
+  code_out     STRONG generic_code OR LCB experts evicted          -- MUST be ~0
+  pins_freed   force-keep pins that actually dropped (real freed slot)
+Winner = max sci_in at code_out~0 and risky_in==0.
+
+Usage:
+  v8b_pick.py <code_map.json> <agentic_t106_map.json> <fkbroad_drop.json> \
+              <pins_str> <STRONG_K> <label=cand_drop.json> [<label=...> ...]
 """
+import collections
 import json
-import os
 import sys
 
-code_map = sys.argv[1]
-fkbroad = sys.argv[2]
-v7coder = sys.argv[3]
-cands = sys.argv[4:]
-
-cats = json.load(open(code_map))["categories"]
+code_p, ag_p, fk_p, pins_s, strong_k = sys.argv[1:6]
+STRONG_K = int(strong_k)
 NL = 30
 NE = 128
-K = 30  # top-K per layer (= the per-layer drop budget)
+SCI = {"generic_science", "generic_multilingual"}
 
 
-def load_drop(p):
-    m = json.load(open(p))
-    return {int(k): set(v) for k, v in (m.items() if isinstance(m, dict) else enumerate(m))}
+def load_cats(p):
+    d = json.load(open(p))
+    return d.get("categories", d)
 
 
-def rank_topk(cat, layer, k=K):
-    """Set of expert ids in the top-k by wnorm for (category, layer)."""
-    row = cats[cat][str(layer)]
+code = load_cats(code_p)
+ag = load_cats(ag_p)
+agcat = None
+for c in ag:
+    cl = c.lower()
+    if "agentic" in cl or "eog" in cl or "t106" in cl:
+        agcat = c
+        break
+if agcat is None and len(ag) == 1:
+    agcat = list(ag)[0]
+allc = list(code.keys())
+
+
+def lr(cats, cat, L):
+    """expert id -> rank (1 = strongest by wnorm) for class `cat` at layer L."""
+    row = cats[cat][str(L)]
     order = sorted(row, key=lambda e: float(e["wnorm"]), reverse=True)
-    return {e["id"] for e in order[:k]}
+    return {e["id"]: i + 1 for i, e in enumerate(order)}
 
 
-# dominant-class specialist: for (layer, expert) the argmax class among all 9
-SIG_SCI = {"generic_science", "generic_multilingual"}
-SIG_CODE = {"generic_code", "targeted_lcb_medium_55"}
-ALLCATS = list(cats.keys())
+def dom_layer(L):
+    """expert id -> dominant class (argmax wnorm across classes) at layer L."""
+    best = {}
+    for c in allc:
+        for e in code[c][str(L)]:
+            w = float(e["wnorm"])
+            eid = e["id"]
+            if eid not in best or w > best[eid][1]:
+                best[eid] = (c, w)
+    return {eid: cv[0] for eid, cv in best.items()}
 
 
-def dom_class():
-    """{layer: {expert_id: argmax_category}} over all 9 classes by wnorm."""
-    out = {}
+def load_keep(p):
+    """drop-map {'L':[dropped...]} OR keepmeta {'keep':{'L':[kept...]}} -> {L: set(kept)}."""
+    d = json.load(open(p))
+    if isinstance(d.get("keep"), dict):  # keepmeta (e.g. v8b_safe_keepmeta.json)
+        return {int(L): set(int(x) for x in v) for L, v in d["keep"].items()}
+    keep = {}
     for L in range(NL):
-        best = {}
-        for c in ALLCATS:
-            for e in cats[c][str(L)]:
-                w = float(e["wnorm"])
-                eid = e["id"]
-                if eid not in best or w > best[eid][1]:
-                    best[eid] = (c, w)
-        out[L] = {eid: cv[0] for eid, cv in best.items()}
-    return out
+        dropped = set(int(x) for x in d[str(L)])
+        keep[L] = set(range(NE)) - dropped
+    return keep
 
 
-DOM = dom_class()
-fk = load_drop(fkbroad)
-v7 = load_drop(v7coder)
+pins = collections.defaultdict(set)
+for tok in pins_s.split(","):
+    L, e = tok.split(":")
+    pins[int(L)].add(int(e))
 
-print(f"{'cand':<8} {'swap':>5} {'in_sciSpec':>10} {'out_codeSpec':>12} "
-      f"{'in_top30sm':>10} {'out_top30cl':>11} {'in∈v7':>6}")
-print("-" * 70)
-TOP = {c: {L: rank_topk(c, L) for L in range(NL)}
-       for c in ("generic_science", "generic_multilingual",
-                 "generic_code", "targeted_lcb_medium_55")}
-rows = []
-for cp in cands:
-    cand = load_drop(cp)
-    swap = 0
-    in_sci_spec = out_code_spec = 0      # dominant-class specialists (decisive)
-    in_top30sm = out_top30cl = 0         # coarse top-30 view (for reference)
-    in_in_v7 = 0
+fk_keep = load_keep(fk_p)
+DOM = {L: dom_layer(L) for L in range(NL)}
+AG = {L: lr(ag, agcat, L) for L in range(NL)}
+CR = {L: lr(code, "generic_code", L) for L in range(NL)}
+LR = {L: lr(code, "targeted_lcb_medium_55", L) for L in range(NL)}
+
+print(f"STRONG_K={STRONG_K}  (a swapped-out expert is code_out if "
+      f"generic_code rank<=K OR LCB rank<=K)")
+print(f"{'label':<26} {'swap':>5} {'sci_in':>7} {'ml_in':>6} {'risky_in':>9} "
+      f"{'code_out':>9} {'pins_freed':>11}")
+print("-" * 82)
+
+for arg in sys.argv[6:]:
+    label, path = arg.split("=", 1)
+    try:
+        ck = load_keep(path)
+    except Exception as e:  # noqa: BLE001
+        print(f"{label:<26} LOAD-FAIL {path} ({e})")
+        continue
+    swap = sci_in = ml_in = risky_in = code_out = pins_freed = 0
+    out_detail = []
     for L in range(NL):
-        si = fk[L] - cand[L]   # restored (kept now, fkbroad dropped)
-        so = cand[L] - fk[L]   # cost     (dropped now, fkbroad kept)
-        swap += len(si)
-        for e in si:
-            if DOM[L].get(e) in SIG_SCI:
-                in_sci_spec += 1
-            if e in TOP["generic_science"][L] or e in TOP["generic_multilingual"][L]:
-                in_top30sm += 1
-            if e not in v7[L]:
-                in_in_v7 += 1
-        for e in so:
-            if DOM[L].get(e) in SIG_CODE:
-                out_code_spec += 1
-            if e in TOP["generic_code"][L] or e in TOP["targeted_lcb_medium_55"][L]:
-                out_top30cl += 1
-    name = os.path.basename(cp).replace("v8b_", "").replace("_drop_map.json", "")
-    rows.append((name, swap, in_sci_spec, out_code_spec))
-    print(f"{name:<8} {swap:>5} {in_sci_spec:>10} {out_code_spec:>12} "
-          f"{in_top30sm:>10} {out_top30cl:>11} {in_in_v7:>6}")
+        s_in = ck[L] - fk_keep[L]
+        s_out = fk_keep[L] - ck[L]
+        swap += len(s_in)
+        for e in s_in:
+            d = DOM[L].get(e)
+            agr = AG[L].get(e, 999)
+            if d in SCI:
+                if agr > 16:
+                    sci_in += 1
+                    if d == "generic_multilingual":
+                        ml_in += 1
+                else:
+                    risky_in += 1  # loop-driver science restored -> danger
+        for e in s_out:
+            cr = CR[L].get(e, 999)
+            lcr = LR[L].get(e, 999)
+            if cr <= STRONG_K or lcr <= STRONG_K:
+                code_out += 1
+                out_detail.append((L, e, cr, lcr))
+        for e in pins[L]:
+            if e not in ck[L]:
+                pins_freed += 1
+    print(f"{label:<26} {swap:>5} {sci_in:>7} {ml_in:>6} {risky_in:>9} "
+          f"{code_out:>9} {pins_freed:>11}")
+    if out_detail:
+        od = ", ".join(f"{L}:{e}(c{cr}/l{lcr})" for (L, e, cr, lcr) in sorted(out_detail)[:12])
+        print(f"    code_out detail: {od}{' ...' if len(out_detail) > 12 else ''}")
 
-print("-" * 70)
-print("in_sciSpec  = swapped-IN whose DOMINANT class is science/multilingual (true science gain)")
-print("out_codeSpec= swapped-OUT whose DOMINANT class is code/lcb (true code loss — want ~0)")
-print("top30 cols  = coarse membership view (generalists double-count)")
-# protect-code mandate: minimize out_codeSpec; among those, maximize in_sciSpec
-best = min(rows, key=lambda r: (r[3], -r[2]))
-print(f"\nRECOMMEND (protect-code): {best[0]}  "
-      f"(swap={best[1]} sci_gain={best[2]} code_loss={best[3]})")
+print("\nWinner rule: max sci_in with risky_in==0 and code_out~0 (no STRONG code/LCB lost).")

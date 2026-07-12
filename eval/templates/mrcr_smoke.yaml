@@ -1,0 +1,46 @@
+# mrcr_smoke — plumbing gate for the OpenAI MRCR native runner.
+#
+# Small 32k bin, 2 needle counts, n=2: validates download → o200k-bin → chat-
+# completions → hash-prefix gate → SequenceMatcher score end-to-end, cheaply.
+# A GREEN smoke is score>0 on at least one sample AND prefix_hit observed.
+# (The first run downloads the 1.4 GB needle shards to the HF cache — unavoidable
+# for any MRCR run; subsequent runs reuse it.)
+
+name: mrcr_smoke
+backend: mrcr
+task: mrcr
+n: 2
+
+selection:
+  type: filter
+  mrcr_bin: 32k
+  needles: [2, 4]
+  num_samples: 2
+  ctx_tokens: 32768          # o200k bin upper bound; served -c needs ~25% headroom
+
+generation:
+  max_gen_toks: 1024
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 600.0
+
+scoring:
+  scorer: mrcr_helpers
+  metric: pass_at_1            # mean SequenceMatcher ratio (0-1)
+  filter: null
+
+cache:
+  sqlite_prefix: mrcr_smoke
+
+backend_args:
+  enable_thinking: false       # MANDATORY: response must begin with the hash
+  num_concurrent: 2
+  random_seed: 42
+
+reports:
+  token_stats: true
+
+sanity:
+  min_p10_chars: 1

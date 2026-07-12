@@ -14,9 +14,12 @@ file in parens). Do not re-litigate; comply.
 
 ## 1. The non-negotiables
 
-### 1.0 Canonical sampler is GREEDY — every Gemma 4 bench, every variant
+### 1.0 Greedy is the DEFAULT and the cross-cohort anchor; sampling is a first-class, sampler-tagged cohort
 
-ALL canonical 9-bench templates (gpqa_diamond_full, gsm8k_100, math500_100, aime_30, arc_challenge_full, ifeval_100, humaneval_full, humanevalplus_full, lcb_medium_55*) **MUST** use:
+Greedy remains the default sampler for every template and the **only** valid sampler for
+cross-variant comparison tables. ALL canonical 9-bench templates (gpqa_diamond_full, gsm8k_100,
+math500_100, aime_30, arc_challenge_full, ifeval_100, humaneval_full, humanevalplus_full,
+lcb_medium_55*; plus the hard-tier lcb_v6_77q — see §1.0a) carry, and KEEP, greedy in their frozen `generation:` block:
 
 ```yaml
 generation:
@@ -26,18 +29,76 @@ generation:
   do_sample: false
 ```
 
-This is the recipe of the v4 published model card and the v5-coder pod cohort. Apples-to-apples cross-variant comparisons (v4 vs v5 vs 128e vs 31B vs he1 etc.) **only work when every cohort uses this exact sampler**.
+This is the recipe of the v4 published model card and the v5-coder pod cohort. Apples-to-apples
+cross-variant comparisons (v4 vs v5 vs 128e vs 31B vs he1 etc.) **only work when every cohort uses
+this exact sampler**.
 
-**Why this is non-negotiable:**
+**Sampling IS allowed — as a separate, explicitly-tagged cohort, NEVER by editing a template.**
+Some questions require the vendor sampler: comparing to Google's published Gemma 4 numbers (which use
+`vendor_base` = temp 1.0 / top_p 0.95 / top_k 64), or characterising a model at its real deployment
+operating point (`vendor_minp_rep` = temp 0.9 / top_p 0.95 / top_k 64 / min_p 0.05 / repeat_penalty
+1.1 — the v7-coder anti-loop config). These run through the **per-model sampling profile** layer
+(`eval/models/<family>.yaml` + `eval/sampler_profiles.py`), selected at the CLI:
+
+```bash
+# Greedy (default — nothing changes; frozen templates are byte-identical):
+omk_eval.py --model … --template lcb_medium_55_v4 --backend llama
+
+# Sampled (vendor_base) — overlaid on the SAME frozen template, recorded as a sampler-tagged run:
+omk_eval.py --model … --template lcb_medium_55_v4 --backend llama \
+    --sampler-profile gemma-4 --sampler recommended
+```
+
+The overlay layers the named sampler over the template's `generation:` block (between
+`backend_overrides` and `--metadata`). With **neither** `--sampler` nor `--sampler-profile`, it is a
+strict no-op — the frozen greedy templates stay byte-identical, so the greedy anchor is never broken.
+The resolved sampler is recorded in `summary.json.sampler` (`{profile, name, source, resolved}`) and
+in a grep-able `>>> OMK_SAMPLER …` log line, so a greedy cohort and a `recommended` cohort can never
+be silently confused. Each `bench_policy` entry in the profile records which benches default to
+sampling (set empirically from the 128e Q6_K greedy-vs-vendor_base comparison; see §2.1).
+
+**Why the cross-cohort rule still binds:**
 - Sampling (temp > 0) with Gemma 4 + `thinking_token_budget=12288` produces 10–40× longer reasoning chains than greedy on hard benches (GPQA p50: 617 → 24,055 chars in our 2026-05-17 incident).
 - The score itself may end up similar via flexible-extract, but token-stats columns, completion finish-reason distributions, GPQA domain breakdowns, etc. all become meaningless across cohorts.
-- A cohort that crosses the sampler boundary is unpublishable until the entire cohort is re-run on one side.
+- A table that **mixes** greedy and sampled rows is unpublishable. Keep them as separate
+  sampler-tagged cohorts (read `summary.json.sampler.name`); never merge.
 
 **Mandatory before any canonical 9-bench launch:**
-1. `grep -E "temperature|do_sample" eval/templates/{gpqa_diamond_full,gsm8k_100,math500_100,aime_30,arc_challenge_full,ifeval_100,humaneval_full,humanevalplus_full,lcb_medium_55,lcb_medium_55_v4}.yaml` — verify every line shows `temperature: 0.0` and `do_sample: false` (or absence of `do_sample`, which defaults greedy in lm-eval).
-2. After launch, peek the first cached SQLite response at 5–10 questions in. If GPQA p50 > 5000 chars, **STOP** — sampler is wrong.
+1. `grep -E "temperature|do_sample" eval/templates/{gpqa_diamond_full,gsm8k_100,math500_100,aime_30,arc_challenge_full,ifeval_100,humaneval_full,humanevalplus_full,lcb_medium_55,lcb_medium_55_v4,lcb_v6_77q}.yaml` — verify every template's frozen block still shows `temperature: 0.0` and `do_sample: false`. A sampled run NEVER edits this; it passes `--sampler …`.
+2. Confirm the intended sampler: a greedy run logs `OMK_SAMPLER … name=template_default`; a sampled run logs `name=recommended|deployment`. After launch, peek the first cached SQLite response at 5–10 questions in — if you expected greedy and GPQA p50 > 5000 chars, **STOP**, the wrong sampler is active.
 
-**Want sampling for a separate study?** Make a **new** template file (`<bench>_sample.yaml`) and a **new** orchestrator that targets it. Never overwrite the greedy templates; never let a "new canonical" silently break cross-cohort comparison.
+**Never overwrite the greedy templates.** A sampled study uses `--sampler` (preferred) or, only when
+a structural change is needed, a NEW template file (`<bench>_sample.yaml`) — never a mutation of the
+canonical greedy template.
+
+### 1.0a `lcb_v6_77q` — the all-HARD LiveCodeBench discriminator (ALWAYS 256k ctx / 32k max gen)
+
+`lcb_v6_77q` is the discriminating hard-tier LCB bench, added to both canonical suites
+(`eval_suite_llama.sh`, `eval_suite_vllm.sh`) alongside the medium `lcb_medium_55*`. It exists
+because the medium LCB benches **saturate** at this capability level: on `lcb_v6_55`, 44 of 55
+problems were medium and every strong code model cleared them ~100% (coderx 44/44), so only the 11
+hard problems carried signal and even those were near-ceiling (a 1-problem gap). `lcb_v6_77q` drops
+medium entirely: **77 hard problems**, LCB release_v6, functional + class-based starter, window
+[2024-01-01, 2025-04], frozen sorted task-ids in `eval/lcb/lcb_v6_77q_taskids.json` (the single
+source of truth — `load_lcb` bypasses its own difficulty/date filters in task_ids mode). Greedy,
+`thinking_token_budget=12288`, parser=gemma4 + enable_thinking, same recipe as `lcb_v6_55`.
+
+**MANDATORY: it is ALWAYS run at 32k max generation.** Hard problems genuinely need the room — on a
+16k run ~10–12% of completions hit `finish_reason=length`, and every one was a confirmed GENUINE
+cut-off (code being written, 12-gram repetition fraction ≤ 0.046, ZERO degenerate loops), capping at
+the per-slot ctx wall (`131072 / 8 parallel = 16384 − prompt ≈ 15.4–16.0k`). The template therefore
+pins:
+- `generation.max_gen_toks: 32768`
+- `backend_args.llama_ctx: 262144` (256k) → with `--parallel 8` that is **32768 per slot**, ~2× the
+  observed caps. `thinking_token_budget` stays 12288 so reasoning is still bounded; the extra room is
+  for the ANSWER. On vLLM the `llama_ctx` field is inert; the planner sizes `max-model-len`
+  per-request from `max_gen_toks` (PagedAttention, never ×concurrency).
+
+**NEVER lower the budget** — a 16k run silently truncates the hardest problems at the per-slot wall
+and depresses the score by ~6pp. This is the same class of bug as the SAT_COLLAPSE launcher trap
+(§ per-slot ctx < generation budget); the difference is `llama_ctx: 262144` makes the per-slot ctx
+explicit in the template rather than relying on the planner's `thinking_budget + headroom` sizing
+(which under-provisions whenever `max_gen_toks > thinking_budget`).
 
 `memory/feedback_canonical_eval_sampler_is_greedy.md`
 
@@ -358,11 +419,16 @@ the token in a script or a `${VAR:-literal}` fallback (gitleaks gate / SECURITY)
 
 ## 2. Sequencing rules
 
-### 2.1 ALWAYS check llama.cpp build version
+### 2.1 ALWAYS check llama.cpp build version — now a LOCKED stack component
 
-Pod and local llama.cpp must be on the same git commit if the comparison
-is going to be published. Different builds change FP rounding in CUDA
-kernels enough to flip 1-3% of greedy-temp=0 problems.
+llama.cpp is a pinned component of the eval stack (`eval/stack.lock.yaml` →
+`components.llama_cpp`, tag **b9700** as of stack v3). Pod and local llama.cpp must be on the
+**same git tag as the locked stack** if the comparison is going to be published. Different builds
+change FP rounding in CUDA kernels enough to flip 1-3% of greedy-temp=0 problems, so a version bump
+follows the stack-promotion procedure (`stack.lock.dev.yaml` → version bump → re-validate →
+promote): rebuild b9700 on every host, re-run the soft2 48-seed agentic loop gate (must stay 0/48),
+re-validate `anchor30`, AND re-baseline the 128e Q6_K reference numbers (greedy + vendor_base) on
+the new binary before any new cohort cites the bumped stack. STACK_HISTORY.md records each bump.
 
 ```bash
 # Pod
@@ -2226,3 +2292,93 @@ even if a future template accidentally ships with sampling on, the runner
 overrides. RULER tasks are deterministic substring matches — sampling adds
 noise and breaks cross-cohort comparison the same way it does on the
 9-bench suite (see `feedback_canonical_eval_sampler_is_greedy`).
+
+
+## v2.11 — OpenAI MRCR native variant (§8 — 2026-06-11)
+
+The omk eval stack ships an `mrcr` backend over **OpenAI MRCR**
+(`openai/mrcr`, MIT; multi-round co-reference resolution, arXiv:2409.12640)
+for long-context multi-needle benchmarking. Runner:
+[`eval/mrcr/mrcr_runner.py`](mrcr/mrcr_runner.py) + `mrcr_helpers.py`.
+
+### v2.11.1 Why a native runner (not lm-eval)
+
+lm-eval 0.4.11 (the pinned omk env) ships **no `mrcr` task** — verified
+2026-06-11 (`find .../lm_eval/tasks -iname '*mrcr*'` → empty). Even a later
+upstream addition would be unusable without bumping the pinned stack
+(0.4.11 is locked for Py3.11 + transformers 5.x; see
+`feedback_pod_lmeval_py311`). MRCR is also chat-native — the `prompt` IS a
+multi-turn message list — so it follows the **NoLiMa** runner shape
+(`/v1/chat/completions`), not RULER's raw-completions. Same native-runner
+rationale as §8 RULER: no upstream-version coupling, full serving + scoring
+control, no site-packages patching.
+
+### v2.11.2 Task, scoring, binning
+
+- **Task.** A long synthetic user/assistant conversation hides 2/4/8
+  identical writing "asks"; the final user turn asks for the i-th instance
+  and to **prepend a random alphanumeric hash**. The model must reproduce
+  that exact earlier assistant reply, hash-first.
+- **Scoring (verbatim OpenAI `grade()`).** If the response does not
+  `startswith(random_hash)` → **0** (hard gate). Else strip the hash from
+  both and score `difflib.SequenceMatcher(None, resp, ans).ratio()` ∈ [0,1].
+  Bench score = mean ratio = omk `pass_at_1`. Per-needle means are kept in
+  `mrcr_result.json` (`per_needle_mean`) and per-sample in `.samples.jsonl`.
+- **Binning is by `tiktoken o200k_base` token count** (OpenAI's measure, NOT
+  the served model's tokenizer), power-of-two boundaries: `256k`=(131072,
+  262144], `512k`=(262144, 524288], `1024k`=(524288, 1048576]. 100 samples
+  per published bin. The runner coarse-prefilters by `n_chars` then exact-
+  tokenizes candidates.
+
+### v2.11.3 THINKING MUST BE OFF (the hash-prefix trap)
+
+Because grading gates on `startswith(hash)`, a leading `<think>` block →
+score 0. Templates set `backend_args.enable_thinking: false` and the runner
+sends `chat_template_kwargs:{enable_thinking:false}` + reads `message.content`
+first (falling back to `reasoning_content` only when content is empty, to
+survive the vLLM gemma4 content-empty bug — Fix-A). **Serve with thinking
+disabled.** A run with `>50%` content-empty AND `pass@1=0` is the smoking gun
+(the runner WARNs on it).
+
+### v2.11.4 Templates + the 768k_synth caveat
+
+| Template | Bin (o200k) | n | Note |
+|---|---|---|---|
+| `mrcr_smoke` | 32k | 2 | Plumbing gate, GREEN = score>0 + prefix_hit |
+| `mrcr_256k` | (131072,262144] | 32 | Standard published bin |
+| `mrcr_512k` | (262144,524288] | 32 | Standard published bin |
+| `mrcr_768k_synth` | [688128,851968] | 32 | **SYNTHETIC** — sub-band of the 1M bin |
+| `mrcr_1024k` | (524288,1048576] | 32 | Standard published bin (hardest) |
+
+OpenAI bins are powers of two — **there is no native 768k bin**.
+`mrcr_768k_synth` sub-filters the 1M bin to o200k ∈ 768k ± 12.5% so the MRCR
+ladder lines up with the RULER-VT ladder. It is **not** comparable to any
+published number — always report it labelled "synth". `n=32` is the DCA-ladder
+size (enough for an on-vs-off delta); raise `selection.num_samples`/`n` to
+**100** for a publish-grade, OpenAI-comparable number.
+
+### v2.11.5 Serving headroom + context-extension requirement
+
+o200k token counts ≈ 1.1–1.3× the equivalent **Gemma** token count, so the
+served `-c` / `--max-model-len` must carry ~25–30% headroom over the bin's
+o200k upper bound, and the 256k+ bins already require context **extension**
+(DCA-on or a trained-extended ckpt) on a native-262144 model. The runner
+reports `prompt_tokens_median` (served-tokenizer actual) so drift is visible.
+
+### v2.11.6 DCA on/off methodology (T87)
+
+MRCR is the capability axis of the DCA prefill-extension validation. The
+runner is server-agnostic, so the on/off comparison uses omk's `--no-server`
+mode against an **externally-launched opencoti DCA llamafile**:
+
+1. Serve the A4B GGUF via the opencoti DCA llamafile with `--dca on`
+   (chunk-extended `-c`) on port P.
+2. `omk_eval --no-server --port P --template mrcr_256k` → `mrcr_256k/.../summary.json`.
+3. Repeat with `--dca off` (native) for the on-vs-off delta at 256k.
+4. Then baselines at `mrcr_512k` / `mrcr_768k_synth` / `mrcr_1024k` (DCA-on;
+   "off" can't reach these on a native-262144 model).
+
+Greedy is enforced (template + canonical rule). MRCR composes with the §8
+NoLiMa + RULER-VT + MK1 triad as a 4th long-context signal — co-reference
+disambiguation under many same-distribution distractors, which NIAH/VT do not
+probe.

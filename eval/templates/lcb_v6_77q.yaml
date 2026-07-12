@@ -1,0 +1,66 @@
+# LiveCodeBench all-HARD 77 (lcb_v6_77q) — the DISCRIMINATING successor to
+# lcb_v6_55, which itself saturated: 44 of its 55 problems were medium (every
+# strong code model clears medium ~100%, e.g. coderx 44/44), so only the 11 hard
+# problems carried any signal and even those were near-ceiling (10/11 vs 9/11 =
+# a 1-problem gap). This bench DROPS medium entirely and uses the full 2024+ hard
+# pool:
+#   - source: livecodebench/code_generation_lite release_v6, functional testtype +
+#     class-based starter (scorer-compatible only).
+#   - difficulty = hard ONLY (the hardest tier LCB offers — no "very hard" exists).
+#   - window [2024-01-01, 2025-04]: 77 hard problems. Recent enough to be a
+#     defensible contamination story; large enough that the ~9pp hard-tier gap
+#     seen on v6-55 becomes a ~7-problem separation instead of 1.
+#   - frozen task-id list (eval/lcb/lcb_v6_77q_taskids.json), deterministic
+#     (sorted by task_id). The loader bypasses its own difficulty/date filters
+#     when task_ids is set (lcb_helpers.load_lcb), so the JSON is the single
+#     source of truth. Reproduce: load_lcb(difficulty='hard', min_date='2024-01-01').
+#
+# EXTENDED GENERATION (256k / 32k): these are genuinely hard problems. On the
+# first 16k run, ~10-12% of completions hit finish_reason=length — and ALL of
+# them were confirmed GENUINE cut-offs (code being written, repetition fraction
+# <=0.046, ZERO degenerate loops), capping at the per-slot ctx wall
+# (131072/8=16384 - prompt ~= 15.4-16.0k). So max_gen_toks is 32768 and the
+# server is pinned to llama_ctx=262144 (256k) / parallel 8 => 32768 per slot,
+# ~2x the observed caps. thinking_token_budget stays 12288 (reasoning bounded
+# against pruned-variant rumination); the extra room goes to the ANSWER.
+#
+# Recipe is otherwise lcb_v6_55 verbatim: GREEDY (frozen), parser=gemma4 +
+# enable_thinking; backend_overrides.llama swaps the bench-default coding flags
+# for the same parser+budget recipe on llama.cpp. ALWAYS run at 32k max gen.
+name: lcb_v6_77q
+backend: lcb_custom
+task: livecodebench
+n: 77
+selection:
+  type: filter           # filter + task_ids_file (the loader bypasses difficulty/date in task_ids mode)
+  task_ids_file: eval/lcb/lcb_v6_77q_taskids.json
+  difficulty: hard          # inert in task_ids mode (loader bypasses); documents the build = all hard
+  min_date: "2024-01-01"    # inert in task_ids mode; documents the build window
+  testtype: functional
+generation:
+  max_gen_toks: 32768   # EXTENDED: hard problems were hitting the per-slot ctx wall at ~15-16k. ALWAYS 32k.
+  thinking_token_budget: 12288   # forcing-function: prevents pruned-variant rumination loops
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 1200
+scoring:
+  scorer: lcb_helpers
+  validated_against: lcb_runner.evaluation.testing_util.grade_call_based
+backend_args:
+  apply_chat_template: true
+  llama_ctx: 262144        # -c 262144 (256k) / parallel 8 = 32768 per slot; no per-slot cap at 32k gen
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: lcb_v6_77q
+reports:
+  token_stats: true
+dependencies:
+  python_modules: [datasets]
+backend_overrides:
+  llama:
+    backend_args:
+      llama_extra_replace: true
+      llama_extra: ["--reasoning-format", "deepseek", "--reasoning-budget", "12288"]

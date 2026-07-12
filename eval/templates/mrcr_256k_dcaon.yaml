@@ -1,0 +1,56 @@
+# mrcr_256k_dcaon — OpenAI MRCR @ 256k o200k bin, DCA ON (chunk 8192 → 32 chunks).
+#
+# T87.pD perf overview: the DCA-ON arm of the 256k A/B (pair: mrcr_256k_dcaoff).
+# Same opencoti DCA llamafile, --dca on --dca-chunk-size 8192 added. prefill/gen
+# tok/s + peak VRAM (mrcr_runner server `timings` + nvidia-smi poll) isolate the
+# DCA overhead vs the native arm at the one bin both can serve.
+# Run with --backend llama --gpus <id>.
+
+name: mrcr_256k_dcaon
+backend: mrcr
+task: mrcr
+n: 16
+
+selection:
+  type: filter
+  mrcr_bin: 256k
+  needles: [2, 4, 8]
+  num_samples: 16
+  ctx_tokens: 262144
+
+generation:
+  max_gen_toks: 2048
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 3600.0
+
+scoring:
+  scorer: mrcr_helpers
+  metric: pass_at_1
+  filter: null
+
+cache:
+  sqlite_prefix: mrcr_256k_dcaon
+
+backend_args:
+  enable_thinking: false
+  num_concurrent: 1
+  llama_parallel: 1
+  random_seed: 42
+  server_bin: /srv/ml/opencoti-dca/bin/llamafile
+  server_prefix_args: ["--server"]
+  llama_raw_serve: true
+  llama_extra_replace: true
+  llama_extra: ["-ngl", "99", "-fa", "on", "--parallel", "1", "--no-warmup",
+                "--dca", "on", "--dca-chunk-size", "8192",
+                "--ctx-checkpoints", "0", "--checkpoint-every-n-tokens", "-1"]
+  llama_ctx: 262144
+  llama_ctx_max: 262144
+
+reports:
+  token_stats: true
+
+sanity:
+  min_p10_chars: 1

@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover
 
 
 REPO_TEMPLATES_DIR = Path(__file__).resolve().parent
-KNOWN_BACKENDS = {"lm-eval", "lcb_custom", "multipl_e", "nolima", "ruler_native"}
+KNOWN_BACKENDS = {"lm-eval", "lcb_custom", "multipl_e", "nolima", "ruler_native", "mrcr"}
 # Selection types:
 #   indices  — list[int] honored by the runner (or baked into a shadow task
 #              via process_docs for lm-eval which doesn't honor --limit indices)

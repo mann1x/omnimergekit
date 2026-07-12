@@ -1,0 +1,56 @@
+# mrcr_1024k_dcaon — OpenAI MRCR @ the 1M o200k bin, DCA ON (chunk 8192 → 130 chunks).
+#
+# T87.pD perf overview, hardest rung. DCA-only (native cannot reach 1M). -c 1064960
+# (130×8192 ≈ 1.04M) covers the worst-case GEMMA prompt (o200k 1048576 ÷ ~1.1 ≈ 953k
+# model tok) + the 2048-tok answer. f16 KV (validated recipe) → this is the peak-VRAM
+# headline cell. Each ~1M prefill is many minutes; n=6 for a tractable throughput +
+# VRAM read. Run with --backend llama --gpus <id>.
+
+name: mrcr_1024k_dcaon
+backend: mrcr
+task: mrcr
+n: 6
+
+selection:
+  type: filter
+  mrcr_bin: 1024k
+  needles: [2, 4, 8]
+  num_samples: 6
+  ctx_tokens: 1048576
+
+generation:
+  max_gen_toks: 2048
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 9000.0
+
+scoring:
+  scorer: mrcr_helpers
+  metric: pass_at_1
+  filter: null
+
+cache:
+  sqlite_prefix: mrcr_1024k_dcaon
+
+backend_args:
+  enable_thinking: false
+  num_concurrent: 1
+  llama_parallel: 1
+  random_seed: 42
+  server_bin: /srv/ml/opencoti-dca/bin/llamafile
+  server_prefix_args: ["--server"]
+  llama_raw_serve: true
+  llama_extra_replace: true
+  llama_extra: ["-ngl", "99", "-fa", "on", "--parallel", "1", "--no-warmup",
+                "--dca", "on", "--dca-chunk-size", "8192",
+                "--ctx-checkpoints", "0", "--checkpoint-every-n-tokens", "-1"]
+  llama_ctx: 1064960
+  llama_ctx_max: 1064960
+
+reports:
+  token_stats: true
+
+sanity:
+  min_p10_chars: 1

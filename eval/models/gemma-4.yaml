@@ -1,0 +1,64 @@
+# Per-model sampling profile — Gemma 4 26B-A4B family (128e + pruned 98e/v7/soft2/v8 + 31B).
+#
+# Loaded by eval/sampler_profiles.py and layered over a template's frozen
+# `generation:` block by omk_eval.py (--sampler-profile gemma-4 | auto, or
+# --sampler <name>). With NEITHER flag, no overlay is applied and the frozen
+# greedy templates stay byte-identical — greedy remains the cross-cohort anchor
+# (EVAL_PROTOCOL.md §1.0).
+#
+# Sampler provenance:
+#   greedy       — the cross-cohort comparison anchor. temp 0 / top_p 1 / top_k 0.
+#   recommended  — Google "vendor_base": the Gemma 4 vendor-recommended sampler.
+#                  Used for runs that should compare to vendor-style numbers.
+#   deployment   — "vendor_minp_rep": the anti-loop deployment config that holds
+#                  0/48 looping seeds on the v7-coder soft2 / v8 GGUFs.
+#
+# `bench_policy` is the per-bench default sampler. It starts all-greedy; the
+# 128e Q6_K greedy-vs-vendor_base comparison on llama.cpp b9700 (T213.C) fills
+# in which benches flip to `recommended`. Until measured, every bench stays on
+# the greedy anchor.
+
+family: gemma-4-26B-A4B
+match:
+  - "gemma-4-*"
+  - "*-26B-A4B*"
+  - "*-98e-*"
+  - "*-128e*"
+  - "*-31B-*"
+
+samplers:
+  greedy:
+    temperature: 0.0
+    top_p: 1.0
+    top_k: 0
+    do_sample: false
+  recommended:            # vendor_base — Google recommended
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 64
+    min_p: 0.0
+    do_sample: true
+  deployment:             # vendor_minp_rep — anti-loop (0/48 seeds on soft2/v8)
+    temperature: 0.9
+    top_p: 0.95
+    top_k: 64
+    min_p: 0.05
+    repeat_penalty: 1.1
+    do_sample: true
+
+bench_policy:
+  default: greedy
+  # Measured by T213.C — 128e Q6_K greedy vs vendor_base (@recommended), llama.cpp
+  # b9700, 2026-06-18 (canonical summary.json .score). Only GPQA both moves
+  # materially AND is reported sampled by Google, so it is the sole flip:
+  #   GPQA   +3.54 (69.19 -> 72.73)        -> recommended
+  #   GSM8K  -8.00 (94.00 -> 86.00)  sampling HURTS  -> stay greedy
+  #   IFEval -1.00 / HumanEval -0.61 / LCB-55 -1.81  -> stay greedy
+  #   MATH500 / AIME / ARC  flat;  HumanEval+ +1.22 (small) -> greedy anchor
+  # default greedy is unchanged for any run that does NOT pass --sampler-profile.
+  gpqa_diamond_full: recommended
+
+# Reserved for other per-model protocol deviations (tokenizer, max_model_len,
+# llama_extra, ...). Not consumed yet; declared so profiles are the single
+# input for model-specific deviations.
+protocol_overrides: {}

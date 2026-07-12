@@ -62,6 +62,7 @@ LCB_DIR = REPO_ROOT / "eval" / "lcb"
 MPE_DIR = REPO_ROOT / "eval" / "multipl_e"
 NOLIMA_DIR = REPO_ROOT / "eval" / "nolima"
 RULER_DIR = REPO_ROOT / "eval" / "ruler_native"
+MRCR_DIR = REPO_ROOT / "eval" / "mrcr"
 
 
 def log(msg: str) -> None:
@@ -408,7 +409,10 @@ def llama_bench_defaults(task: str) -> list[str]:
 def launch_llama(gguf: str, port: int, log_path: Path,
                  ctx: int = 32768, ngl: int = 99, parallel: int = 2,
                  extra: list[str] | None = None,
-                 gpu_id: int | None = None) -> ServerHandle:
+                 gpu_id: int | None = None,
+                 server_bin: str | None = None,
+                 server_prefix: list[str] | None = None,
+                 raw_args: bool = False) -> ServerHandle:
     """Launch llama-server. For Q-quants (Q4_K_M, Q6_K, ...).
 
     `extra` is appended after the mandatory args; pass bench-typed flags
@@ -419,16 +423,41 @@ def launch_llama(gguf: str, port: int, log_path: Path,
     so it loads the FULL model there (no -ngl layer-split). None = inherit the
     caller's env unchanged (today's behavior; -ngl 99 splits across whatever is
     visible). The planner (gpu_planner.build_plan) decides the pin.
+
+    DCA-serve / custom-binary mode (T87.pD): `server_bin` overrides the default
+    `LLAMA_BIN/llama-server` (e.g. the opencoti DCA llamafile); `server_prefix`
+    is inserted right after the binary (the llamafile needs `["--server"]`);
+    `raw_args=True` means `extra` fully specifies the serve flags (ngl /
+    parallel / fa / cache-type / --dca …) so the opinionated defaults
+    (-ngl/--parallel/--no-warmup/q8_0 KV) are NOT injected — the validated DCA
+    recipe is carried verbatim by the template. Set all three from
+    `backend_args.{server_bin,server_prefix_args,llama_raw_serve}`.
     """
-    bin_path = os.environ.get("LLAMA_BIN",
-                              "/opt/llama.cpp/build/bin") + "/llama-server"
-    cmd = [
-        bin_path,
-        "-m", gguf, "--port", str(port),
-        "-c", str(ctx), "-ngl", str(ngl), "--parallel", str(parallel),
-        "--no-warmup",
-        "--cache-type-k", "q8_0", "--cache-type-v", "q8_0",
-    ]
+    bin_path = server_bin or (
+        os.environ.get("LLAMA_BIN", "/opt/llama.cpp/build/bin") + "/llama-server")
+    # Cosmopolitan APE binaries (the opencoti DCA llamafile) carry an MZ-DOS /
+    # shell-script polyglot header, not ELF magic. A bare execve() of an APE
+    # returns ENOEXEC ("Exec format error") when no binfmt_misc handler is
+    # registered; bash silently retries via /bin/sh, but subprocess.Popen(argv)
+    # does not. Prepend /bin/sh so the APE shell-stub trampolines into the real
+    # binary. A normal ELF llama-server has \x7fELF magic → prefix stays empty.
+    launch_prefix: list[str] = []
+    try:
+        with open(bin_path, "rb") as _bf:
+            if _bf.read(4) != b"\x7fELF":
+                launch_prefix = ["/bin/sh"]
+    except OSError:
+        pass
+    cmd = [*launch_prefix, bin_path]
+    if server_prefix:
+        cmd += list(server_prefix)
+    cmd += ["-m", gguf, "--port", str(port), "-c", str(ctx)]
+    if not raw_args:
+        cmd += [
+            "-ngl", str(ngl), "--parallel", str(parallel),
+            "--no-warmup",
+            "--cache-type-k", "q8_0", "--cache-type-v", "q8_0",
+        ]
     if extra:
         cmd += extra
     env = dict(os.environ)
@@ -631,7 +660,7 @@ def _resolve_hf_tokenizer(tokenizer: str) -> str:
     tokenizer_config.json, or a hub id). When `--tokenizer` is omitted, main()
     defaults it to `--model`; if `--model` is a `.gguf`, lm-eval calls
     `AutoTokenizer.from_pretrained(<binary>)` and dies ~97s in at construction
-    ("not a valid JSON file") - AFTER the server booted, leaving a
+    ("not a valid JSON file") — AFTER the server booted, leaving a
     0-sample / score=null result. Fail fast here (sub-second, pre-construction)
     with an actionable message, and auto-resolve to a sibling HF dir when one
     sits next to the .gguf."""
@@ -651,7 +680,7 @@ def _resolve_hf_tokenizer(tokenizer: str) -> str:
               f"and would crash ~97s in at construction. Pass --tokenizer <HF model "
               f"dir or hub id> (e.g. the bf16 source dir, or google/gemma-4-26B-A4B-it). "
               f"Failing now instead of after server boot.")
-    # Not a local path -> assume a HF hub id (org/name); lm-eval validates it.
+    # Not a local path → assume a HF hub id (org/name); lm-eval validates it.
     return tokenizer
 
 
@@ -672,8 +701,10 @@ def dispatch_lm_eval(template: dict, model_tag: str, base_url: str,
     the server level (via `backend_args.vllm_chat_template` +
     `backend_args.vllm_reasoning_parser`), so no per-request
     `chat_template_kwargs` plumbing is required."""
-    # Durable guard: feeds `tokenizer` to lm-eval HF backend; a GGUF
-    # --model defaulted as tokenizer crashes ~97s in. Auto-resolve or fail fast.
+    # Durable guard: this path feeds `tokenizer` to lm-eval's HF tokenizer
+    # backend. If --tokenizer was omitted and --model is a GGUF, `tokenizer`
+    # is the .gguf path → AutoTokenizer crashes ~97s in at construction.
+    # Auto-resolve to a sibling HF dir, or fail fast with the fix.
     tokenizer = _resolve_hf_tokenizer(tokenizer)
     cache_dir = out_dir / "sqlite_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -742,6 +773,16 @@ def dispatch_lm_eval(template: dict, model_tag: str, base_url: str,
             if k == "thinking_token_budget" and not has_parser:
                 continue
             gen_kw_parts.append(f"{k}={g[k]}")
+    # vLLM accepts min_p / repeat_penalty as OpenAI-compatible extra sampling
+    # params, and lm-eval forwards unknown gen_kwargs straight into the request
+    # body. For the llama backend these are server-LAUNCH flags instead
+    # (--min-p / --repeat-penalty, injected into llama_extra), so only forward
+    # them here for vLLM to avoid llama-server rejecting unknown per-request
+    # fields. Populated only when a sampler profile carries them.
+    if template.get("_runtime_backend") == "vllm":
+        for k in ("min_p", "repeat_penalty"):
+            if k in g:
+                gen_kw_parts.append(f"{k}={g[k]}")
     cmd = [
         os.environ.get("LM_EVAL_BIN", "lm-eval"),
         "--model", "local-chat-completions",
@@ -831,6 +872,17 @@ def dispatch_lcb(template: dict, model_tag: str, base_url: str,
     ctk = ba.get("vllm_default_chat_template_kwargs") or {}
     if "enable_thinking" in ctk:
         cmd += ["--enable-thinking", "true" if ctk["enable_thinking"] else "false"]
+    # Per-model sampler (eval/models/<family>.yaml). Forward ONLY when a profile
+    # is active, so greedy LCB runs keep a byte-identical command line (the shim
+    # defaults to greedy when these flags are absent). Replaces the ad-hoc env
+    # hack previously needed for sampled LCB on bs2.
+    _sm = template.get("_sampler_meta") or {}
+    if _sm.get("name") and _sm.get("name") != "template_default":
+        for _flag, _key in (("--temperature", "temperature"), ("--top-p", "top_p"),
+                            ("--top-k", "top_k"), ("--min-p", "min_p"),
+                            ("--repeat-penalty", "repeat_penalty")):
+            if g.get(_key) is not None:
+                cmd += [_flag, str(g[_key])]
     log(f"lcb shim: {' '.join(shlex.quote(c) for c in cmd)}")
     return subprocess.call(cmd)
 
@@ -966,6 +1018,69 @@ def dispatch_ruler_native(template: dict, model_tag: str, base_url: str,
     return subprocess.call(cmd)
 
 
+def dispatch_mrcr(template: dict, model_tag: str, base_url: str,
+                  out_dir: Path, tokenizer: str | None,
+                  vram_gpu: int | None = None) -> int:
+    """Run the omk-native OpenAI MRCR runner against the chat-completions endpoint.
+
+    Same shape as dispatch_nolima: subprocess into eval/mrcr/mrcr_runner.py with
+    selection + generation fields mapped to its CLI. The runner writes
+    mrcr_result.json which extract_canonical_score reads to populate summary.json.
+    License: dataset MIT (openai/mrcr), pulled at runtime, never vendored.
+
+    MRCR is a chat task — the `prompt` IS the multi-turn message list — so thinking
+    MUST be served OFF (the graded response must begin with the required hash; a
+    leading <think> block fails the prefix gate → 0). `tokenizer` is unused here
+    (binning is by o200k_base inside the runner), accepted for dispatch symmetry.
+    """
+    g = template["generation"]
+    sel = template["selection"]
+    ba = template.get("backend_args", {}) or {}
+
+    cache_dir = out_dir / "sqlite_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    prefix = template.get("cache", {}).get("sqlite_prefix", template["name"])
+    cache_db = cache_dir / f"{prefix}_{model_tag}.db"
+
+    py = os.environ.get("OMK_PYTHON") or (
+        "/root/anaconda3/envs/omnimergekit/bin/python"
+        if os.path.exists("/root/anaconda3/envs/omnimergekit/bin/python")
+        else sys.executable)
+
+    bin_name = sel.get("mrcr_bin")
+    if not bin_name:
+        log("ERROR: mrcr template missing selection.mrcr_bin "
+            "(e.g. '256k', '512k', '768k_synth', '1024k')")
+        return 11
+
+    needles = sel.get("needles", "2,4,8")
+    if isinstance(needles, (list, tuple)):
+        needles = ",".join(str(int(x)) for x in needles)
+
+    cmd = [
+        py, str(MRCR_DIR / "mrcr_runner.py"),
+        "--name", model_tag,
+        "--base-url", base_url.replace("/v1", ""),
+        "--bin", str(bin_name),
+        "--needles", str(needles),
+        "--num-samples", str(int(sel.get("num_samples", template.get("n", 32)))),
+        "--max-tokens", str(int(g.get("max_gen_toks", 2048))),
+        "--http-timeout", str(float(g.get("http_timeout", 1800.0))),
+        "--num-concurrent", str(int(ba.get("num_concurrent", 2))),
+        "--enable-thinking", str(ba.get("enable_thinking", "false")).lower(),
+        "--random-seed", str(int(ba.get("random_seed", 42))),
+        "--cache-db", str(cache_db),
+        "--output", str(out_dir / "mrcr_result.json"),
+    ]
+    # Peak-VRAM capture on the pinned physical GPU (omk passes the serve pin).
+    # A template can also force selection.vram_gpu; the explicit pin wins.
+    vg = sel.get("vram_gpu", vram_gpu)
+    if vg is not None:
+        cmd += ["--vram-gpu", str(int(vg))]
+    log(f"mrcr runner: {' '.join(shlex.quote(c) for c in cmd)}")
+    return subprocess.call(cmd)
+
+
 def dispatch_multipl(template: dict, model_tag: str, base_url: str,
                      out_dir: Path) -> int:
     """MultiPL-E backend: per-language generate (against the running
@@ -1023,10 +1138,11 @@ def dispatch_multipl(template: dict, model_tag: str, base_url: str,
                 "--model-name", model_tag,
                 "--out-dir", str(gen_dir),
                 "--max-tokens", str(max_tokens),
-                # Sampler from generation.* — defaults greedy (0.0/1.0/0) so
+                # Sampler from generation.* — defaults greedy (0.0/1.0/0) so the
                 # frozen canonical MPE templates are byte-identical; shadow
-                # templates carry the gemma vendor sampler. min_p/repeat_penalty
-                # stay server-launch flags (generator never sends them).
+                # templates (e.g. multipl_e_sampler_probe) carry the gemma vendor
+                # sampler. min_p/repeat_penalty stay server-launch flags
+                # (deployment-faithful — the generator never sends them).
                 "--temperature", str(g.get("temperature", 0.0)),
                 "--top-p", str(g.get("top_p", 1.0)),
                 "--top-k", str(g.get("top_k", 0)),
@@ -1386,6 +1502,39 @@ def extract_canonical_score(template: dict, out_dir: Path) -> tuple[float | None
         }
         return (float(score) if score is not None else None), score_dict
 
+    if backend == "mrcr":
+        rj = out_dir / "mrcr_result.json"
+        if not rj.exists():
+            return None, {}
+        try:
+            d = json.loads(rj.read_text())
+        except Exception as e:  # pragma: no cover
+            return None, {"error": f"mrcr_result.json parse: {e}"}
+        # Headline = pass_at_1 = mean SequenceMatcher ratio over samples (0-1).
+        score = d.get("pass_at_1")
+        score_dict = {
+            "pass_at_1": d.get("pass_at_1"),
+            "accuracy": d.get("accuracy"),
+            "metric": d.get("metric"),             # sequence_matcher_ratio
+            "bin": d.get("bin"),
+            "ctx_tokens": d.get("ctx_tokens"),
+            "n": d.get("n"),
+            "num_samples": d.get("num_samples"),
+            "needles": d.get("needles"),
+            "per_needle_mean": d.get("per_needle_mean"),
+            "o200k_tokens_median": d.get("o200k_tokens_median"),
+            "prompt_tokens_median": d.get("prompt_tokens_median"),
+            "content_empty": d.get("content_empty"),
+            "prefix_miss": d.get("prefix_miss"),
+            "errors": d.get("errors"),
+            # T87.pD perf overview: server-reported prefill/gen tok/s + peak VRAM.
+            "prefill_tok_s": d.get("prefill_tok_s"),
+            "gen_tok_s": d.get("gen_tok_s"),
+            "wall_s_median": d.get("wall_s_median"),
+            "vram_peak_mib": d.get("vram_peak_mib"),
+        }
+        return (float(score) if score is not None else None), score_dict
+
     if backend == "multipl_e":
         rj = out_dir / "mpe_result.json"
         if not rj.exists():
@@ -1564,6 +1713,28 @@ def _check_ruler_native(template: dict) -> None:
     log(f"ruler_native preflight OK (task={task})")
 
 
+def _check_mrcr(template: dict) -> None:
+    """Pre-flight for the mrcr backend: tiktoken/pandas/pyarrow/hf_hub imports +
+    the o200k_base encoding (first-run BPE fetch) + a known bin name. Aborts
+    (exit 6) BEFORE serving so a chain fails fast at the broken bench instead of
+    losing the whole run. No-op for every other backend."""
+    if (template.get("backend") or "") != "mrcr":
+        return
+    bin_name = ((template.get("selection") or {}).get("mrcr_bin") or "").strip() or None
+    sys.path.insert(0, str(MRCR_DIR))
+    try:
+        from mrcr_helpers import mrcr_native_readiness
+    except Exception as e:
+        fatal(6, f"mrcr preflight: cannot import mrcr_helpers from {MRCR_DIR}: {e}")
+    problems = mrcr_native_readiness(bin_name)
+    if problems:
+        log(f"MRCR PREFLIGHT FAIL: template={template.get('name')} bin={bin_name}")
+        for p in problems:
+            log(f"  - {p}")
+        fatal(6, f"mrcr preflight failed: {len(problems)} problem(s) — see log above")
+    log(f"mrcr preflight OK (bin={bin_name})")
+
+
 # Tasks whose HF dataset is GATED → an authenticated token is mandatory.
 # Map the task-name substring to the gated dataset id (for a precise message).
 # Add new gated datasets here as the cohort grows.
@@ -1700,6 +1871,18 @@ def main() -> None:
                     help="tokenizer for lm-eval (defaults to --model)")
     ap.add_argument("--served-name", default="",
                     help="vllm served-model-name (defaults to derived from path)")
+    # ── Per-model sampling profile (eval/models/<family>.yaml via
+    #    sampler_profiles.py). Layered over the template generation block.
+    #    With NEITHER flag, no overlay is applied → frozen greedy templates stay
+    #    byte-identical (cross-cohort anchor). See EVAL_PROTOCOL.md §1.0. ───────
+    ap.add_argument("--sampler-profile", default="",
+                    help="Per-model sampler profile: <family>|<path>|auto. "
+                         "'auto' (or a bare --sampler) matches eval/models/*.yaml "
+                         "by served-name/model-dir glob. Empty = no profile.")
+    ap.add_argument("--sampler", default="",
+                    help="Named sampler from the profile (greedy|recommended|"
+                         "deployment|...). Overrides the profile's bench_policy "
+                         "for this run. Requires a profile (explicit or auto).")
     ap.add_argument("--no-server", action="store_true",
                     help="use an already-running server on --port")
     ap.add_argument("--max-model-len", type=int, default=32768)
@@ -1783,6 +1966,45 @@ def main() -> None:
         _deep_merge(template, _engine_override)
         log(f"applied backend_overrides[{args.backend}]: {_engine_override}")
 
+    # ── Per-model sampler overlay (eval/models/<family>.yaml). Layered ON TOP of
+    #    backend_overrides and BELOW --metadata (so --metadata stays the final
+    #    authoritative word — a single knob can still be forced). With neither
+    #    --sampler nor --sampler-profile this is a STRICT no-op: the frozen greedy
+    #    templates stay byte-identical, preserving the cross-cohort greedy anchor
+    #    (EVAL_PROTOCOL.md §1.0). See sampler_profiles.py.
+    template["_runtime_backend"] = args.backend
+    import sampler_profiles  # type: ignore
+    _served_for_match = args.served_name or Path(args.model).name
+    _sprofile = None
+    if args.sampler_profile and args.sampler_profile != "auto":
+        _sprofile = sampler_profiles.load(args.sampler_profile)
+    elif args.sampler_profile == "auto" or args.sampler:
+        _sprofile = sampler_profiles.match_profile(_served_for_match, args.model)
+    _samp_name, _samp, _samp_src = sampler_profiles.resolve(
+        _sprofile, template["name"], args.sampler or None)
+    _gen = template.setdefault("generation", {})
+    if _samp:
+        # temperature/top_p/top_k/do_sample overlay the generation block; min_p/
+        # repeat_penalty are written here too and routed per-backend downstream
+        # (vLLM → gen_kwargs; llama-server → --min-p/--repeat-penalty launch
+        # flags; the LCB shim → per-request payload).
+        for _k in sampler_profiles.SAMPLER_KEYS:
+            if _k in _samp:
+                _gen[_k] = _samp[_k]
+    template["_sampler_meta"] = {
+        "profile": sampler_profiles.family(_sprofile) if _sprofile else None,
+        "name": _samp_name or "template_default",
+        "source": _samp_src,
+    }
+    # Grep-able, always-emitted record of the EFFECTIVE sampler (in every logfile).
+    log(">>> OMK_SAMPLER template={} name={} source={} profile={} "
+        "temp={} top_p={} top_k={} min_p={} rep={} do_sample={}".format(
+            template["name"], _samp_name or "template_default", _samp_src,
+            template["_sampler_meta"]["profile"],
+            _gen.get("temperature", 0.0), _gen.get("top_p", 1.0),
+            _gen.get("top_k", 0), _gen.get("min_p", "-"),
+            _gen.get("repeat_penalty", "-"), _gen.get("do_sample", False)))
+
     # Runtime field overrides (--metadata). Applied LAST so the CLI is the most
     # authoritative layer (above template defaults and backend_overrides). Lets
     # one canonical template serve multiple operating points — the motivating
@@ -1804,6 +2026,9 @@ def main() -> None:
     # modules + nltk punkt + the task's haystack/qa corpus) — the generic check
     # above can't see data-file deps. No-op for every other backend.
     _check_ruler_native(template)
+    # mrcr needs its own preflight (tiktoken/pandas/hf_hub + o200k bpe). No-op
+    # for every other backend.
+    _check_mrcr(template)
 
     # Resolve served name + tokenizer + out dir
     served_name = args.served_name or Path(args.model).name
@@ -1844,6 +2069,10 @@ def main() -> None:
     # (replicas × per-server parallel). Set per-backend below, injected into the
     # template's num_concurrent before dispatch so templates stay parallel-agnostic.
     effective_concurrency: int | None = None
+    # Physical GPU the server is pinned to (single-server llama path). Threaded
+    # into dispatch_mrcr as --vram-gpu so the MRCR runner records peak VRAM on
+    # the right device. None when unpinned (vllm / fleet / --no-server).
+    serve_gpu_id: int | None = None
     if not args.no_server:
         log_path = out_dir / "server.log"
         if args.backend == "vllm":
@@ -1949,6 +2178,16 @@ def main() -> None:
             else:
                 for x in ba.get("llama_extra", []) or []:
                     llama_extra.append(str(x))
+            # Per-model sampler (eval/models/<family>.yaml): min_p / repeat_penalty
+            # are server-LAUNCH flags for llama-server. Inject them from the
+            # (overlaid) generation block unless the template already carries the
+            # flag. Covers the lm-eval + multipl_e llama paths uniformly; the LCB
+            # shim additionally sends them per-request. No-op when no profile set.
+            _sgen = template.get("generation", {}) or {}
+            for _sk, _flag in (("min_p", "--min-p"),
+                               ("repeat_penalty", "--repeat-penalty")):
+                if _sk in _sgen and _flag not in llama_extra:
+                    llama_extra += [_flag, str(_sgen[_sk])]
             # Env override wins (LLAMA_EXTRA="--flag1 value1 --flag2 value2").
             env_extra = os.environ.get("LLAMA_EXTRA", "").strip()
             if env_extra:
@@ -2012,9 +2251,19 @@ def main() -> None:
                     ctx=ctx, parallel=parallel, extra=llama_extra,
                     served_name=served_name, request_timeout=rt)
             else:
+                # DCA-serve / custom-binary passthrough (T87.pD): a template can
+                # serve the opencoti DCA llamafile (server_bin + ["--server"]
+                # prefix) with the validated --dca recipe carried verbatim in
+                # llama_extra (llama_raw_serve=true → omk injects no opinionated
+                # serve defaults). Standard GGUF templates set none of these and
+                # behave exactly as before.
                 server = launch_llama(args.model, args.port, log_path,
                                       ctx=ctx, parallel=parallel,
-                                      extra=llama_extra, gpu_id=gpu_id)
+                                      extra=llama_extra, gpu_id=gpu_id,
+                                      server_bin=ba.get("server_bin"),
+                                      server_prefix=ba.get("server_prefix_args"),
+                                      raw_args=bool(ba.get("llama_raw_serve", False)))
+                serve_gpu_id = gpu_id
         try:
             wait_ready(server, served_name=served_name)
         except SystemExit:
@@ -2069,6 +2318,9 @@ def main() -> None:
             rc = dispatch_nolima(template, served_name, base_url, out_dir, tokenizer)
         elif template["backend"] == "ruler_native":
             rc = dispatch_ruler_native(template, served_name, base_url, out_dir, tokenizer)
+        elif template["backend"] == "mrcr":
+            rc = dispatch_mrcr(template, served_name, base_url, out_dir, tokenizer,
+                               vram_gpu=serve_gpu_id)
         else:
             fatal(10, f"unknown template backend: {template['backend']}")
     finally:
@@ -2136,11 +2388,27 @@ def main() -> None:
     else:
         smoke_failed = False
 
+    _sg = template.get("generation", {}) or {}
     summary = {
         "template": template["name"],
         "model": served_name,
         "quant": quant,
         "backend": args.backend,
+        # Resolved sampler (per-model profile overlay). "template_default" means
+        # no profile was applied → the template's frozen generation block (greedy
+        # anchor unless the template itself declares otherwise).
+        "sampler": {
+            **(template.get("_sampler_meta") or {
+                "profile": None, "name": "template_default", "source": "template_default"}),
+            "resolved": {
+                "temperature": _sg.get("temperature", 0.0),
+                "top_p": _sg.get("top_p", 1.0),
+                "top_k": _sg.get("top_k", 0),
+                "min_p": _sg.get("min_p"),
+                "repeat_penalty": _sg.get("repeat_penalty"),
+                "do_sample": _sg.get("do_sample", False),
+            },
+        },
         "rc": rc,
         "samples_file": str(samples),
         "score": score,

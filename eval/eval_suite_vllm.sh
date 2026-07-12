@@ -18,9 +18,10 @@
 #   --only    CSV of template names; runs only those.
 #   --skip    CSV of template names; skips those.
 #
-# Templates ordered for this suite (9 benches; FP-grouping reorders at runtime):
+# Templates ordered for this suite (10 benches; FP-grouping reorders at runtime):
 #   gpqa_diamond_full · gsm8k_100 · math500_100 · aime_30
 #   arc_challenge_full · ifeval_100 · humaneval_full · humanevalplus_full · lcb_medium_55
+#   lcb_v6_77q  (all-HARD 77 @ 2024+, ALWAYS 32k max gen; vLLM sizes max-model-len per-request)
 #
 # 2026-05-12: ifeval_full (541q, ~8.5h) swapped for ifeval_100 (stride-5 → 100q,
 # ~95min). LCB-55 added back as a fresh re-run.
@@ -97,6 +98,7 @@ TEMPLATES=(
     humaneval_full
     humanevalplus_full
     "$LCB_TPL"
+    lcb_v6_77q          # all-HARD 77 (2024+); template pins 32k max gen — discriminating hard-tier LCB
 )
 
 # selection filter

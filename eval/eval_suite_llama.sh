@@ -24,9 +24,10 @@
 #   --skip csv  Skip these templates.
 #   --port      llama-server port (default 8099). Pick non-default if 8099 is busy.
 #
-# Templates (9 benches, in-order):
+# Templates (10 benches, in-order):
 #   gpqa_diamond_full · gsm8k_100 · math500_100 · aime_30
 #   arc_challenge_full · ifeval_100 · humaneval_full · humanevalplus_full · lcb_medium_55_v4
+#   lcb_v6_77q  (all-HARD 77 @ 2024+, ALWAYS 256k ctx / 32k max gen — discriminating hard-tier LCB)
 #
 set -uo pipefail
 
@@ -37,6 +38,8 @@ LIMIT=0
 ONLY=""
 SKIP=""
 PORT=8099
+SAMPLER=""           # per-model sampler name (greedy|recommended|deployment); empty = frozen greedy templates
+SAMPLER_PROFILE=""   # eval/models/<family>.yaml | auto | path; empty = no overlay
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --variant) VARIANT="$2"; shift 2;;
@@ -45,6 +48,8 @@ while [[ $# -gt 0 ]]; do
         --only)    ONLY="$2"; shift 2;;
         --skip)    SKIP="$2"; shift 2;;
         --port)    PORT="$2"; shift 2;;
+        --sampler) SAMPLER="$2"; shift 2;;
+        --sampler-profile) SAMPLER_PROFILE="$2"; shift 2;;
         -h|--help) sed -n '2,32p' "$0"; exit 0;;
         *) echo "unknown arg: $1"; exit 2;;
     esac
@@ -54,14 +59,17 @@ done
 [[ -f "$GGUF"    ]] || { echo "ERR: $GGUF not found"; exit 2; }
 
 # ── paths / env ─────────────────────────────────────────────────────────
-WS=/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models
-OMK=/shared/dev/omnimergekit
-OMK_PY=/root/anaconda3/envs/omnimergekit/bin/python
+# Host-portable: OMK_WS / OMK_ROOT / OMK_TOKENIZER override the solidpc defaults
+# so the same canonical driver runs on a pod / bs2 (results + repo + tokenizer
+# at host-specific paths). Unset → solidpc defaults, byte-identical to before.
+WS="${OMK_WS:-/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models}"
+OMK="${OMK_ROOT:-/shared/dev/omnimergekit}"
+OMK_PY="${OMK_PY:-/root/anaconda3/envs/omnimergekit/bin/python}"
 # omk_eval respects LM_EVAL_BIN — the omnimergekit env ships lm-eval but its bin
 # isn't on root's default PATH, so spell it out absolutely.
-export LM_EVAL_BIN=/root/anaconda3/envs/omnimergekit/bin/lm-eval
+export LM_EVAL_BIN="${LM_EVAL_BIN:-/root/anaconda3/envs/omnimergekit/bin/lm-eval}"
 export PATH=/root/anaconda3/envs/omnimergekit/bin:$PATH
-TOKENIZER=$WS/google/gemma-4-26B-A4B-it
+TOKENIZER="${OMK_TOKENIZER:-$WS/google/gemma-4-26B-A4B-it}"
 SERVED_NAME="${VARIANT}_q6k"
 TS=$(date +%Y%m%d_%H%M%S)
 LOGS=$WS/logs
@@ -91,6 +99,7 @@ TEMPLATES=(
     humaneval_full
     humanevalplus_full
     "$LCB_TPL"
+    lcb_v6_77q          # all-HARD 77 (2024+); template pins 256k ctx / 32k max gen — discriminating hard-tier LCB
 )
 
 # selection filter
@@ -116,6 +125,7 @@ log "===== eval_suite_llama.sh ====="
 log "  variant:     $VARIANT  (served-name=$SERVED_NAME)"
 log "  gguf:        $GGUF ($(stat -c %s "$GGUF" | numfmt --to=iec))"
 log "  port:        $PORT"
+log "  sampler:     ${SAMPLER:-<none/greedy>}  profile=${SAMPLER_PROFILE:-<none>}"
 log "  limit:       $LIMIT (0=full)"
 log "  templates:   ${selected[*]}"
 log "  results:     $RESULTS_DIR"
@@ -183,6 +193,11 @@ for t in "${selected[@]}"; do
         --results-dir "$RESULTS_DIR"
     )
     [[ "$LIMIT" -gt 0 ]] && cmd+=(--limit "$LIMIT")
+    # Per-model sampler overlay (eval/models/<family>.yaml). With neither flag
+    # set this is a strict no-op and the frozen greedy templates are used
+    # byte-identically (EVAL_PROTOCOL.md §1.0).
+    [[ -n "$SAMPLER" ]]         && cmd+=(--sampler "$SAMPLER")
+    [[ -n "$SAMPLER_PROFILE" ]] && cmd+=(--sampler-profile "$SAMPLER_PROFILE")
     log "[$t] cmd: ${cmd[*]}"
     bench_log="$LOGS/eval_suite_llama_${VARIANT}_${t}_${TS}.log"
     bstart=$(date +%s)

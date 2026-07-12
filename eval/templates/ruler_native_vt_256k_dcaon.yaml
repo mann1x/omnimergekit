@@ -1,0 +1,56 @@
+# ruler_native_vt_256k_dcaon — RULER Variable Tracking @ 256k, DCA ON (chunk 8192 → 32 chunks).
+#
+# T87.pD-gen (#617) clean-base long-ctx A/B: the DCA-ON arm of the 256k RULER-VT pair
+# (mirror: ruler_native_vt_256k_dcaoff). Same opencoti DCA llamafile + DCA-serve passthrough as
+# mrcr_256k_dcaon; --dca on --dca-chunk-size 8192 added. Both arms share identical rope at
+# -c 262144 so the VT pass@1 delta isolates the DCA effect at 32-chunk depth on the clean 128e
+# base (set --model 128e-F16/Q6_K on the omk_eval CLI). Greedy, 50 VT samples.
+
+name: ruler_native_vt_256k_dcaon
+backend: ruler_native
+task: ruler
+n: 50
+
+selection:
+  type: filter
+  ruler_task: vt
+  ctx_tokens: 262144
+  num_samples: 50
+
+generation:
+  max_gen_toks: 120
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 3600.0
+
+scoring:
+  scorer: ruler_helpers
+  metric: pass_at_1
+  filter: null
+
+cache:
+  sqlite_prefix: ruler_vt_256k_dcaon
+
+backend_args:
+  model_template_type: base
+  tokenizer_type: hf
+  random_seed: 42
+  # DCA-serve passthrough (identical mechanism to mrcr_256k_dcaon): omk launches the opencoti
+  # DCA llamafile itself; this is the DCA-ON arm — --dca on --dca-chunk-size 8192 added.
+  server_bin: /srv/ml/opencoti-dca/bin/llamafile
+  server_prefix_args: ["--server"]
+  llama_raw_serve: true
+  llama_extra_replace: true
+  llama_extra: ["-ngl", "99", "-fa", "on", "--parallel", "1", "--no-warmup",
+                "--dca", "on", "--dca-chunk-size", "8192",
+                "--ctx-checkpoints", "0", "--checkpoint-every-n-tokens", "-1"]
+  llama_ctx: 262144
+  llama_ctx_max: 262144
+
+reports:
+  token_stats: true
+
+sanity:
+  min_p10_chars: 1

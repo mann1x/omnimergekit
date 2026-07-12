@@ -1,0 +1,56 @@
+# mrcr_768k_synth — SYNTHETIC 768k rung. NOT an OpenAI MRCR bin.
+#
+# OpenAI MRCR bins are powers of two (256k / 512k / 1024k); there is no 768k bin.
+# This rung sub-filters the 1M bin (524288, 1048576] to o200k token counts within
+# 768k ± 12.5% ([688128, 851968]) so the MRCR ladder lines up with the RULER-VT
+# ladder (which has a 768k rung). It is NOT directly comparable to any published
+# MRCR number — label it "synth" wherever it is reported. Fewer than 100 samples
+# exist in this sub-band; n=32 is comfortably available.
+# See mrcr_256k.yaml for serving/headroom/thinking notes.
+
+name: mrcr_768k_synth
+backend: mrcr
+task: mrcr
+n: 32
+
+selection:
+  type: filter
+  mrcr_bin: 768k_synth
+  needles: [2, 4, 8]
+  num_samples: 32
+  ctx_tokens: 851968
+
+generation:
+  max_gen_toks: 2048
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 3000.0
+
+scoring:
+  scorer: mrcr_helpers
+  metric: pass_at_1
+  filter: null
+
+cache:
+  sqlite_prefix: mrcr_768k_synth
+
+backend_args:
+  enable_thinking: false
+  num_concurrent: 2
+  random_seed: 42
+
+reports:
+  token_stats: true
+
+sanity:
+  min_p10_chars: 1
+
+backend_overrides:
+  vllm:
+    generation:
+      http_timeout: 3600.0
+  llama:
+    generation:
+      http_timeout: 3600.0

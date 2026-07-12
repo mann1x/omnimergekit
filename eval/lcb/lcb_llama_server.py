@@ -67,7 +67,8 @@ except Exception:
 def chat_complete(base_url: str, model: str, prompt: str, max_tokens: int,
                   timeout: float = 600.0,
                   thinking_budget: int | None = None,
-                  enable_thinking: bool | None = None) -> dict:
+                  enable_thinking: bool | None = None,
+                  sampler: dict | None = None) -> dict:
     """Returns dict {text, prompt_tokens, completion_tokens, finish_reason}.
 
     `finish_reason="length"` is the cap-hit fingerprint — that response was
@@ -85,25 +86,22 @@ def chat_complete(base_url: str, model: str, prompt: str, max_tokens: int,
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": float(os.environ.get("LCB_TEMPERATURE", "0.0")),
-        "top_p": float(os.environ.get("LCB_TOP_P", "1.0")),
+        # Default greedy (temp 0 / top_p 1). `sampler` — forwarded by the runner
+        # (dispatch_lcb) ONLY when a per-model sampling profile is active —
+        # overrides per key. vLLM + llama-server accept top_k/min_p/
+        # repeat_penalty as top-level extra SamplingParams (same contract as
+        # thinking_token_budget below). Greedy runs pass no sampler, so the
+        # payload is byte-identical to the historical hardcoded one.
+        "temperature": 0.0,
+        "top_p": 1.0,
         "max_tokens": max_tokens,
         "stream": False,
     }
-    # Optional deployment-sampler overrides (env-driven; default = canonical
-    # greedy, so unset env => byte-identical behavior). Used to run LCB under
-    # the served anti-loop sampler vendor_minp_rep (top_k 64 / min_p 0.05 /
-    # repeat_penalty 1.1 / top_p 0.95 / temp 0.9) — same top-level keys
-    # replay_harness forwards to llama-server.
-    _lcb_topk = os.environ.get("LCB_TOP_K")
-    if _lcb_topk:
-        payload["top_k"] = int(_lcb_topk)
-    _lcb_minp = os.environ.get("LCB_MIN_P")
-    if _lcb_minp:
-        payload["min_p"] = float(_lcb_minp)
-    _lcb_reppen = os.environ.get("LCB_REPEAT_PENALTY")
-    if _lcb_reppen:
-        payload["repeat_penalty"] = float(_lcb_reppen)
+    if sampler:
+        for _k in ("temperature", "top_p", "top_k", "min_p", "repeat_penalty"):
+            _v = sampler.get(_k)
+            if _v is not None:
+                payload[_k] = _v
     # vLLM /v1/chat/completions accepts extra SamplingParams as TOP-LEVEL
     # JSON fields (matching how the OpenAI Python SDK auto-forwards unknown
     # kwargs via extra_body — they end up at the JSON root). Match that
@@ -219,7 +217,27 @@ def main():
                          "reasoning trace can take ~760s. Was 600 (too "
                          "tight for the slow quant); now 900 default. "
                          "Set higher when seeing recurring ReadTimeouts.")
+    # Sampler overrides (per-model sampling profile). Default None → payload
+    # stays greedy (temp 0 / top_p 1, no top_k/min_p/repeat_penalty), preserving
+    # historical behavior. omk_eval's dispatch_lcb passes these ONLY when a
+    # profile is active, so a greedy LCB run is byte-identical to before.
+    ap.add_argument("--temperature", type=float, default=None,
+                    help="Sampler temperature (None → greedy 0.0).")
+    ap.add_argument("--top-p", type=float, default=None)
+    ap.add_argument("--top-k", type=int, default=None)
+    ap.add_argument("--min-p", type=float, default=None)
+    ap.add_argument("--repeat-penalty", type=float, default=None)
     args = ap.parse_args()
+
+    # Collapse the sampler flags into a dict of only the explicitly-set knobs;
+    # None means "leave the payload default" so greedy runs send no extra params.
+    sampler = {k: v for k, v in {
+        "temperature": args.temperature, "top_p": args.top_p,
+        "top_k": args.top_k, "min_p": args.min_p,
+        "repeat_penalty": args.repeat_penalty,
+    }.items() if v is not None} or None
+    if sampler:
+        print(f"[lcb] sampler override: {sampler}", flush=True)
 
     out_path = Path(args.output)
     cache_path = Path(args.samples_cache) if args.samples_cache else \
@@ -300,7 +318,8 @@ def main():
                                  args.max_tokens,
                                  timeout=args.http_timeout,
                                  thinking_budget=args.thinking_budget or None,
-                                 enable_thinking=et)
+                                 enable_thinking=et,
+                                 sampler=sampler)
             completion = resp["text"]
             prompt_tokens = resp["prompt_tokens"]
             completion_tokens = resp["completion_tokens"]

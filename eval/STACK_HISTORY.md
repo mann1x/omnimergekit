@@ -9,6 +9,57 @@ See [EVAL_PROTOCOL §v3.3](EVAL_PROTOCOL.md) for the update procedure.
 
 ---
 
+## gemma4-moe-stack@3 — 2026-06-18 (PROMOTED)
+
+**Status:** PROMOTED 2026-06-18 21:00 CEST. Adds a LOCKED `llama_cpp@b9700`
+component; no vLLM / lm-eval / modelopt change from @2 (those carry over
+unchanged).
+
+**What changed vs @2:**
+- llama.cpp promoted from an unpinned procedural `--version` check to a **locked
+  stack component at b9700** (`9724f664e803e70eb8d046a3fac411122ad42ff7`), built
+  per-arch: sm86 local `/opt/llama.cpp/build` (→ `/shared/dev/llama.cpp-b9700`),
+  sm120 bs2 `/mnt/sdc/ml/llama.cpp-b9700`. A llama.cpp bump flips ~1–3% of greedy
+  temp=0 problems via CUDA FP-rounding order, so the binary is now versioned like
+  vLLM. Supersedes the prior drift (local was b9660).
+- New per-model sampling-profile layer (`eval/models/gemma-4.yaml` +
+  `eval/sampler_profiles.py`, layered by `omk_eval.py`): greedy stays the
+  cross-cohort anchor and the no-flag default is a strict no-op; sampled cohorts
+  are selected only via `--sampler` / `--sampler-profile` and tagged in
+  `summary.json.sampler`. `bench_policy` default greedy; only
+  `gpqa_diamond_full → recommended` (vendor_base).
+
+**Adoption gate (both PASS on b9700):**
+- **Anti-loop:** soft2 imat-Q6 @ vendor_minp_rep = **0/48** looping seeds
+  (`agentic_loop/results/minp48_soft2_b9700.json`). The published anti-loop
+  story does not regress.
+- **Anchor:** 128e Q6_K greedy 9-bench within stack-bump tolerance — 7/9 within
+  ±3pp of the @2-era `128e_bart` anchor; GPQA −3.54 / AIME −10.0 are small-N
+  variance (GPQA-198 ≈7q, AIME-30 = 1 item). The LCB −9.1pp on the plain
+  template was a per-slot-ctx truncation artifact (`--parallel 8 × -c 32768` =
+  4096 tok/slot starving the 16384-tok request → 9/55 length-capped), **not**
+  binary drift: the budgeted `lcb_medium_55_v4` cell came back at **96.36%
+  (53/55), above the reference**.
+
+**128e Q6_K greedy vs vendor_base on b9700 (sets `bench_policy`; canonical
+`summary.json.score`):**
+
+| bench | greedy | vendor_base | Δ v−g | policy |
+|---|---:|---:|---:|---|
+| GPQA-198 | 69.19 | 72.73 | +3.54 | **recommended** |
+| GSM8K-100 | 94.00 | 86.00 | −8.00 | greedy |
+| MATH500-100 | 94.00 | 94.00 | 0 | greedy |
+| AIME-30 | 73.33 | 73.33 | 0 | greedy |
+| ARC-Challenge | 96.59 | 96.76 | +0.17 | greedy |
+| IFEval-100 | 97.00 | 96.00 | −1.00 | greedy |
+| HumanEval | 98.17 | 97.56 | −0.61 | greedy |
+| HumanEval+ | 91.46 | 92.68 | +1.22 | greedy |
+| LCB-55 (v4) | 96.36 | 94.55 | −1.81 | greedy |
+
+Result dirs: `partc_b9700/eval_results_llama_suite/128e_b9700_{greedy,vendorbase}/`.
+
+---
+
 ## gemma4-moe-stack@2 — 2026-05-21 (PROMOTED)
 
 **Status:** PROMOTED 2026-05-21 18:07 CEST. All structural rules PASS,
