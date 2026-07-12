@@ -20,18 +20,16 @@ import argparse
 import json
 import time
 
-import os
-import sys
-
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, "/srv/ml/repos/omnimergekit/scripts")
 from audit_full_bench import detect_loop  # noqa: E402
 
-A2 = os.environ.get("REDIST_STUDENT")
-BASE = os.environ.get("REDIST_TEACHER")
+A2 = "/mnt/sdc/ml/google/gemma-4-A4B-62e-fc15_25-p8-pes120-it"
+BASE = "/srv/ml/models/base/gemma-4-26B-A4B-it"
 
 
 def log(m):
@@ -40,25 +38,16 @@ def log(m):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--a2", default=A2, help="pruned student dir (or set REDIST_STUDENT)")
-    ap.add_argument("--base", default=BASE, help="128e teacher dir (or set REDIST_TEACHER)")
-    ap.add_argument("--keep-meta", default=os.environ.get("REDIST_KEEP_META"),
-                    help="a2 keep metadata json (or set REDIST_KEEP_META)")
-    ap.add_argument("--sample", default=os.environ.get("REDIST_SAMPLE"),
-                    help="loop-screen prompts jsonl (or set REDIST_SAMPLE)")
+    ap.add_argument("--a2", default=A2)
+    ap.add_argument("--base", default=BASE)
+    ap.add_argument("--keep-meta", default="/srv/ml/scripts/a2_keep_metadata.json")
+    ap.add_argument("--sample", default="/mnt/sdc/ml/corpora/loop_screen_sample.jsonl")
     ap.add_argument("--loop-bucket", default="multilingual",
                     help="bucket whose LOOP tokens to attribute (vs openended clean)")
     ap.add_argument("--per-bucket", type=int, default=30)
     ap.add_argument("--gen-tokens", type=int, default=1024)
-    ap.add_argument("--out", default="router_diff_bucket.json",
-                    help="output json (CWD-relative default)")
+    ap.add_argument("--out", default="/srv/ml/eval_results_tracks_2_3/t189_router_diff_multilingual.json")
     args = ap.parse_args()
-    for _v, _fl, _ev in [(args.a2, "--a2", "REDIST_STUDENT"),
-                         (args.base, "--base", "REDIST_TEACHER"),
-                         (args.keep_meta, "--keep-meta", "REDIST_KEEP_META"),
-                         (args.sample, "--sample", "REDIST_SAMPLE")]:
-        if not _v:
-            raise SystemExit(f"FAIL: {_fl} is required (or set {_ev})")
     LB = args.loop_bucket
 
     keep_meta = json.load(open(args.keep_meta))

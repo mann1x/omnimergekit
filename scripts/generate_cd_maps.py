@@ -57,16 +57,16 @@ META_SUFFIX = ".meta.json"
 CD_TIERS = {
     "CD-Q6_K":   ("Q8_0", "Q6_K", "Q5_K"),
     "CD-Q5_K_M": ("Q6_K", "Q5_K", "Q4_K"),
-    "CD-Q4_K_M": ("Q5_K", "Q4_K", "IQ3_S"),
-    "CD-Q3_K_L": ("Q4_K", "Q3_K", "IQ3_S"),
-    "CD-Q2_K":   ("Q3_K", "Q2_K", "IQ2_S"),
+    "CD-Q4_K_M": ("Q5_K", "Q4_K", "Q3_K"),  # was IQ3_S — ruminated on 98e MoE (smoke 2026-06-06)
+    "CD-Q3_K_L": ("Q4_K", "Q3_K", "Q3_K"),  # was IQ3_S — ruminated on 98e MoE
+    "CD-Q2_K":   ("Q3_K", "Q2_K", "Q2_K"),  # was IQ2_S — i-quant low ruminates
     # CD-IQ ladder (2026-05-19 T67): K-tier slots replaced with IQ codebook
     # equivalents. v5-coder T64 evidence: Q3_K_S 3.72 bpw → 75.00% HE+ but
     # IQ3_XS 3.55 bpw → 91.46%. K-quant fixed-block destroys ~16pp per
     # tier-slot on this MoE chassis; IQ codebook preserves it. CD-IQ aims
     # to recover the CD per-layer differentiation benefit *without* the
     # K-tier poison.
-    "CD-IQ4_K_M": ("IQ4_NL", "IQ4_XS", "IQ3_S"),   # ~10-11 GB target band
+    "CD-IQ4_K_M": ("IQ4_NL", "IQ4_XS", "Q3_K"),   # ~10-11 GB; low IQ3_S->Q3_K (ruminated)
     # ⚠ KNOWN-BROKEN on Gemma 4 MoE + the CURRENT llama.cpp --tensor-type-file
     # parser (bug-433): IQ3_M / IQ3_XS / IQ2_M are LLAMA_FTYPE file-mixes, not
     # valid per-tensor ggml_types, so parse_ggml_type rejects them as CD_TIERS
@@ -88,8 +88,6 @@ TOP_N, MID_N = 1, 7  # LOW_N = total - TOP_N - MID_N
 # attn_v.weight and attn_k.weight are NOT in this list because they need
 # special handling — see ATTN_VK_PROTECT below.
 BLOCK_TENSOR_ROLES = [
-    "attn_q.weight",
-    "attn_output.weight",
     "ffn_gate.weight",
     "ffn_up.weight",
     "ffn_down.weight",
@@ -219,6 +217,8 @@ def write_tensor_types_file(
         # ATTN_VK_PROTECT comment for why this is mandatory.
         lines.append(f"blk.{li}.attn_v.weight={attn_vk}")
         lines.append(f"blk.{li}.attn_k.weight={attn_vk}")
+        lines.append(f"blk.{li}.attn_q.weight={attn_vk}")
+        lines.append(f"blk.{li}.attn_output.weight={attn_vk}")
         # scale tensors mirror their parent
         lines.append(f"blk.{li}.ffn_down_exps.scale={q}")
         lines.append(f"blk.{li}.ffn_gate_inp.scale={q}")

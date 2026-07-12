@@ -40,6 +40,8 @@ backend_args:
   apply_chat_template: true
   num_fewshot: 0
   batch_size: 1
+  num_concurrent: 8
+  llama_parallel: 8
   vllm_reasoning_parser: gemma4
   vllm_default_chat_template_kwargs: {enable_thinking: true}
 cache:

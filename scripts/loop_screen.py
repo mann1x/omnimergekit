@@ -22,7 +22,6 @@ Run on bs2, one model per Blackwell (CUDA_VISIBLE_DEVICES-pinned), omk python.
 """
 import argparse
 import json
-import os
 import sys
 import time
 from collections import Counter
@@ -30,7 +29,7 @@ from collections import Counter
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, "/srv/ml/repos/omnimergekit/scripts")
 from audit_full_bench import detect_loop  # noqa: E402
 
 
@@ -41,15 +40,12 @@ def log(m):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
-    ap.add_argument("--sample", default=os.environ.get("REDIST_SAMPLE"),
-                    help="loop-screen prompts jsonl (or set REDIST_SAMPLE)")
+    ap.add_argument("--sample", default="/mnt/sdc/ml/corpora/loop_screen_sample.jsonl")
     ap.add_argument("--out", required=True, help="per-model result json")
     ap.add_argument("--name", default=None)
     ap.add_argument("--bs", type=int, default=16)
     ap.add_argument("--max-new", type=int, default=2048)
     args = ap.parse_args()
-    if not args.sample:
-        raise SystemExit("FAIL: --sample is required (or set REDIST_SAMPLE)")
     name = args.name or args.model.rstrip("/").split("/")[-1]
 
     rows = [json.loads(x) for x in open(args.sample)]

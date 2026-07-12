@@ -47,7 +47,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -58,17 +57,6 @@ from pathlib import Path
 # ─── env / paths ──────────────────────────────────────────────────────────────
 
 SCRIPTS_DIR_DEFAULT = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPTS_DIR_DEFAULT.parent
-
-# Cross-directory dep scripts that do NOT live next to this file in the repo.
-# Resolved host-independently by _resolve_dep() relative to REPO_ROOT; keep the
-# basenames stable. Co-located deps (loop_screen / router_diff_bucket /
-# redist_localize_divergence, all in scripts/) need no entry — probe step (2).
-_DEP_MAP = {
-    "expert_drop.py": "gemma4/expert_pruning/expert_drop.py",
-    "generate_drop_map_v5.py": "gemma4/expert_pruning/generate_drop_map_v5.py",
-    "router_shared_upweight.py": "recipes/gemma4/v5_moe_sweep/router_shared_upweight.py",
-}
 
 
 def _first_existing(*cands: str) -> str | None:
@@ -78,54 +66,24 @@ def _first_existing(*cands: str) -> str | None:
     return None
 
 
-def _resolve_dep(name: str, scripts_dir) -> Path:
-    """Locate a dep/sibling script host-independently. Probe order:
-      (1) operator override  <scripts_dir>/<name>
-      (2) co-located         <this file's dir>/<name>
-      (3) repo-relative      REPO_ROOT/_DEP_MAP[name]
-      (4) PATH               shutil.which(name)
-    Raise FileNotFoundError listing every probed path if none resolve."""
-    probed: list[Path] = []
-    for cand in (Path(scripts_dir) / name, SCRIPTS_DIR_DEFAULT / name):
-        probed.append(cand)
-        if cand.exists():
-            return cand
-    if name in _DEP_MAP:
-        cand = REPO_ROOT / _DEP_MAP[name]
-        probed.append(cand)
-        if cand.exists():
-            return cand
-    which = shutil.which(name)
-    if which:
-        return Path(which)
-    raise FileNotFoundError(
-        "dep script not found: " + name + "\n  probed:\n    "
-        + "\n    ".join(str(p) for p in probed)
-        + "\n    PATH (shutil.which)\n  fix: pass --scripts-dir, or place it under "
-        + "REPO_ROOT/" + _DEP_MAP.get(name, "<scripts>/" + name)
-    )
-
-
-# Persistent default workdir — NEVER /tmp (tmpfs). Env-var first, then known
-# hosts (harmless off-host auto-detect -> None), then CWD-relative.
-WORKDIR_DEFAULT = os.environ.get("REDIST_WORK") or _first_existing(
+# Persistent default workdir — NEVER /tmp (tmpfs). solidpc then bs2.
+WORKDIR_DEFAULT = _first_existing(
     "/srv/ml/redist_work",
     "/mnt/sdc/ml/redist_work",
-) or str(Path.cwd() / "redist_work")
+) or str(SCRIPTS_DIR_DEFAULT.parent / "redist_work")
 
-# 128e teacher + A2 student — env-var first, then per-host auto-detect (-> None
-# on a foreign host; validated at use via _req(), never at import).
-TEACHER_DEFAULT = os.environ.get("REDIST_TEACHER") or _first_existing(
+# 128e teacher + A2 student — resolved per host.
+TEACHER_DEFAULT = _first_existing(
     "/srv/ml/models/base/gemma-4-26B-A4B-it",
     "/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/google/gemma-4-26B-A4B-it",
 )
-STUDENT_DEFAULT = os.environ.get("REDIST_STUDENT") or _first_existing(
+STUDENT_DEFAULT = _first_existing(
     "/mnt/sdc/ml/google/gemma-4-A4B-62e-fc15_25-p8-pes120-it",
 )
-KEEPMETA_DEFAULT = os.environ.get("REDIST_KEEP_META") or _first_existing(
+KEEPMETA_DEFAULT = _first_existing(
     "/srv/ml/scripts/a2_keep_metadata.json",
 )
-SAMPLE_DEFAULT = os.environ.get("REDIST_SAMPLE") or _first_existing(
+SAMPLE_DEFAULT = _first_existing(
     "/mnt/sdc/ml/corpora/loop_screen_sample.jsonl",
 )
 
@@ -342,6 +300,8 @@ def _assign_dropped(mean_out, keep_ids, drop_ids):
 def _emit_merge(art: "Artifacts", src_dir: str, out_dir: str) -> None:
     """Write a recovered 62e: copy src (A2) aux files + non-expert tensors, overwrite
     the 62 survivor experts.{gate_up_proj,down_proj} with the merged weights."""
+    import os
+    import shutil
     from safetensors import safe_open
     from safetensors.torch import save_file
     os.makedirs(out_dir, exist_ok=True)
@@ -529,20 +489,10 @@ REGISTRY: dict[str, type[RedistMethod]] = {
 
 
 def _sibling(args, name: str) -> Path:
-    """Resolve a dep script host-independently (see _resolve_dep)."""
-    try:
-        return _resolve_dep(name, args.scripts_dir)
-    except FileNotFoundError as e:
-        raise SystemExit(f"FAIL: {e}")
-
-
-def _req(val, flag: str, env: str | None = None):
-    """Validate-at-use: a stage needs `val`; if it resolved to None (no CLI arg,
-    no env, no on-host auto-detect), fail loudly naming the flag + env override."""
-    if not val:
-        extra = f" (or set {env})" if env else ""
-        raise SystemExit(f"FAIL: {flag} is required{extra}")
-    return val
+    p = Path(args.scripts_dir) / name
+    if not p.exists():
+        raise SystemExit(f"FAIL: sibling script not found: {p} (set --scripts-dir)")
+    return p
 
 
 def _run(cmd: list[str], dry: bool) -> int:
@@ -570,13 +520,9 @@ def _workpath(args, *parts: str) -> Path:
 
 def do_localize(args) -> None:
     drv = _driver(args)
-    _req(args.teacher, "--teacher", "REDIST_TEACHER")
-    _req(args.student, "--student", "REDIST_STUDENT")
     out = _workpath(args, f"localize_{drv.name}.json")
     if drv.fail_mode == "loop":
         # loop-differential: reuse router_diff_bucket.py (teacher vs student dropped-mass).
-        _req(args.keep_meta, "--keep-meta", "REDIST_KEEP_META")
-        _req(args.sample, "--sample", "REDIST_SAMPLE")
         script = _sibling(args, "router_diff_bucket.py")
         cmd = [args.python, script,
                "--a2", args.student, "--base", args.teacher,
@@ -617,7 +563,6 @@ def do_capture(args) -> None:
             "each layer's .experts (input/routing/output) + .router (softmax-over-E)")
         return
 
-    _req(args.teacher, "--teacher", "REDIST_TEACHER")
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -739,7 +684,6 @@ def do_redistribute(args) -> None:
         log(f"would: load keep-meta+capture -> plan -> fit -> "
             f"{'emit recovered 62e to ' + args.emit if args.emit else 'save Artifacts .pt'}")
         return
-    _req(args.keep_meta, "--keep-meta", "REDIST_KEEP_META")
     keep_meta = load_keep_meta(args.keep_meta)
     localize = json.load(open(args.localize)) if args.localize else {}
     plan = method.plan(localize, keep_meta)
@@ -777,8 +721,6 @@ def do_gate(args) -> None:
     and read here; Phase 1 wires the numeric comparison.) Tier-2 (full 200-prompt
     loop_screen + capability bench) is invoked with --tier 2."""
     drv = _driver(args)
-    _req(args.model, "--model")
-    _req(args.sample, "--sample", "REDIST_SAMPLE")
     script = _sibling(args, "loop_screen.py")
     res = _workpath(args, f"gate_{drv.name}_{args.method}_tier{args.tier}.json")
     max_new = 2048
@@ -802,10 +744,8 @@ def do_build(args) -> None:
     screen. For methods that only edit survivor weights of the EXISTING A2 keep-set,
     the student dir is copied and overwritten in-place by emit."""
     method = REGISTRY[args.method]()
-    _req(args.output_dir, "--output-dir")
     log(f"build: method={method.name} -> {args.output_dir}")
     if args.drop_map:
-        _req(args.teacher, "--teacher", "REDIST_TEACHER")
         script = _sibling(args, "expert_drop.py")
         cmd = [args.python, script, "--source-dir", args.teacher,
                "--drop-map", args.drop_map, "--output-dir", args.output_dir]

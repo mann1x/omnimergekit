@@ -518,6 +518,30 @@ def kd_loss(t_logits, s_logits, attn_mask, tau: float, eps: float = 1e-6):
     return (tau * tau) * kl.sum() / n_x
 
 
+def eog_loss(s_logits, input_ids, attn_mask, eot_id: int, eps: float = 1e-6):
+    """End-of-generation preference term (T196.SFT, council recipe B).
+
+    The v7-98e prune broke TERMINATION, not repetition: on the agentic tool-call
+    path the model fails to emit <end_of_turn> and runs away (rep_penalty only
+    converts the verbatim loop into a non-repeating runaway, never restoring the
+    stop). This term upweights the student's stop-token log-prob at exactly the
+    positions where the gold NEXT token IS the terminator — i.e. where the
+    128e-clean teacher trajectory stops. Returns -mean(log p_S(eot)) over those
+    positions; gradients flow only to the trainable router params (everything
+    else frozen), nudging routing toward experts that restore stop-confidence.
+    Added as alpha * eog_loss to the forward-KL; alpha defaults to 0.0 (inert)."""
+    import torch.nn.functional as F
+    s = s_logits[:, :-1, :].float()                   # predict token t+1 from <=t
+    labels_next = input_ids[:, 1:]                     # (B, L-1) gold next token
+    m = attn_mask[:, 1:].float()                       # (B, L-1) real-target mask
+    sel = ((labels_next == eot_id).float() * m).reshape(-1) > 0
+    if sel.sum() == 0:
+        return s.sum() * 0.0                           # no terminator in batch
+    s = s.reshape(-1, s.shape[-1])[sel]                # (P_eog, V)
+    logp_eot = F.log_softmax(s, dim=-1)[:, eot_id]     # (P_eog,)
+    return -(logp_eot.sum() / (logp_eot.numel() + eps))
+
+
 # ─── generation canary (relative AR-mode signal before write-back) ────────────
 
 def run_canary(tok, model, canary_path: Path, max_new: int, tag: str,
@@ -661,6 +685,15 @@ def train(args) -> int:
 
     tok, teacher, student = load_models(args)
     trainable, names = select_router_params(student, args.train_tensors, args.train_layers)
+    eot_id = tok.convert_tokens_to_ids(args.eog_token)
+    if args.eog_alpha > 0:
+        if eot_id is None or eot_id < 0 or eot_id == tok.unk_token_id:
+            raise SystemExit(
+                f"FAIL: --eog-alpha>0 but --eog-token {args.eog_token!r} resolves to "
+                f"id {eot_id} (unk={tok.unk_token_id}) — not a real terminator. The "
+                "Gemma-4-omnimerge family uses '<turn|>' (id 106), not '<end_of_turn>'.")
+        print(f"[eog] term ON: alpha={args.eog_alpha} token={args.eog_token!r} "
+              f"id={eot_id}")
     if args.grad_checkpointing:
         student.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -703,6 +736,7 @@ def train(args) -> int:
     micro = 0
     step = 0
     running = 0.0
+    running_eog = 0.0
     t0 = time.time()
     for epoch in range(args.epochs):
         for input_ids, attn in build_batches(tok, args):
@@ -726,8 +760,16 @@ def train(args) -> int:
                                attention_mask=attn.to(student.device),
                                mm_token_type_ids=mm_zeros.to(student.device),
                                use_cache=False).logits
-            loss = kd_loss(t_logits.to(s_logits.device), s_logits, attn.to(s_logits.device),
-                           args.tau) / args.grad_accum
+            kdl = kd_loss(t_logits.to(s_logits.device), s_logits,
+                          attn.to(s_logits.device), args.tau)
+            if args.eog_alpha > 0:
+                egl = eog_loss(s_logits, input_ids.to(s_logits.device),
+                               attn.to(s_logits.device), eot_id)
+                loss_full = kdl + args.eog_alpha * egl
+                running_eog += float(egl.detach())
+            else:
+                loss_full = kdl
+            loss = loss_full / args.grad_accum
             loss.backward()
             running += loss.item() * args.grad_accum
             micro += 1
@@ -738,9 +780,12 @@ def train(args) -> int:
                 opt.zero_grad(set_to_none=True)
                 step += 1
                 avg = running / args.grad_accum
+                avg_eog = running_eog / args.grad_accum
                 running = 0.0
+                running_eog = 0.0
                 if step % args.log_every == 0 or step == 1:
-                    print(f"  step {step:5d} loss={avg:.5f} "
+                    eog_str = f" eog={avg_eog:.4f}" if args.eog_alpha > 0 else ""
+                    print(f"  step {step:5d} loss={avg:.5f}{eog_str} "
                           f"({(time.time()-t0)/step:.1f}s/step)", flush=True)
                 if args.save_every and step % args.save_every == 0:
                     save_ckpt(step)
@@ -800,6 +845,14 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--corpus-pad-c4", action="store_true",
                     help="after the domain corpus is exhausted, top up to "
                          "--max-samples with C4 (keeps the paper token regime)")
+    ap.add_argument("--eog-alpha", type=float, default=0.0,
+                    help="weight of the end-of-generation preference term "
+                         "(T196.SFT): L = L_KD + alpha * (-mean log p_S(eot)) at "
+                         "gold-next-token==eot positions. 0.0 = inert (default, "
+                         "backward-compatible with plain Router-KD). Sweep from 0.1.")
+    ap.add_argument("--eog-token", default="<end_of_turn>",
+                    help="terminator token whose stop-confidence the EOG term "
+                         "upweights (Gemma 4 turn terminator)")
     ap.add_argument("--grad-clip", type=float, default=1.0)
     ap.add_argument("--train-tensors",
                     choices=["all", "proj", "router", "experts",

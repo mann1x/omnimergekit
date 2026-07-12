@@ -18,6 +18,7 @@ LCB_INSTRUCT_TEMPLATE = (
 
 def load_lcb(limit: int, difficulty: str = "medium",
              min_date: str = "2024-10-01",
+             max_date: str | None = None,
              testtype: str = "functional",
              task_ids: list[str] | None = None) -> list[dict]:
     """Load LiveCodeBench problems filtered to function_call style.
@@ -68,11 +69,21 @@ def load_lcb(limit: int, difficulty: str = "medium",
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if row.get("difficulty") != difficulty:
-                    continue
                 contest_date = (row.get("contest_date") or "")[:10]
-                if contest_date and contest_date < min_date:
-                    continue
+                # task_ids mode: the curated list is the single source of truth
+                # — it already encodes difficulty + date window at BUILD time, so
+                # bypass the difficulty/date filters here. This lets a frozen
+                # subset mix difficulties (e.g. lcb_v6_55 = 44 medium + 11 hard).
+                # The structural filters below (functional testtype + class-based
+                # starter) STILL apply — the scorer requires them. No-op when
+                # task_ids is None (legacy filter-mode is byte-identical).
+                if task_ids is None:
+                    if row.get("difficulty") != difficulty:
+                        continue
+                    if contest_date and contest_date < min_date:
+                        continue
+                    if max_date and contest_date and contest_date >= max_date:
+                        continue
                 public_raw = row.get("public_test_cases", "[]")
                 if isinstance(public_raw, str):
                     try:
@@ -101,9 +112,9 @@ def load_lcb(limit: int, difficulty: str = "medium",
                     "contest_date": contest_date,
                     "public_tests": public,
                 })
-                if len(out) >= limit:
+                if task_ids is None and len(out) >= limit:
                     break
-        if len(out) >= limit:
+        if task_ids is None and len(out) >= limit:
             break
     if task_ids is not None:
         order = {t: i for i, t in enumerate(task_ids)}

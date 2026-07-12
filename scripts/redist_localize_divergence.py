@@ -27,15 +27,14 @@ omk python. Mirrors router_diff_bucket.py hook/IO style.
 """
 import argparse
 import json
-import os
 import time
 
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-A2 = os.environ.get("REDIST_STUDENT")
-BASE = os.environ.get("REDIST_TEACHER")
+A2 = "/mnt/sdc/ml/google/gemma-4-A4B-62e-fc15_25-p8-pes120-it"
+BASE = "/srv/ml/models/base/gemma-4-26B-A4B-it"
 
 
 def log(m):
@@ -51,10 +50,9 @@ def _load(path, device):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--student", default=A2, help="pruned student dir (or set REDIST_STUDENT)")
-    ap.add_argument("--teacher", default=BASE, help="128e teacher dir (or set REDIST_TEACHER)")
-    ap.add_argument("--keep-meta", default=os.environ.get("REDIST_KEEP_META"),
-                    help="a2 keep metadata json (or set REDIST_KEEP_META)")
+    ap.add_argument("--student", default=A2)
+    ap.add_argument("--teacher", default=BASE)
+    ap.add_argument("--keep-meta", default="/srv/ml/scripts/a2_keep_metadata.json")
     ap.add_argument("--corpus", required=True,
                     help="jsonl with {prompt} (or {prompt,bucket}); the driver capability")
     ap.add_argument("--per-n", type=int, default=40, help="num prompts to use")
@@ -63,14 +61,8 @@ def main():
                     help="fraction of highest-KL completion tokens treated as 'divergent'")
     ap.add_argument("--teacher-device", default="cuda:0")
     ap.add_argument("--student-device", default="cuda:1")
-    ap.add_argument("--out", default="localize_fluent.json",
-                    help="output json (CWD-relative default)")
+    ap.add_argument("--out", default="/srv/ml/redist_work/localize_fluent.json")
     args = ap.parse_args()
-    for _v, _fl, _ev in [(args.student, "--student", "REDIST_STUDENT"),
-                         (args.teacher, "--teacher", "REDIST_TEACHER"),
-                         (args.keep_meta, "--keep-meta", "REDIST_KEEP_META")]:
-        if not _v:
-            raise SystemExit(f"FAIL: {_fl} is required (or set {_ev})")
 
     keep_meta = json.load(open(args.keep_meta))
     per_layer_keep = {int(k): sorted(v) for k, v in keep_meta["per_layer_keep"].items()}

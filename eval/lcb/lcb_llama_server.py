@@ -85,11 +85,25 @@ def chat_complete(base_url: str, model: str, prompt: str, max_tokens: int,
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.0,
-        "top_p": 1.0,
+        "temperature": float(os.environ.get("LCB_TEMPERATURE", "0.0")),
+        "top_p": float(os.environ.get("LCB_TOP_P", "1.0")),
         "max_tokens": max_tokens,
         "stream": False,
     }
+    # Optional deployment-sampler overrides (env-driven; default = canonical
+    # greedy, so unset env => byte-identical behavior). Used to run LCB under
+    # the served anti-loop sampler vendor_minp_rep (top_k 64 / min_p 0.05 /
+    # repeat_penalty 1.1 / top_p 0.95 / temp 0.9) — same top-level keys
+    # replay_harness forwards to llama-server.
+    _lcb_topk = os.environ.get("LCB_TOP_K")
+    if _lcb_topk:
+        payload["top_k"] = int(_lcb_topk)
+    _lcb_minp = os.environ.get("LCB_MIN_P")
+    if _lcb_minp:
+        payload["min_p"] = float(_lcb_minp)
+    _lcb_reppen = os.environ.get("LCB_REPEAT_PENALTY")
+    if _lcb_reppen:
+        payload["repeat_penalty"] = float(_lcb_reppen)
     # vLLM /v1/chat/completions accepts extra SamplingParams as TOP-LEVEL
     # JSON fields (matching how the OpenAI Python SDK auto-forwards unknown
     # kwargs via extra_body — they end up at the JSON root). Match that

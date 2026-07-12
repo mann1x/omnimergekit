@@ -625,6 +625,36 @@ def wait_ready(server: ServerHandle, served_name: str = "",
 # ── Eval dispatch ─────────────────────────────────────────────────────────
 
 
+def _resolve_hf_tokenizer(tokenizer: str) -> str:
+    """Guard the GGUF-as-tokenizer footgun. lm-eval's `tokenizer_backend=
+    huggingface` needs a real HF tokenizer (a dir with tokenizer.json /
+    tokenizer_config.json, or a hub id). When `--tokenizer` is omitted, main()
+    defaults it to `--model`; if `--model` is a `.gguf`, lm-eval calls
+    `AutoTokenizer.from_pretrained(<binary>)` and dies ~97s in at construction
+    ("not a valid JSON file") - AFTER the server booted, leaving a
+    0-sample / score=null result. Fail fast here (sub-second, pre-construction)
+    with an actionable message, and auto-resolve to a sibling HF dir when one
+    sits next to the .gguf."""
+    p = Path(tokenizer)
+    if p.is_dir() and ((p / "tokenizer.json").is_file()
+                       or (p / "tokenizer_config.json").is_file()):
+        return tokenizer
+    if p.suffix == ".gguf" or p.is_file():
+        sib = p.parent
+        if (sib / "tokenizer.json").is_file() or (sib / "tokenizer_config.json").is_file():
+            log(f"tokenizer: --tokenizer pointed at a GGUF/file ({p.name}); "
+                f"auto-resolved to sibling HF tokenizer dir {sib}")
+            return str(sib)
+        fatal(21,
+              f"this template needs an HF tokenizer but --tokenizer resolved to a "
+              f"GGUF/file ({tokenizer}). lm-eval cannot load a tokenizer from a .gguf "
+              f"and would crash ~97s in at construction. Pass --tokenizer <HF model "
+              f"dir or hub id> (e.g. the bf16 source dir, or google/gemma-4-26B-A4B-it). "
+              f"Failing now instead of after server boot.")
+    # Not a local path -> assume a HF hub id (org/name); lm-eval validates it.
+    return tokenizer
+
+
 def dispatch_lm_eval(template: dict, model_tag: str, base_url: str,
                      out_dir: Path, tokenizer: str,
                      limit: int | None = None) -> int:
@@ -642,6 +672,9 @@ def dispatch_lm_eval(template: dict, model_tag: str, base_url: str,
     the server level (via `backend_args.vllm_chat_template` +
     `backend_args.vllm_reasoning_parser`), so no per-request
     `chat_template_kwargs` plumbing is required."""
+    # Durable guard: feeds `tokenizer` to lm-eval HF backend; a GGUF
+    # --model defaulted as tokenizer crashes ~97s in. Auto-resolve or fail fast.
+    tokenizer = _resolve_hf_tokenizer(tokenizer)
     cache_dir = out_dir / "sqlite_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_prefix = template["cache"]["sqlite_prefix"]
@@ -990,6 +1023,13 @@ def dispatch_multipl(template: dict, model_tag: str, base_url: str,
                 "--model-name", model_tag,
                 "--out-dir", str(gen_dir),
                 "--max-tokens", str(max_tokens),
+                # Sampler from generation.* — defaults greedy (0.0/1.0/0) so
+                # frozen canonical MPE templates are byte-identical; shadow
+                # templates carry the gemma vendor sampler. min_p/repeat_penalty
+                # stay server-launch flags (generator never sends them).
+                "--temperature", str(g.get("temperature", 0.0)),
+                "--top-p", str(g.get("top_p", 1.0)),
+                "--top-k", str(g.get("top_k", 0)),
                 "--limit", str(0 if problems_map else (n if n > 0 else 0)),
                 "--concurrency", str(concurrency),
                 "--cache-db", str(cache_db),

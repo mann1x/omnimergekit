@@ -76,8 +76,10 @@ def already_generated(out_path: Path) -> bool:
 
 def make_request(base_url: str, prompt: str, stop: list[str], max_tokens: int,
                  model_name: str, timeout: int = 600,
-                 max_retries: int = 6) -> str:
-    """Greedy completion with retry on 5xx/transient errors. Returns generated
+                 max_retries: int = 6,
+                 temperature: float = 0.0, top_p: float = 1.0,
+                 top_k: int = 0) -> str:
+    """Completion (defaults greedy) with retry on 5xx/transient errors. Returns
     text only. Exponential backoff (4/8/16/32/64/128 s) on HTTP 5xx,
     ConnectionError, Timeout, or malformed/empty JSON. A clean 4xx raises
     immediately. Server errors are NEVER silently dropped."""
@@ -85,9 +87,9 @@ def make_request(base_url: str, prompt: str, stop: list[str], max_tokens: int,
         "model": model_name,
         "prompt": prompt,
         "max_tokens": max_tokens,
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "top_k": 0,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
         "stop": stop,
         "stream": False,
     }
@@ -172,9 +174,11 @@ def chat_to_body(prompt: str, code: str, stop_tokens: list[str]) -> str:
 
 def make_chat_request(chat_url: str, prompt: str, lang: str, max_tokens: int,
                       model_name: str, timeout: int = 600,
-                      max_retries: int = 6) -> str:
-    """Greedy chat completion. Returns the assistant content (code extracted by
-    the caller). Same retry/backoff policy as make_request."""
+                      max_retries: int = 6,
+                      temperature: float = 0.0, top_p: float = 1.0,
+                      top_k: int = 0) -> str:
+    """Chat completion (defaults greedy). Returns the assistant content (code
+    extracted by the caller). Same retry/backoff policy as make_request."""
     instruction = (
         f"Complete the following {lang} function. Reply with ONLY the complete "
         f"function implementation in a single Markdown code block — include the "
@@ -185,9 +189,9 @@ def make_chat_request(chat_url: str, prompt: str, lang: str, max_tokens: int,
         "model": model_name,
         "messages": [{"role": "user", "content": instruction}],
         "max_tokens": max_tokens,
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "top_k": 0,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
         "stream": False,
     }
     last_err = None
@@ -260,12 +264,15 @@ def gen_one(args, doc, out_dir: Path, scache, lock) -> tuple[str, str, float, in
     if args.mode == "chat":
         chat_url = args.base_url.replace("/v1/completions", "/v1/chat/completions")
         raw = make_chat_request(chat_url, prompt, args.lang,
-                                args.max_tokens, args.model_name)
+                                args.max_tokens, args.model_name,
+                                temperature=args.temperature, top_p=args.top_p,
+                                top_k=args.top_k)
         completion = chat_to_body(prompt, extract_code_block(raw), stop)
     else:
         completion = make_request(
             args.base_url, prompt, stop[:4],  # /v1/completions caps stop at 4
-            args.max_tokens, args.model_name)
+            args.max_tokens, args.model_name,
+            temperature=args.temperature, top_p=args.top_p, top_k=args.top_k)
     elapsed = time.time() - t0
 
     _write_problem_json(out_path, name, doc["language"], prompt, completion, tests, stop)
@@ -289,6 +296,12 @@ def main():
                          "/v1/chat/completions + chat template + code extraction "
                          "(required for reasoning/instruct models like Gemma-4)")
     ap.add_argument("--max-tokens", type=int, default=1024)
+    ap.add_argument("--temperature", type=float, default=0.0,
+                    help="Sampling temperature (0 = greedy; default greedy for "
+                         "frozen canonical MPE). Shadow templates set the gemma "
+                         "vendor sampler via omk_eval --metadata generation.*")
+    ap.add_argument("--top-p", type=float, default=1.0)
+    ap.add_argument("--top-k", type=int, default=0)
     ap.add_argument("--limit", type=int, default=0,
                     help="First N problems (0 = full split)")
     ap.add_argument("--problems", default="",

@@ -29,7 +29,7 @@ import torch
 from transformers import AutoConfig
 from transformers.models.gemma4.modeling_gemma4 import Gemma4TextExperts, Gemma4TextRouter
 
-A2 = os.environ.get("REDIST_STUDENT")
+A2 = "/mnt/sdc/ml/google/gemma-4-A4B-62e-fc15_25-p8-pes120-it"
 _P = "model.language_model.layers.%d.%s"
 
 
@@ -73,7 +73,7 @@ def divergence(student_out, teacher_out):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--student", default=A2, help="pruned student dir (or set REDIST_STUDENT)")
+    ap.add_argument("--student", default=A2)
     ap.add_argument("--capture", required=True, help="capture .pt WITH router_in tap (method=expert_kd)")
     ap.add_argument("--layers", default="5,12,18,25")
     ap.add_argument("--steps", type=int, default=400)
@@ -85,11 +85,8 @@ def main():
     ap.add_argument("--pass-thresh", type=float, default=30.0,
                     help="mean held-out relMSE drop %% above which rank is 'absorbable'")
     ap.add_argument("--device", default="cuda:0")
-    ap.add_argument("--out", default="rankprobe.json",
-                    help="output json (CWD-relative default)")
+    ap.add_argument("--out", default="/srv/ml/redist_work/rankprobe.json")
     args = ap.parse_args()
-    if not args.student:
-        raise SystemExit("FAIL: --student is required (or set REDIST_STUDENT)")
 
     cfg = AutoConfig.from_pretrained(args.student).text_config
     assert cfg.num_experts == 62, cfg.num_experts
