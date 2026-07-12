@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""Generate CD tensor-type maps from an imatrix.dat file.
+
+The imatrix contains per-tensor activation statistics (in_sum2/counts) computed
+during llama-imatrix calibration. This is the cleanest signal for layer importance
+because it:
+  1) comes from the target model itself (not a different teacher)
+  2) uses the exact calibration data used for quantization
+  3) uses llama.cpp's fp32 reduction (no bf16 NaN bug)
+
+Layer importance = sum over all tensors in the layer of (in_sum2/counts).
+Ranking: top 1 → highest tier, next 7 → target tier, remaining 22 → lowest tier.
+
+CD tier table:
+  CD-Q6_K:    top=Q8_0,  mid=Q6_K,  low=Q5_K
+  CD-Q5_K_M:  top=Q6_K,  mid=Q5_K,  low=Q4_K
+  CD-Q4_K_M:  top=Q5_K,  mid=Q4_K,  low=Q3_K
+  CD-Q3_K_L:  top=Q4_K,  mid=Q3_K,  low=IQ3_S  (Q8_0 globals — see line 207)
+  CD-Q2_K:    top=Q3_K,  mid=Q2_K,  low=IQ2_S
+
+Output: one tensor_types_CD-<LEVEL>.txt per CD level, written to --out-dir.
+"""
+import argparse
+import datetime
+import hashlib
+import json
+import re
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+
+def sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# Provenance is stored in a SIDECAR `<map>.meta.json` next to each tensor-type
+# file — NOT inside the .txt itself. llama-quantize's --tensor-type-file parser
+# has no comment syntax (chokes on `#` with "malformed tensor type"), so the
+# .txt must stay clean key=value lines. quantize_gguf.py Step 2b reads the
+# .meta.json to detect stale maps (cross-model pollution: a 109e map left in
+# the script dir picked up by a v5-coder build would give wrong importance).
+META_SUFFIX = ".meta.json"
+
+# Tier definitions — (top_1, mid_7, low_22)
+#
+# CD-Q4_K_M LOW slot uses IQ3_S (not Q3_K). The original rationale was that
+# overrides bypass the attn_v/k heuristic; that's still true, but the fix
+# now lives in ATTN_VK_PROTECT below (explicit per-tier bump). IQ3_S is
+# kept at LOW because the imatrix-weighted lookup codebook on FFN tensors
+# at 3-bit is markedly better than raw Q3_K — verified by T64 IQ3_XXS
+# (3.44 bpw) scoring 89% HE+ vs plain Q3_K_M (4.04 bpw) at 84%.
+CD_TIERS = {
+    "CD-Q6_K":   ("Q8_0", "Q6_K", "Q5_K"),
+    "CD-Q5_K_M": ("Q6_K", "Q5_K", "Q4_K"),
+    "CD-Q4_K_M": ("Q5_K", "Q4_K", "IQ3_S"),
+    "CD-Q3_K_L": ("Q4_K", "Q3_K", "IQ3_S"),
+    "CD-Q2_K":   ("Q3_K", "Q2_K", "IQ2_S"),
+    # CD-IQ ladder (2026-05-19 T67): K-tier slots replaced with IQ codebook
+    # equivalents. v5-coder T64 evidence: Q3_K_S 3.72 bpw → 75.00% HE+ but
+    # IQ3_XS 3.55 bpw → 91.46%. K-quant fixed-block destroys ~16pp per
+    # tier-slot on this MoE chassis; IQ codebook preserves it. CD-IQ aims
+    # to recover the CD per-layer differentiation benefit *without* the
+    # K-tier poison.
+    "CD-IQ4_K_M": ("IQ4_NL", "IQ4_XS", "IQ3_S"),   # ~10-11 GB target band
+    # ⚠ KNOWN-BROKEN on Gemma 4 MoE + the CURRENT llama.cpp --tensor-type-file
+    # parser (bug-433): IQ3_M / IQ3_XS / IQ2_M are LLAMA_FTYPE file-mixes, not
+    # valid per-tensor ggml_types, so parse_ggml_type rejects them as CD_TIERS
+    # slots. RETAINED opt-in ONLY (OPT_IN_QUANTS) — never in a default sweep.
+    # Preserved as a research artifact: may become viable via (a) a future
+    # llama.cpp parser that accepts these names per-tensor, (b) redefinition
+    # with valid per-tensor types, or (c) another architecture's quant path.
+    # TEST CAREFULLY before any real use. For a WORKING sub-10 GB CD tier today,
+    # use the *_h / *_L mix families in generate_cd_maps_mix.py (file-base FTYPE
+    # + body-only override; v5-coder shipped CD-IQ3_XS_h / CD-IQ3_XS_L).
+    "CD-IQ3_K_M": ("IQ4_XS", "IQ3_M",  "IQ3_S"),   # opt-in only — see warning above
+    "CD-IQ2_K":   ("IQ3_M",  "IQ3_XS", "IQ2_M"),   # opt-in only — see warning above
+}
+
+# How many layers in each tier (fixed for Gemma 4 26B-A4B: 30 layers)
+TOP_N, MID_N = 1, 7  # LOW_N = total - TOP_N - MID_N
+
+# Per-layer tensor roles that we explicitly tier through the .txt file.
+# attn_v.weight and attn_k.weight are NOT in this list because they need
+# special handling — see ATTN_VK_PROTECT below.
+BLOCK_TENSOR_ROLES = [
+    "ffn_gate.weight",
+    "ffn_up.weight",
+    "ffn_down.weight",
+    "ffn_gate_inp.weight",
+    "ffn_gate_up_exps.weight",
+    "ffn_down_exps.weight",
+]
+
+# Explicit per-tier protection for attn_v.weight and attn_k.weight. These
+# mirror llama-quantize's documented safety heuristics in llama-quant.cpp
+# (attn_v.weight always bumped, attn_k.weight bumped when n_gqa >= 4).
+#
+# 2026-05-19 v5-coder CD-Q4_K_M canary RCA (pod 37020050): the previous
+# strategy of OMITTING these tensors from the override file (relying on the
+# heuristic to fire) only partially worked on the current llama-quantize
+# build — attn_v.weight got bumped on ~half the layers via an internal
+# i_attn_v counter, and attn_k.weight was NOT bumped at any layer despite
+# n_gqa=8. Result: HE+ collapsed to 73-74% with massive rumination.
+#
+# Fix: emit attn_v.weight and attn_k.weight EXPLICITLY in the .txt for every
+# layer at the per-tier baseline below. The values match the heuristic that
+# plain Q*_K_M tiers actually receive, so CD-Q4_K_M attn_v/k at Q5_K matches
+# what plain Q4_K_M produces, etc.
+ATTN_VK_PROTECT = {
+    "CD-Q6_K":    "Q8_0",   # plain Q6_K   heuristic baseline
+    "CD-Q5_K_M":  "Q6_K",   # plain Q5_K_M heuristic baseline
+    "CD-Q4_K_M":  "Q5_K",   # plain Q4_K_M heuristic baseline
+    "CD-Q3_K_L":  "Q5_K",   # plain Q3_K_L (= Q3_K_M body + Q8_0 globals) baseline
+    "CD-Q2_K":    "Q4_K",   # plain Q2_K   heuristic baseline
+    # CD-IQ ladder keeps Q5_K attn protection (T61b proven baseline).
+    # Single-variable test: ONLY body slots change K → IQ; attn stays at
+    # Q5_K so any score delta is attributable to the body swap.
+    "CD-IQ4_K_M": "Q5_K",
+    # CD-IQ3_K_M / CD-IQ2_K: opt-in only, known-broken on Gemma 4 MoE (bug-433).
+    "CD-IQ3_K_M": "Q5_K",
+    "CD-IQ2_K":   "Q5_K",
+}
+
+
+def load_imatrix_importance(imatrix_path: Path) -> tuple[dict[int, float], int]:
+    """Load imatrix.dat and return (per-layer importance dict, num_layers)."""
+    sys.path.insert(0, "/opt/llama.cpp/gguf-py")
+    from gguf import GGUFReader
+
+    reader = GGUFReader(str(imatrix_path))
+
+    # Dense tensors: in_sum2 shape [N], counts shape [1].
+    # MoE expert tensors (newer llama.cpp imatrix): in_sum2 shape
+    # [n_experts, N], counts shape [n_experts, 1] (one activation count per
+    # expert, top-k routing). float(t.data[0]) only worked for the [1] case;
+    # on [n_experts, 1] it raised "only 0-dimensional arrays can be converted
+    # to Python scalars" under numpy 2.x. Sum the whole tensor in both cases:
+    # importance = total in_sum2 / total counts, dimensionally consistent and
+    # shape-agnostic ([1]->scalar, [98,1]->sum over experts).
+    in_sum2 = {}
+    counts = {}
+    for t in reader.tensors:
+        name = t.name
+        if name.endswith(".in_sum2"):
+            base = name[: -len(".in_sum2")]
+            # Sum of squared activations (proxy for L2 magnitude)
+            data = t.data
+            in_sum2[base] = float(data.sum())
+        elif name.endswith(".counts"):
+            base = name[: -len(".counts")]
+            counts[base] = float(t.data.sum())
+
+    # Per-layer aggregate
+    layer_re = re.compile(r"^blk\.(\d+)\.")
+    per_layer = defaultdict(float)
+    max_layer = -1
+    for base, s2 in in_sum2.items():
+        c = counts.get(base, 1.0)
+        if c <= 0:
+            continue
+        # Normalize by counts to get mean squared activation
+        importance = s2 / c
+        m = layer_re.match(base)
+        if m:
+            li = int(m.group(1))
+            per_layer[li] += importance
+            max_layer = max(max_layer, li)
+
+    num_layers = max_layer + 1
+    return dict(per_layer), num_layers
+
+
+def rank_layers(per_layer: dict[int, float], num_layers: int) -> list[int]:
+    """Return layers sorted by importance descending."""
+    scores = [(li, per_layer.get(li, 0.0)) for li in range(num_layers)]
+    scores.sort(key=lambda x: x[1], reverse=True)
+    return [li for li, _ in scores]
+
+
+def assign_tiers(ranking: list[int]) -> dict[int, str]:
+    """Return {layer_idx: tier_name} where tier ∈ {'top', 'mid', 'low'}."""
+    out = {}
+    for rank, li in enumerate(ranking):
+        if rank < TOP_N:
+            out[li] = "top"
+        elif rank < TOP_N + MID_N:
+            out[li] = "mid"
+        else:
+            out[li] = "low"
+    return out
+
+
+def write_tensor_types_file(
+    cd_name: str, tiers: dict[int, str], num_layers: int, out_dir: Path,
+    imatrix_sha: str = "",
+    importance_source: str = "imatrix",
+    importance_file_sha: str | None = None,
+    importance_file_name: str | None = None,
+):
+    top, mid, low = CD_TIERS[cd_name]
+    tier_quant = {"top": top, "mid": mid, "low": low}
+    attn_vk = ATTN_VK_PROTECT[cd_name]
+    out_path = out_dir / f"tensor_types_{cd_name}.txt"
+    lines = []
+    # Block tensors per layer — clean key=value, no comments (llama-quantize
+    # has no comment syntax; provenance goes in the .meta.json sidecar below).
+    for li in range(num_layers):
+        q = tier_quant[tiers[li]]
+        for role in BLOCK_TENSOR_ROLES:
+            lines.append(f"blk.{li}.{role}={q}")
+        # Explicit attn_v / attn_k protection — every layer, every tier. See
+        # ATTN_VK_PROTECT comment for why this is mandatory.
+        lines.append(f"blk.{li}.attn_v.weight={attn_vk}")
+        lines.append(f"blk.{li}.attn_k.weight={attn_vk}")
+        lines.append(f"blk.{li}.attn_q.weight={attn_vk}")
+        lines.append(f"blk.{li}.attn_output.weight={attn_vk}")
+        # scale tensors mirror their parent
+        lines.append(f"blk.{li}.ffn_down_exps.scale={q}")
+        lines.append(f"blk.{li}.ffn_gate_inp.scale={q}")
+    # Global: token_embd + output always at Q8_0 (follows existing convention)
+    lines.append("token_embd.weight=q8_0")
+    lines.append("output.weight=q8_0")
+    out_path.write_text("\n".join(lines) + "\n")
+    # Provenance sidecar (read by quantize_gguf.py Step 2b to detect stale
+    # maps — cross-model pollution from either a different imatrix OR a
+    # different layer-importance file).
+    if imatrix_sha:
+        ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+        meta_path = out_path.with_name(out_path.name + META_SUFFIX)
+        meta_path.write_text(json.dumps({
+            "generated_from_imatrix_sha256": imatrix_sha,
+            "importance_source": importance_source,
+            "importance_file_sha256": importance_file_sha,
+            "importance_file_name": importance_file_name,
+            "generated_at": ts,
+            "tier_profile": cd_name,
+            "tiers": {"top": top, "mid": mid, "low": low},
+            "num_layers": num_layers,
+        }, indent=2) + "\n")
+    return out_path
+
+
+def load_layer_importance_file(path: Path) -> dict[int, float]:
+    """Load per-layer importance from a JSON file. Two shapes accepted:
+
+      1. Flat dict:        {"0": 514.4, "1": 350.3, ...}
+      2. C6-style wrapper: {"top98_mean_per_layer": {"0": 514.4, ...}, ...}
+         (also accepts "floor_per_layer" if no top98_mean — useful when
+         only the floor map is available)
+
+    Returns {layer_idx: score}. Keys are coerced to int."""
+    data = json.loads(path.read_text())
+    if isinstance(data, dict) and "top98_mean_per_layer" in data:
+        raw = data["top98_mean_per_layer"]
+    elif isinstance(data, dict) and "floor_per_layer" in data and not any(
+        isinstance(v, (int, float)) for v in data.values()
+    ):
+        # Fallback when only floor_per_layer is present (less precise — floors
+        # are clipped to [75, 95] so ranking ties are common)
+        raw = data["floor_per_layer"]
+        print(f"  NOTE: using floor_per_layer from {path.name} (less precise "
+              f"than top98_mean_per_layer)", file=sys.stderr)
+    elif isinstance(data, dict) and all(
+        isinstance(v, (int, float)) for v in data.values()
+    ):
+        raw = data
+    else:
+        raise ValueError(
+            f"{path}: unrecognized layer-importance JSON shape. Expected "
+            f"flat {{layer_idx: score}} or wrapper with "
+            f"'top98_mean_per_layer' / 'floor_per_layer' key."
+        )
+    return {int(k): float(v) for k, v in raw.items()}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--imatrix", required=True,
+                    help="Path to imatrix.dat (always required — low-tier IQ*/Q2_K "
+                         "block layouts need it at quantize time, even when layer "
+                         "importance comes from --layer-importance)")
+    ap.add_argument("--layer-importance",
+                    help="Optional JSON file with per-layer importance scores. "
+                         "When given, OVERRIDES the imatrix-derived layer ranking. "
+                         "Use this when a model-aware signal (e.g. expert-set "
+                         "relevance from a pruning study) is more meaningful than "
+                         "raw activation magnitude. Accepts flat {layer: score} or "
+                         "the v4_layer_floor_map.json shape with 'top98_mean_per_layer'.")
+    ap.add_argument("--out-dir", default=".", help="Output directory for tensor_types_*.txt")
+    ap.add_argument("--dry-run", action="store_true", help="Only print ranking, no files")
+    args = ap.parse_args()
+
+    imatrix_path = Path(args.imatrix)
+    if not imatrix_path.exists():
+        print(f"ERROR: {imatrix_path} not found", file=sys.stderr)
+        sys.exit(1)
+
+    # Always load imatrix — quantize_one() needs it for IQ*/Q2_K block layouts
+    # regardless of where the layer ranking comes from.
+    imatrix_per_layer, num_layers = load_imatrix_importance(imatrix_path)
+    if num_layers == 0:
+        print("ERROR: no block-level tensors found in imatrix", file=sys.stderr)
+        sys.exit(1)
+
+    # Choose the ranking source
+    importance_file_sha = None
+    if args.layer_importance:
+        lif_path = Path(args.layer_importance)
+        if not lif_path.exists():
+            print(f"ERROR: --layer-importance file {lif_path} not found", file=sys.stderr)
+            sys.exit(1)
+        per_layer = load_layer_importance_file(lif_path)
+        importance_file_sha = sha256_of(lif_path)
+        importance_source = "layer-importance-file"
+        # Cross-check shape against imatrix
+        if max(per_layer) >= num_layers:
+            print(f"  WARNING: --layer-importance has layer index "
+                  f"{max(per_layer)} but imatrix shows num_layers={num_layers}", file=sys.stderr)
+        print(f"=== Per-layer importance from {lif_path.name} "
+              f"(sha256={importance_file_sha[:12]}, imatrix kept for IQ/Q2 blocks) ===")
+    else:
+        per_layer = imatrix_per_layer
+        importance_source = "imatrix"
+        print(f"=== Per-layer importance from imatrix (num_layers={num_layers}) ===")
+
+    ranking = rank_layers(per_layer, num_layers)
+    tiers = assign_tiers(ranking)
+
+    # Normalize scores for display
+    max_score = max(per_layer.values()) if per_layer else 1.0
+    print(f"{'rank':>4}  {'layer':>5}  {'tier':>4}  {'score':>15}  {'norm':>6}")
+    for rank, li in enumerate(ranking):
+        score = per_layer.get(li, 0.0)
+        pct = 100 * score / max_score
+        print(f"  {rank+1:>3}  L{li:<4}  {tiers[li]:>4}  {score:>15.4e}  {pct:>5.1f}%")
+
+    print()
+    print("=== Tier summary ===")
+    top_layers = [li for li, t in tiers.items() if t == "top"]
+    mid_layers = sorted([li for li, t in tiers.items() if t == "mid"])
+    low_layers = sorted([li for li, t in tiers.items() if t == "low"])
+    print(f"  top (1): L{top_layers}")
+    print(f"  mid (7): L{mid_layers}")
+    print(f"  low ({num_layers-TOP_N-MID_N}): L{low_layers}")
+
+    if args.dry_run:
+        return
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    imatrix_sha = sha256_of(imatrix_path)
+    print(f"\n=== Writing tensor_types files to {out_dir} ===")
+    print(f"  imatrix sha256: {imatrix_sha[:12]}...")
+    print(f"  importance source: {importance_source}"
+          + (f" (sha={importance_file_sha[:12]})" if importance_file_sha else ""))
+    importance_file_name = (
+        Path(args.layer_importance).name if args.layer_importance else None
+    )
+    for cd_name in CD_TIERS:
+        path = write_tensor_types_file(
+            cd_name, tiers, num_layers, out_dir,
+            imatrix_sha=imatrix_sha,
+            importance_source=importance_source,
+            importance_file_sha=importance_file_sha,
+            importance_file_name=importance_file_name,
+        )
+        print(f"  wrote {path}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,9 @@
+{
+  "mode": "balanced-window",
+  "total_tokens": 262144,
+  "seq_len": 2048,
+  "n_seq": 128,
+  "calib_tokens": 1598700,
+  "wiki_tokens": 2459301,
+  "out": "/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/scripts/eac_corpus_wiki2_plus_calib.txt"
+}

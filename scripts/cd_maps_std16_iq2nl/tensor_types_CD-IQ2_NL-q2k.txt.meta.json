@@ -1,0 +1,32 @@
+{
+  "generated_from_imatrix_sha256": "7a99afdb9b3cdbec2595c21b30e0208572033b610ecc06ed2982aa7e61172159",
+  "importance_source": "rank-source=blend",
+  "importance_file_name": "v4_layer_floor_map_v7.json",
+  "importance_file_sha256": "762375631c756fe2804c88dd354d93420aa5871681edd3f9e3087911b85b0713",
+  "generated_at": "2026-06-22T22:55:24+00:00",
+  "tier_profile": "CD-IQ2_NL-q2k",
+  "recipe": {
+    "top": "IQ4_NL",
+    "bulk": "IQ3_S",
+    "tail": "Q2_K",
+    "ffn_down_floor": "IQ3_S",
+    "attn": "IQ4_NL",
+    "router": "IQ4_NL"
+  },
+  "split": {
+    "top_n": 1,
+    "bulk_n": 21,
+    "tail_n": 8
+  },
+  "num_layers": 30,
+  "tail_layers": [
+    9,
+    11,
+    15,
+    17,
+    18,
+    19,
+    27,
+    29
+  ]
+}

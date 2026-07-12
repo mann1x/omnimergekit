@@ -1,0 +1,39 @@
+# Shadow HE+ template for the CODE-side penalty confirmation (T201-code): does
+# min_p 0.05 help / repeat_penalty 1.1 harm CODE pass@1 at the deployment gemma
+# vendor sampler? Clone of humanevalplus_full with the gemma sampler
+# (temp 1.0 / top_p 0.95 / top_k 64) as the DEFAULT so the frozen canonical
+# greedy template stays untouched (2026-05-17 rule). Each driver cell varies ONLY
+# the penalty axis via --metadata backend_args.llama_extra (min_p / repeat_penalty
+# are llama-server launch flags — lm-eval never sends them; the deployment
+# topology). Serving stays canonical HE+ (--jinja --reasoning off via
+# llama_bench_defaults), so reasoning-OFF isolates the code-token effect and the
+# number is comparable to the published HE+ with only the sampler swapped.
+name: humanevalplus_sampler_probe
+backend: lm-eval
+task: humaneval_plus_chat
+n: 164
+selection:
+  type: filter
+  all: true
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 64
+  do_sample: true
+scoring:
+  metric: pass_at_1
+  validated_against: evalplus/humanevalplus
+backend_args:
+  lm_eval_include_path: lm_eval_tasks/humaneval_chat
+  apply_chat_template: true
+  num_fewshot: 0
+  batch_size: 1
+  confirm_run_unsafe_code: true
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: hep_probe
+reports:
+  token_stats: true

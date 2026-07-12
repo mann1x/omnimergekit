@@ -1,0 +1,34 @@
+{
+  "generated_from_imatrix_sha256": "dc11e4ff43b82c7c821336b06dcd8589c51b362deb7fdbaa186a77c2e13de03a",
+  "importance_source": "imatrix",
+  "importance_file_sha256": null,
+  "importance_file_name": null,
+  "generated_at": "2026-06-07T08:56:00+00:00",
+  "tier_profile": "CD-IQ2_M_h",
+  "tiers": {
+    "top": "IQ3_S",
+    "mid": "IQ2_S",
+    "low": "IQ2_S"
+  },
+  "file_base_ftype": "IQ2_M",
+  "body_tensor_roles": [
+    "attn_q.weight",
+    "attn_k.weight",
+    "attn_output.weight",
+    "ffn_gate.weight",
+    "ffn_up.weight",
+    "ffn_gate_up_exps.weight"
+  ],
+  "heuristic_protected_tensors": [
+    "attn_v.weight",
+    "ffn_down.weight",
+    "ffn_down_exps.weight",
+    "ffn_down_exps.scale",
+    "ffn_gate_inp.weight",
+    "ffn_gate_inp.scale",
+    "token_embd.weight",
+    "output.weight"
+  ],
+  "num_layers": 30,
+  "mode": "mix"
+}

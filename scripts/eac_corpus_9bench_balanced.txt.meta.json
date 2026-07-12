@@ -1,0 +1,7 @@
+{
+  "mode": "9bench-balanced-no-wiki",
+  "total_tokens": 262144,
+  "seq_len": 2048,
+  "n_seq": 128,
+  "source": "router_calib_corpus_9bench_balanced.jsonl"
+}

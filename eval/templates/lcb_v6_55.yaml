@@ -1,0 +1,59 @@
+# LiveCodeBench release_v6, curated 55 — the DISCRIMINATING replacement for the
+# saturated lcb_medium_55 / _v4 (which is just the newest medium slice every
+# strong code model now clears at ~96-98%, giving no separation).
+#
+# Selection (frozen task-id list, built by eval/lcb/build_lcb_v6_55_taskids.py):
+#   - source: livecodebench/code_generation_lite release_v6 (~1055 problems),
+#     scorer-compatible only (functional testtype + class-based starter).
+#   - window [2024-01-01, 2025-01-01): "not too new" (drops the 2025 frontier:
+#     contamination-uncertain / model-cutoff-sensitive) and "not too old" (drops
+#     2023: highest train-set contamination risk).
+#   - 44 medium + 11 hard ("mostly not too hard"; the ~20% hard tail is the
+#     headroom that makes it separate models instead of re-saturating).
+#   - even month-spread (round-robin, deterministic). Fully reproducible: rerun
+#     the builder to regenerate byte-identical.
+#
+# The loader bypasses its own difficulty/date filters when task_ids is set
+# (lcb_helpers.load_lcb), so lcb_v6_55_taskids.json is the single source of truth
+# and legitimately mixes medium+hard.
+#
+# Recipe = lcb_medium_55_v4 verbatim: GREEDY (frozen), parser=gemma4 +
+# enable_thinking + thinking_token_budget=12288 as the forcing function against
+# pruned-variant rumination; backend_overrides.llama swaps the bench-default
+# coding flags for the same parser+budget recipe on llama.cpp.
+name: lcb_v6_55
+backend: lcb_custom
+task: livecodebench
+n: 55
+selection:
+  type: filter           # filter + task_ids_file (the loader bypasses difficulty/date in task_ids mode)
+  task_ids_file: eval/lcb/lcb_v6_55_taskids.json
+  difficulty: medium        # inert in task_ids mode (loader bypasses); set = 44 medium + 11 hard
+  min_date: "2024-01-01"    # inert in task_ids mode; documents the build window
+  testtype: functional
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288   # forcing-function: prevents pruned-variant rumination loops
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 1200
+scoring:
+  scorer: lcb_helpers
+  validated_against: lcb_runner.evaluation.testing_util.grade_call_based
+backend_args:
+  apply_chat_template: true
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: lcb_v6_55
+reports:
+  token_stats: true
+dependencies:
+  python_modules: [datasets]
+backend_overrides:
+  llama:
+    backend_args:
+      llama_extra_replace: true
+      llama_extra: ["--reasoning-format", "deepseek", "--reasoning-budget", "12288"]

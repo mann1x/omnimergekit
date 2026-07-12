@@ -1,0 +1,9 @@
+{
+  "mode": "balanced-window",
+  "total_tokens": 262144,
+  "seq_len": 2048,
+  "n_seq": 128,
+  "calib_tokens": 262144,
+  "wiki_tokens": 2459301,
+  "out": "/srv/ml/scripts/eac_corpus_9bench_plus_wiki2.txt"
+}

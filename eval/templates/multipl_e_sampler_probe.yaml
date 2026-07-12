@@ -1,0 +1,40 @@
+# Shadow MPE template for the CODE-side penalty confirmation (T201-code): the
+# multi-language discriminator HE+ could not be (HE+ is near-ceiling Python).
+# Clone of multipl_e_100 with the gemma vendor sampler (temp 1.0 / top_p 0.95 /
+# top_k 64) as the DEFAULT so the frozen canonical greedy MPE stays untouched.
+# Sampler now reaches the generator via the multipl_e_generate.py
+# --temperature/--top-p/--top-k plumbing (omk_eval dispatch_multipl forwards
+# generation.*). The penalty axis {none,min_p,rep,both} is varied per cell via
+# --metadata backend_args.llama_extra (min_p/repeat_penalty are llama-server
+# launch flags — the generator never sends them; deployment-faithful).
+# Serving stays canonical MPE (--jinja --reasoning off) so this is apples-to-
+# apples with the published MPE-100, sampler swapped greedy->gemma.
+name: multipl_e_sampler_probe
+backend: multipl_e
+task: multipl_e
+n: 100
+selection:
+  type: langs
+  langs: [rs, java, js]
+generation:
+  mode: chat
+  max_gen_toks: 1024
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 64
+  do_sample: true
+scoring:
+  scorer: multipl_e
+  metric: pass_at_1
+  aggregate: macro_mean_over_langs
+backend_args:
+  llama_ctx: 16384
+cache:
+  sqlite_prefix: mpe_probe
+reports:
+  token_stats: true
+sanity:
+  min_p10_chars: 1
+dependencies:
+  python_modules: [datasets]
+  docker_images: [ghcr.io/nuprl/multipl-e-evaluation]

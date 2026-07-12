@@ -1,0 +1,41 @@
+# Shadow GPQA template for the sampler × budget × penalty × thinking disentangling
+# probe (T201 — "was --reasoning-budget's necessity a greedy artifact, and do
+# min_p/repeat_penalty help or harm at the vendor sampler?").
+#
+# DO NOT EDIT gpqa_diamond_full.yaml — this clone exists precisely so per-cell
+# --metadata overrides can vary temperature / thinking_token_budget / llama_extra
+# WITHOUT touching the frozen canonical greedy recipe (the 2026-05-17 incident
+# rule). The driver run_sampler_budget_probe.sh sets each cell's operating point;
+# the defaults below reproduce the canonical regime (greedy + budget 8192) for a
+# bare run. Scored exactly like the canonical: exact_match / flexible-extract.
+name: gpqa_sampler_probe
+backend: lm-eval
+task: gpqa_diamond_cot_zeroshot
+requires_hf_token: true   # Idavidrein/gpqa is GATED
+n: 198
+selection:
+  type: filter
+  all: true
+generation:
+  # Every cell OVERRIDES these via --metadata. Greedy+budget = canonical anchor.
+  max_gen_toks: 24576
+  thinking_token_budget: 8192
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: exact_match
+  filter: flexible-extract
+backend_args:
+  apply_chat_template: true
+  num_fewshot: 0
+  batch_size: 1
+  # parallel=2 with -c 65536 = 32768/slot ≥ any realistic GPQA answer even at
+  # budget=-1 (unrestricted) capped by max_gen_toks 24576.
+  llama_ctx: 65536
+  max_length: 65536
+cache:
+  sqlite_prefix: gpqa_probe
+reports:
+  token_stats: true

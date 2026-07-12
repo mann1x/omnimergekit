@@ -1,0 +1,9 @@
+{
+  "mode": "calib-only",
+  "total_tokens": 262144,
+  "seq_len": 2048,
+  "n_seq": 128,
+  "calib_tokens": 262144,
+  "wiki_tokens": 0,
+  "source": "router_calib_corpus.txt"
+}

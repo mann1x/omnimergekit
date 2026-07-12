@@ -1,0 +1,35 @@
+# Deploy-sampler HE+ for the STD16 promotion cohort: vendor_minp_rep @ t0.9
+# (the actual deployment sampler — temp 0.9 / top_p 0.95 / top_k 64 / min_p 0.05 /
+# repeat_penalty 1.1). Clone of humanevalplus_sampler_probe (canonical HE+ serving)
+# with temp 0.9 and min_p/repeat baked into the llama-server launch via
+# backend_args.llama_extra. NEW file — the frozen greedy template is untouched.
+name: humanevalplus_full_minprep09
+backend: lm-eval
+task: humaneval_plus_chat
+n: 164
+selection:
+  type: filter
+  all: true
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288
+  temperature: 0.9
+  top_p: 0.95
+  top_k: 64
+  do_sample: true
+scoring:
+  metric: pass_at_1
+  validated_against: evalplus/humanevalplus
+backend_args:
+  lm_eval_include_path: lm_eval_tasks/humaneval_chat
+  apply_chat_template: true
+  num_fewshot: 0
+  batch_size: 1
+  confirm_run_unsafe_code: true
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+  llama_extra: ["--min-p", "0.05", "--repeat-penalty", "1.1"]
+cache:
+  sqlite_prefix: hep_minprep09
+reports:
+  token_stats: true

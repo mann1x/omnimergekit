@@ -1,0 +1,59 @@
+# LiveCodeBench-medium-100 (v4) — SAMPLED (deploy-sampler) variant of lcb_medium_100_v4.
+#
+# Identical to lcb_medium_100_v4 in EVERY way (same pinned 100 task_ids, thinking
+# budget 12288, max_gen_toks 16384, http_timeout 1200, reasoning-budget forcing)
+# EXCEPT the sampler: instead of frozen greedy, this runs under the SERVED
+# anti-loop sampler `vendor_minp_rep` @ temp 0.9 — the exact config the v8
+# (fkbroad-soft2) loop-fix was measured at on the 48-seed agentic gate:
+#
+#     temperature 0.9 · top_p 0.95 · top_k 64 · min_p 0.05 · repeat_penalty 1.1
+#
+# Rationale: the loop-fixed model is DEPLOYED with this sampler (published GGUF
+# cards + ollama tags bake min_p 0.05 + repeat_penalty 1.1). Greedy LCB measures
+# it in a regime it is never served in; this template measures the 100-set under
+# the real deployment sampler so it slots into the deploy-cohort LCB row of the
+# benchmark table (mirrors lcb_medium_55_v4_minprep09).
+#
+# IMPLEMENTATION: sampler injected via LCB_* env vars (patch_lcb_env_sampler.py);
+# launcher lcb_deploy_v8.sh exports
+#   LCB_TEMPERATURE=0.9 LCB_TOP_P=0.95 LCB_TOP_K=64 LCB_MIN_P=0.05 LCB_REPEAT_PENALTY=1.1
+# The generation block below DOCUMENTS that sampler but is not the source of truth
+# for temp/top_p/top_k/min_p/repeat_penalty (those come from the env). The
+# canonical frozen-greedy lcb_medium_100_v4.yaml is left untouched.
+name: lcb_medium_100_v4_minprep09
+backend: lcb_custom
+task: livecodebench
+n: 100
+selection:
+  type: filter
+  difficulty: medium
+  min_date: "2023-06-01"
+  testtype: functional
+  task_ids_file: eval/lcb/lcb_medium_100_taskids.json
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288   # forcing-function: prevents pruned-variant rumination
+  temperature: 0.9               # DOCUMENTED — actual value from LCB_TEMPERATURE env
+  top_p: 0.95                    # DOCUMENTED — LCB_TOP_P
+  top_k: 64                      # DOCUMENTED — LCB_TOP_K
+  min_p: 0.05                    # DOCUMENTED — LCB_MIN_P
+  repeat_penalty: 1.1            # DOCUMENTED — LCB_REPEAT_PENALTY
+  do_sample: true
+  http_timeout: 1200
+scoring:
+  scorer: lcb_helpers
+backend_args:
+  apply_chat_template: true
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: lcb_med_100_v4_minprep09
+reports:
+  token_stats: true
+dependencies:
+  python_modules: [datasets]
+backend_overrides:
+  llama:
+    backend_args:
+      llama_extra_replace: true
+      llama_extra: ["--reasoning-format", "deepseek", "--reasoning-budget", "12288"]

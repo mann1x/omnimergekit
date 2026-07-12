@@ -1,0 +1,56 @@
+# ruler_native_vt_768k — Variable Tracking at 768k (DCA long-context rung).
+#
+# Cloned from ruler_native_vt_512k for the DCA (Dual Chunk Attention) RULER
+# ladder. DCA-extended A4B should hold VT well above the naive-extension
+# (YaRN) baseline at this context. Greedy, 50 samples.
+#
+# Served externally via the opencoti llamafile-DCA binary (omk_eval --no-server);
+# the backend_args/overrides here only matter if a managed serve is used.
+
+name: ruler_native_vt_768k
+backend: ruler_native
+task: ruler
+n: 50
+
+selection:
+  type: filter
+  ruler_task: vt
+  ctx_tokens: 786432
+  num_samples: 50
+
+generation:
+  max_gen_toks: 120
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 2700.0
+
+scoring:
+  scorer: ruler_helpers
+  metric: pass_at_1
+  filter: null
+
+cache:
+  sqlite_prefix: ruler_vt_768k
+
+backend_args:
+  # Single-flight: one 768k context per GPU at a time.
+  num_concurrent: 1
+  model_template_type: base
+  tokenizer_type: hf
+  random_seed: 42
+
+reports:
+  token_stats: true
+
+sanity:
+  min_p10_chars: 1
+
+backend_overrides:
+  vllm:
+    generation:
+      http_timeout: 3600.0
+  llama:
+    generation:
+      http_timeout: 3600.0

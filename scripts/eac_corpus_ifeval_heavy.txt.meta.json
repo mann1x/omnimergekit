@@ -1,0 +1,5 @@
+{
+  "mode": "ifeval-heavy-35pct",
+  "total_tokens": 262144,
+  "ifeval_fraction": 0.35
+}

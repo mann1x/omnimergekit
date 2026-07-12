@@ -1,0 +1,14 @@
+{
+  "generated_from_imatrix_sha256": "7a99afdb9b3cdbec2595c21b30e0208572033b610ecc06ed2982aa7e61172159",
+  "importance_source": "imatrix",
+  "importance_file_sha256": null,
+  "importance_file_name": null,
+  "generated_at": "2026-06-22T13:29:23+00:00",
+  "tier_profile": "CD-Q5_K_M",
+  "tiers": {
+    "top": "Q6_K",
+    "mid": "Q5_K",
+    "low": "Q4_K"
+  },
+  "num_layers": 30
+}
