@@ -124,3 +124,41 @@ Command: `expert_neuron_analysis_v5_targeted.py --model /srv/ml/models/Qwen3.6-3
 **Next (P2 finish → P3):** run `expert_drop_qwen35b.py` for real (writes the 184e safetensors),
 then router recovery (renorm → shared-α / EAC, shared-expert-aware) → GGUF + omk_eval vs 256e.
 Consider `--agg max` (protect domain specialists) if the sum-based drop regresses a domain.
+
+## P2 baseline eval DONE (2026-07-13, bs2 GPU0, Q6_K + imatrix, greedy, MTP nextn)
+256e (base) vs 184e (balanced 28% drop), same recipe:
+
+| bench | 256e | 184e | Δ |
+|---|---|---|---|
+| HE+ (164) | 90.24 | 90.24 | 0 |
+| LCB-55 v6 @24k-thinking | 94.55 (52/55) | 96.36 (53/55) | +1.82 (1 problem, noise) |
+
+Balanced drop **fully preserves code** (HE+ identical, LCB within noise). LCB run used a **24k
+thinking budget** (not the frozen template's 12288 — that value is a *Gemma-pruned* rumination
+forcing-function; a base/Qwen baseline wants the model's full reasoning). Applied via `--metadata`
+on the frozen `lcb_v6_55` (thinking 24576 / max_gen 32768 / ctx 73728, per-slot 36864 @ parallel 2),
+template byte-unchanged. imatrix at `.../Qwen3.6-35B-A3B-{256e,184e}-GGUF/imatrix.dat`.
+
+## P3 — LCB-TARGETED coder variant tooling BUILT (2026-07-13)
+Mirrors the Gemma v7-coder T17 targeting (`targeted_lcb_medium_55` 128e-PASS channel, weight 2.0,
+weighted-max vs generic floor, floor-clamp, +router_shared_upweight α1.2). Three new pieces + a
+make_drop_map port, all back-compatible (the balanced 184e path is byte-identical):
+
+- **`eval/lcb/build_lcb_calib_taskids.py`** → `lcb_calib_taskids.json`: the **103** scorer-compatible
+  (functional + class-based) release_v6 medium+hard problems in [2024,2025) that are **disjoint from
+  the 55 lcb_v6_55 eval ids** (59 medium + 44 hard). Disjointness is mandatory — calibrating on the
+  eval set overfits the drop map.
+- **`eval/templates/lcb_calib.yaml`** + **`gen_lcb_calib_corpus.sh`**: the 256e teacher generates
+  full-CoT solutions (24k recipe, MTP) on the 103, the scorer labels PASS/FAIL, then
+  **`harvest_lcb_calib_corpus.py`** keeps the **PASS** subset → `results/router_calib_corpus_lcb_qwen.jsonl`
+  as `bench=targeted_lcb` (producer category **`corpus_targeted_lcb`**).
+- **`make_drop_map.py` port**: `--agg wmax|wsum` (per-category **rank-normalized** weighted aggregation),
+  `--cat-weight CAT=W` (hard-errors on an unknown category — the `corpus_` prefix is a silent-no-op
+  trap), `--floor-count F` + `--floor-cats`/`--floor-map` (force-keep the top-F base-critical experts
+  per layer; the uniform-drop analogue of v7's `--v4-floor-clamp`). Validated: default `--agg sum`
+  reproduces `drop_map_184e.json` byte-identically; wmax+floor smoke passes.
+
+**Coder build (once corpus lands):** rebuild the competence map on [balanced + targeted_lcb] corpus,
+then `make_drop_map --agg wmax --cat-weight corpus_targeted_lcb=2.0 --floor-count <F>` →
+`expert_drop_qwen35b` → router_shared_upweight α1.2 → GGUF → LCB-55/HE+ vs the balanced 184e.
+The balanced 184e already hits LCB 96.36, so the target is pushing the frontier / trading off-domain.

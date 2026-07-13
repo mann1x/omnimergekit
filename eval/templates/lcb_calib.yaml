@@ -1,0 +1,50 @@
+# LCB-targeted CALIBRATION generation template — NOT an eval template, do not tabulate.
+#
+# Generates the teacher's (256e) full-CoT solutions on the 103 disjoint LCB problems
+# (eval/lcb/lcb_calib_taskids.json = LiveCodeBench release_v6 medium+hard in
+# [2024-01-01, 2025-01-01), scorer-compatible, MINUS the 55 lcb_v6_55 eval task-ids).
+# The scorer runs too, so every generation carries a PASS/FAIL label; harvest_lcb_calib_corpus.py
+# keeps the PASS subset as the `targeted_lcb` competence channel for the LCB-targeted coder
+# prune — the direct analogue of the Gemma v7-coder 128e-PASS `targeted_lcb_medium_55` channel
+# (docs/T17_v5_targeted_pruning_strategy.md).
+#
+# Recipe = the 24k-generous LCB eval recipe (thinking 24576 / max_gen 32768 / ctx 73728) so
+# solutions are complete, not budget-truncated. GREEDY (the teacher's canonical trajectory).
+# Run with --backend llama --parallel 2 and LLAMA_ARG_SPEC_TYPE=draft-mtp (nextn, lossless speedup).
+name: lcb_calib
+backend: lcb_custom
+task: livecodebench
+n: 103
+selection:
+  type: filter
+  task_ids_file: eval/lcb/lcb_calib_taskids.json
+  difficulty: medium        # inert in task_ids mode (loader bypasses difficulty/date)
+  min_date: "2024-01-01"    # inert in task_ids mode; documents the build window
+  testtype: functional
+generation:
+  max_gen_toks: 32768
+  thinking_token_budget: 24576
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 1200
+scoring:
+  scorer: lcb_helpers
+  validated_against: lcb_runner.evaluation.testing_util.grade_call_based
+backend_args:
+  apply_chat_template: true
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+  llama_ctx: 73728              # per-slot 36864 @ parallel 2 >= max_gen 32768 + prompt
+  llama_content_headroom: 10240 # (max_gen 32768 - thinking 24576) + prompt, so the planner sizes ctx right
+cache:
+  sqlite_prefix: lcb_calib
+reports:
+  token_stats: true
+dependencies:
+  python_modules: [datasets]
+backend_overrides:
+  llama:
+    backend_args:
+      llama_extra_replace: true
+      llama_extra: ["--reasoning-format", "deepseek", "--reasoning-budget", "24576"]
