@@ -797,7 +797,14 @@ def dispatch_lm_eval(template: dict, model_tag: str, base_url: str,
         cmd += ["--gen_kwargs", ",".join(gen_kw_parts)]
     if ba.get("apply_chat_template", False):
         cmd += ["--apply_chat_template"]
-    if ba.get("num_fewshot", 0):
+    if ba.get("num_fewshot") is not None:
+        # NB: must be `is not None`, not truthiness — `num_fewshot: 0` (force
+        # zero-shot) is falsy and was silently dropped, so tasks with a nonzero
+        # default fewshot (e.g. minerva_math500 = 4-shot) ran few-shot anyway.
+        # For thinking models that is fatal: the 4 exemplar assistant turns are
+        # rendered no-think (fewshot_as_multiturn) and collide with the final
+        # <think> prefill, degenerating into early-EOS. Zero-shot CoT is the
+        # canonical thinking-model math recipe; forwarding 0 makes it reachable.
         cmd += ["--num_fewshot", str(ba["num_fewshot"])]
     if ba.get("confirm_run_unsafe_code", False):
         cmd += ["--confirm_run_unsafe_code"]
