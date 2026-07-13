@@ -29,9 +29,19 @@ Runtime estimate (RTX 3090, BF16, eager attention):
 
 REQUIREMENT: must run inside `/shared/dev/lightseek/.venv/bin/python` for
 transformers 5.5.0 (Gemma 4 support).
+
+ARCH-GENERIC (2026-07-13): also profiles Qwen3.5-MoE (e.g. Qwen3.6-35B-A3B).
+The fused-experts hook is architecture-agnostic — Gemma exposes `layer.experts`,
+Qwen `layer.mlp.experts`, both with the same `(hidden_states, top_k_index,
+top_k_weights)` forward — so the same tc/wnorm/neuron_act signal is measured for
+either. Pass `--model <dir>`; `--device cuda:0` loads the whole bf16 model onto a
+big-VRAM GPU (no CPU spill). `--corpus <jsonl>` adds a Tier-C routing-frequency
+mode (no pass-traces, no generation) that makes `--variant`/`--tier-b-json`
+optional; `--probe` verifies the hook points then exits.
 """
 from __future__ import annotations
 import argparse
+import inspect
 import json
 import os
 import time
@@ -46,6 +56,29 @@ from torch import nn                                                  # noqa: E4
 
 WS = Path("/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models")
 MODEL_PATH = WS / "google" / "gemma-4-26B-A4B-it"
+
+
+def _decoder_layers(model):
+    """Locate the decoder-layer ModuleList across Gemma/Qwen multimodal wrappers."""
+    for path in (("model", "language_model", "layers"),
+                 ("model", "layers"),
+                 ("language_model", "layers")):
+        obj = model
+        try:
+            for a in path:
+                obj = getattr(obj, a)
+            return obj
+        except AttributeError:
+            continue
+    raise RuntimeError("could not locate decoder-layer ModuleList on this model")
+
+
+def _experts_of(layer):
+    """Fused-experts module: Gemma 4 = layer.experts, Qwen3.5-MoE = layer.mlp.experts."""
+    exp = getattr(layer, "experts", None)
+    if exp is None:
+        exp = getattr(getattr(layer, "mlp", None), "experts", None)
+    return exp
 
 # Tier-A: 40 synthetic prompts (verbatim from expert_neuron_analysis_v4.py — same
 # distribution that produced the working 109e/98e v3/v4 priors). DO NOT alter
@@ -129,9 +162,11 @@ def make_hooks(model, num_layers: int, tracker: list[list[dict]], weight: float)
     Gemma 4 flattens to [B*T, D] before experts() — top_k_idx is [B*T, top_k].
     """
     hooks = []
+    decoder_layers = _decoder_layers(model)
     for li in range(num_layers):
-        layer = model.model.language_model.layers[li]
-        if not hasattr(layer, "experts"):
+        layer = decoder_layers[li]
+        experts = _experts_of(layer)
+        if experts is None:
             continue
 
         def make_hook(layer_idx: int):
@@ -164,14 +199,25 @@ def make_hooks(model, num_layers: int, tracker: list[list[dict]], weight: float)
                         tracker[layer_idx][eidx]["tc"]    += int(tidx.numel() * weight)
                         tracker[layer_idx][eidx]["cc"]    += int(1 * weight)
             return hook
-        hooks.append(layer.experts.register_forward_hook(make_hook(li)))
+        hooks.append(experts.register_forward_hook(make_hook(li)))
     return hooks
 
 
 def forward_pass(model, input_ids: torch.Tensor):
-    mm_ids = torch.zeros_like(input_ids)
+    # Gemma 4's forward requires `mm_token_type_ids`; Qwen3.5-MoE (and other
+    # text models) don't accept it. Detect once per model and cache.
+    mm = getattr(model, "_ena_accepts_mm", None)
+    if mm is None:
+        try:
+            mm = "mm_token_type_ids" in inspect.signature(model.forward).parameters
+        except (ValueError, TypeError):
+            mm = False
+        model._ena_accepts_mm = mm
     with torch.no_grad():
-        model(input_ids, mm_token_type_ids=mm_ids)
+        if mm:
+            model(input_ids, mm_token_type_ids=torch.zeros_like(input_ids))
+        else:
+            model(input_ids)
 
 
 def tier_a_run(model, tokenizer, num_layers, num_experts, intermediate_size,
@@ -315,6 +361,73 @@ def tier_b_run(model, tokenizer, num_layers, num_experts, intermediate_size,
             checkpoint_cb(done_keys)
 
 
+def corpus_run(model, tokenizer, num_layers, num_experts, intermediate_size,
+               corpus_path, text_field, cat_field, max_samples, window, overlap,
+               apply_template, all_cats: dict, done_keys: set,
+               checkpoint_cb=None) -> None:
+    """Tier-C: routing-frequency profile over a plain calibration corpus.
+
+    Each JSONL row's `text_field` is replayed through the model with the same
+    expert hooks used by Tier-A/Tier-B; per-expert tc/wnorm/neuron_act accumulate
+    into `all_cats[f"corpus_{<cat_field>}"]`. No pass/completion split and no
+    generation — just hook-replay, so it works for any arch (Gemma or Qwen) and
+    any corpus. Rows longer than `window` are chunked (overlap MUST be 0, see the
+    Tier-B council-bug-#2 note). Resumes via `done_keys` (`"corpus/<cat>/<i>"`)."""
+    samples = []
+    with open(corpus_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            d = json.loads(line)
+            txt = d.get(text_field)
+            if not txt:
+                continue
+            samples.append((str(d.get(cat_field, "all")), txt))
+            if max_samples and len(samples) >= max_samples:
+                break
+    total = len(samples)
+    cats = sorted({c for c, _ in samples})
+    print(f"[Tier-C] {total} rows from {corpus_path}  text_field={text_field} "
+          f"cat_field={cat_field} categories={cats} apply_template={apply_template}",
+          flush=True)
+    overall_t0 = time.time()
+    for si, (cat, txt) in enumerate(samples):
+        item_key = f"corpus/{cat}/{si}"
+        if item_key in done_keys:
+            continue
+        if apply_template:
+            ids = tokenizer.apply_chat_template(
+                [{"role": "user", "content": txt}], return_tensors="pt",
+                return_dict=True, add_generation_prompt=True)["input_ids"]
+        else:
+            ids = tokenizer(txt, return_tensors="pt")["input_ids"]
+        ids = ids.to(model.device)
+        cat_key = f"corpus_{cat}"
+        if cat_key not in all_cats:
+            all_cats[cat_key] = _new_per_layer_tracker(num_layers, num_experts, intermediate_size)
+        tracker = all_cats[cat_key]
+        n_chunks = 0
+        t0 = time.time()
+        hooks = make_hooks(model, num_layers, tracker, weight=1.0)
+        try:
+            for chunk_ids in chunk_input(ids, window, overlap):
+                n_chunks += 1
+                forward_pass(model, chunk_ids)
+        finally:
+            for h in hooks:
+                h.remove()
+        done_keys.add(item_key)
+        if checkpoint_cb is not None:
+            checkpoint_cb(done_keys)
+        if (si + 1) % 25 == 0 or si == total - 1:
+            el = (time.time() - overall_t0) / 60
+            eta = el / (si + 1) * (total - si - 1) if (si + 1) else 0
+            print(f"  [Tier-C {si+1}/{total}] cat={cat} len={ids.shape[1]} "
+                  f"chunks={n_chunks} dt={time.time()-t0:.1f}s "
+                  f"(elapsed {el:.0f}m ETA {eta:.0f}m)", flush=True)
+
+
 def serialize(categories: dict[str, list], num_layers: int, num_experts: int) -> dict:
     out = {}
     for cat_name, tracker in categories.items():
@@ -399,10 +512,12 @@ def _checkpoint_load(ckpt_path: Path, num_layers: int, num_experts: int,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--variant", choices=["code", "science", "math", "logic"], required=True)
-    ap.add_argument("--tier-b-json", required=True,
-                    help="Output of extract_pass_traces.py")
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--variant", choices=["code", "science", "math", "logic"], default=None,
+                    help="Tier-A+B mode: variant taxonomy. Required unless --corpus/--probe.")
+    ap.add_argument("--tier-b-json", default=None,
+                    help="Tier-A+B mode: output of extract_pass_traces.py. "
+                         "Required unless --corpus/--probe.")
+    ap.add_argument("--out", default=None, help="Output JSON. Required unless --probe.")
     ap.add_argument("--tier-a-max-tokens", type=int, default=128)
     ap.add_argument("--window-tokens", type=int, default=2048)
     # Council bug #2 fix (csl-2026-05-15-1439-4ff0): overlap>0 causes tokens
@@ -429,25 +544,59 @@ def main():
                     help="bf16: full BF16 weights (needs ≥48 GB GPU OR CPU offload thrash); "
                          "nf4: bitsandbytes 4-bit NF4 (fits 24 GB GPU, ~5-10× faster, "
                          "small signal noise on wnorm/tc).")
+    ap.add_argument("--model", default=str(MODEL_PATH),
+                    help="Model dir. Default = Gemma 4 26B-A4B; pass a Qwen3.5-MoE dir "
+                         "(e.g. Qwen3.6-35B-A3B) to profile that arch — the expert hook "
+                         "is arch-agnostic (Gemma layer.experts / Qwen layer.mlp.experts).")
+    ap.add_argument("--corpus", default=None,
+                    help="Tier-C mode: JSONL calibration corpus to replay for a "
+                         "routing-frequency map (no pass-traces, no generation). "
+                         "Makes --variant/--tier-b-json optional.")
+    ap.add_argument("--corpus-text-field", default="text")
+    ap.add_argument("--corpus-cat-field", default="bench")
+    ap.add_argument("--corpus-max-samples", type=int, default=0, help="0 = all rows.")
+    ap.add_argument("--corpus-apply-template", action="store_true",
+                    help="Wrap each corpus row in the model chat template (for raw-question "
+                         "corpora); default feeds the text verbatim.")
+    ap.add_argument("--probe", action="store_true",
+                    help="Load model, attach expert hooks, run one short forward to verify "
+                         "the hook points accumulate tc, then exit (writes nothing).")
     args = ap.parse_args()
 
-    print(f"=== expert_neuron_analysis_v5_targeted — variant={args.variant} ===", flush=True)
-    print(f"  model: {MODEL_PATH}", flush=True)
+    mode = "probe" if args.probe else ("corpus" if args.corpus else "tierab")
+    if mode == "tierab" and (not args.variant or not args.tier_b_json):
+        ap.error("Tier-A+B mode requires --variant and --tier-b-json "
+                 "(or use --corpus <jsonl> / --probe).")
+    if mode != "probe" and not args.out:
+        ap.error("--out is required (only --probe may omit it).")
+
+    print(f"=== expert_neuron_analysis — mode={mode} (arch-generic) ===", flush=True)
+    print(f"  model: {args.model}", flush=True)
     print(f"  device: {args.device}  dtype: {args.dtype}", flush=True)
-    print(f"  tier-a max_new_tokens: {args.tier_a_max_tokens}", flush=True)
-    print(f"  tier-b window/overlap: {args.window_tokens}/{args.window_overlap}", flush=True)
 
-    print(f"\nLoading Tier-B traces from {args.tier_b_json} …", flush=True)
-    with open(args.tier_b_json) as f:
-        tier_b = json.load(f)
-    traces = tier_b["traces"]
-    print(f"  {len(traces)} traces, set counts: {tier_b['metadata']['set_counts']}", flush=True)
+    traces, tier_b = [], None
+    if mode == "tierab":
+        print(f"  tier-a max_new_tokens: {args.tier_a_max_tokens}", flush=True)
+        print(f"  tier-b window/overlap: {args.window_tokens}/{args.window_overlap}", flush=True)
+        print(f"\nLoading Tier-B traces from {args.tier_b_json} …", flush=True)
+        with open(args.tier_b_json) as f:
+            tier_b = json.load(f)
+        traces = tier_b["traces"]
+        print(f"  {len(traces)} traces, set counts: {tier_b['metadata']['set_counts']}", flush=True)
 
-    print("\nLoading 128e model …", flush=True)
+    print(f"\nLoading model {args.model} …", flush=True)
     from transformers import AutoModelForCausalLM, AutoTokenizer
     t0 = time.time()
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    if args.device == "cuda" and args.quant == "nf4":
+    if args.device.startswith("cuda:") and args.quant != "nf4":
+        # Full-GPU load: a big-VRAM GPU (e.g. Blackwell 96 GB) fits the whole bf16
+        # model (Gemma 4 26B-A4B ~52 GB / Qwen3.5-MoE 35B ~67 GB) with no CPU
+        # spill — pin every module to the named device (no per-token thrash).
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, dtype=dtype, device_map={"": args.device},
+            trust_remote_code=True, low_cpu_mem_usage=True,
+            attn_implementation="sdpa")
+    elif args.device == "cuda" and args.quant == "nf4":
         # bitsandbytes NF4 4-bit: ~13 GB on GPU for Gemma 4 26B-A4B, leaving
         # ~10 GB for activations + hook tensors on a 3090. Compute dtype is
         # bf16 — wnorm/tc signals are measured from dequantized weights
@@ -474,7 +623,7 @@ def main():
         # compression — putting `"": 0` materializes the whole 47 GB first
         # shard on GPU before bnb gets a chance to compress → OOM.
         model = AutoModelForCausalLM.from_pretrained(
-            str(MODEL_PATH), quantization_config=bnb_cfg,
+            args.model, quantization_config=bnb_cfg,
             device_map="auto",
             max_memory={0: "22GiB", "cpu": "200GiB"},
             trust_remote_code=True,
@@ -486,22 +635,48 @@ def main():
         _gpu_budget_gib = 18
         max_memory = {0: f"{_gpu_budget_gib}GiB", "cpu": "200GiB"}
         model = AutoModelForCausalLM.from_pretrained(
-            str(MODEL_PATH), dtype=dtype, device_map="auto",
+            args.model, dtype=dtype, device_map="auto",
             max_memory=max_memory,
             trust_remote_code=True, low_cpu_mem_usage=True,
             attn_implementation="sdpa")
     else:
         model = AutoModelForCausalLM.from_pretrained(
-            str(MODEL_PATH), dtype=dtype, device_map="cpu",
+            args.model, dtype=dtype, device_map="cpu",
             trust_remote_code=True, low_cpu_mem_usage=True)
-    tokenizer = AutoTokenizer.from_pretrained(str(MODEL_PATH))
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     model.eval()
-    num_layers = model.config.text_config.num_hidden_layers
-    num_experts = model.config.text_config.num_experts
-    intermediate_size = model.config.text_config.moe_intermediate_size
-    hidden_size = model.config.text_config.hidden_size
+    # get_text_config() returns the text sub-config for a multimodal wrapper
+    # (Gemma 4) or the config itself when AutoModelForCausalLM loaded the
+    # text-only model (Qwen3.5-MoE) — arch-agnostic.
+    tcfg = model.config.get_text_config()
+    num_layers = tcfg.num_hidden_layers
+    num_experts = tcfg.num_experts
+    intermediate_size = tcfg.moe_intermediate_size
+    hidden_size = tcfg.hidden_size
     print(f"  loaded in {time.time()-t0:.0f}s — layers={num_layers} "
           f"experts={num_experts} intermediate={intermediate_size}", flush=True)
+
+    if mode == "probe":
+        tracker = _new_per_layer_tracker(num_layers, num_experts, intermediate_size)
+        hooks = make_hooks(model, num_layers, tracker, weight=1.0)
+        try:
+            ids = tokenizer("Hello, world. Compute 2+2 and briefly explain.",
+                            return_tensors="pt")["input_ids"].to(model.device)
+            forward_pass(model, ids)
+        finally:
+            for h in hooks:
+                h.remove()
+        tot = sum(tracker[li][e]["tc"] for li in range(num_layers) for e in range(num_experts))
+        l0used = sum(1 for e in range(num_experts) if tracker[0][e]["tc"] > 0)
+        exp_sel = ids.shape[1] * tcfg.num_experts_per_tok * num_layers
+        print(f"[probe] {len(hooks)} expert-hooks attached; forward ok. "
+              f"tokens={ids.shape[1]} total top-k selections={tot} "
+              f"(expect ~{exp_sel} = tokens*top_k*layers); "
+              f"L0 experts used={l0used}/{num_experts}", flush=True)
+        ok = tot > 0 and l0used > 0
+        print(f"[probe] {'OK' if ok else 'FAIL'} — hook points "
+              f"{'valid' if ok else 'DID NOT accumulate'}, no output written.", flush=True)
+        raise SystemExit(0 if ok else 1)
 
     # ── Checkpoint setup ──────────────────────────────────────────────────
     out_path = Path(args.out)
@@ -546,6 +721,39 @@ def main():
             raise SystemExit(128 + signum)
     _sig.signal(_sig.SIGTERM, _on_signal)
     _sig.signal(_sig.SIGINT,  _on_signal)
+
+    # ── Tier-C: corpus routing-frequency mode (arch-generic) ──────────────
+    if mode == "corpus":
+        def _ckpt_cb_c(dk):
+            _checkpoint_write(ckpt_path, all_cats, _make_state("corpus"),
+                              num_layers, num_experts)
+        print(f"\n=== Tier-C: corpus routing profile ({args.corpus}) ===", flush=True)
+        corpus_run(model, tokenizer, num_layers, num_experts, intermediate_size,
+                   args.corpus, args.corpus_text_field, args.corpus_cat_field,
+                   args.corpus_max_samples, args.window_tokens, args.window_overlap,
+                   args.corpus_apply_template, all_cats, done_keys,
+                   checkpoint_cb=_ckpt_cb_c)
+        save = {
+            "metadata": {
+                "model": args.model, "mode": "corpus",
+                "num_layers": num_layers, "num_experts": num_experts,
+                "intermediate_size": intermediate_size, "hidden_size": hidden_size,
+                "corpus": args.corpus, "corpus_text_field": args.corpus_text_field,
+                "corpus_cat_field": args.corpus_cat_field,
+                "corpus_apply_template": args.corpus_apply_template,
+                "window_tokens": args.window_tokens, "window_overlap": args.window_overlap,
+                "device": args.device, "dtype": args.dtype,
+                "categories": list(all_cats.keys()),
+            },
+            "categories": serialize(all_cats, num_layers, num_experts),
+        }
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w") as f:
+            json.dump(save, f)
+        print(f"\nWrote {out_path}  ({out_path.stat().st_size/1024**2:.0f} MB)  "
+              f"categories={list(all_cats.keys())}", flush=True)
+        return
 
     # ── Optional: import Tier-A from an existing v5 output ────────────────
     # Lets v5-science / v5-math reuse the v5-code Tier-A (~7.5h on solidPC
@@ -622,7 +830,7 @@ def main():
     print(f"\nSerializing {len(all_cats)} categories …", flush=True)
     save = {
         "metadata": {
-            "model": str(MODEL_PATH),
+            "model": args.model,
             "variant": f"v5-{args.variant}",
             "num_layers": num_layers,
             "num_experts": num_experts,

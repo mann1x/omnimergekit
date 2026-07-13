@@ -56,12 +56,37 @@ packed-expert contribution on calib corpus → rank experts, bottom-72/layer →
 by importance summed over all 40 layers). Full bridge smoke-tested on CPU: synthetic
 competence map (40L×256E, 3 cats) → make_drop_map (drop 72, keep 184) →
 expert_drop_qwen35b `--dry-run` → 26.66 B, all shapes exact. **Pipeline now:**
-`[competence profiler — GPU, TODO]` → competence-map JSON → `make_drop_map.py` ✅ →
+`competence producer` ✅ → competence-map JSON → `make_drop_map.py` ✅ →
 `expert_drop_qwen35b.py` ✅ → 184e model.
 
-**Only remaining P1 piece:** the competence *producer* — `gate_competence_map.py` is the map
-*validator*, not the producer; the producer is `expert_neuron_analysis_v5_targeted.py` (935 L) /
-`competence_extract.py` (785 L). Adapt one to hook Qwen `model.language_model.layers.N.mlp.gate`
-(routing freq `tc`) + packed-expert contribution (`wnorm`) over the calib corpus, emit categories
-in the gate format. **GPU-gated** — develop with the model loaded (hook-point verification) once
-GPU0 frees (v7-coder SWE-bench 500 at ~88/500). Everything else in the chain is ready + tested.
+### P1 COMPLETE — competence producer generalized (2026-07-13)
+Rather than fork a Qwen-only profiler, the canonical Gemma producer
+**`gemma4/neuron_analysis/expert_neuron_analysis_v5_targeted.py` was made arch-generic**.
+The transformers-5.5 fused-experts refactor gives Gemma 4 and Qwen3.5-MoE the *same*
+`Experts.forward(hidden_states, top_k_index, top_k_weights)`, so the existing per-expert
+hook (tc / wnorm / neuron_act) works for both — the only deltas are the attach point
+(`layer.experts` for Gemma vs `layer.mlp.experts` for Qwen, auto-detected), `mm_token_type_ids`
+(passed only when the model's forward accepts it), config via `get_text_config()`, and a
+`--model` / `--device cuda:N` full-GPU load. New flags (Gemma tier-a/tier-b path byte-unchanged):
+- `--model <dir>` — profile any packed-MoE arch; `--device cuda:0` loads the whole bf16 model
+  on a big-VRAM GPU (Blackwell 96 GB fits 67 GB, no CPU spill).
+- `--corpus <jsonl>` — **Tier-C** routing-frequency mode (no pass-traces, no generation);
+  makes `--variant`/`--tier-b-json` optional; emits `corpus_<cat>` categories in the same map.
+- `--probe` — attach hooks + one forward, verify tc accumulates, exit.
+
+**Probe-verified on Qwen (2026-07-13, bs2 GPU0):** loads in 11 s, 40 expert-hooks attached,
+`4160 = 13 tok × 8 top_k × 40 layers` top-k selections (exact), 80/256 experts used in L0.
+
+**Run (P2):**
+```
+python gemma4/neuron_analysis/expert_neuron_analysis_v5_targeted.py \
+    --model /srv/ml/models/Qwen3.6-35B-A3B --device cuda:0 \
+    --corpus <qwen-calib>.jsonl --corpus-cat-field bench \
+    --out recipes/qwen3_6_35b_a3b_prune/results/competence_qwen35b.json
+```
+then `make_drop_map.py --competence-map … --drop-count 72 --score tc` → `expert_drop_qwen35b.py`.
+
+⚠️ **Corpus caveat:** `scripts/router_calib_corpus_9bench_balanced.jsonl` is **Gemma-templated**
+(`<bos><|turn>…`), so it's not directly right for Qwen routing. For P2 build a Qwen-templated
+calib corpus (or feed raw domain text with `--corpus-apply-template` off, accepting minor
+template-token noise for a first drop-ladder). Producer + bridge + dropper are all ready + tested.
