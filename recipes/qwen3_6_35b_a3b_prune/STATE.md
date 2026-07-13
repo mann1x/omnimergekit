@@ -81,12 +81,21 @@ hook (tc / wnorm / neuron_act) works for both — the only deltas are the attach
 ```
 python gemma4/neuron_analysis/expert_neuron_analysis_v5_targeted.py \
     --model /srv/ml/models/Qwen3.6-35B-A3B --device cuda:0 \
-    --corpus <qwen-calib>.jsonl --corpus-cat-field bench \
+    --corpus recipes/qwen3_6_35b_a3b_prune/results/router_calib_corpus_qwen.jsonl \
+    --corpus-cat-field bench \
     --out recipes/qwen3_6_35b_a3b_prune/results/competence_qwen35b.json
 ```
 then `make_drop_map.py --competence-map … --drop-count 72 --score tc` → `expert_drop_qwen35b.py`.
 
-⚠️ **Corpus caveat:** `scripts/router_calib_corpus_9bench_balanced.jsonl` is **Gemma-templated**
-(`<bos><|turn>…`), so it's not directly right for Qwen routing. For P2 build a Qwen-templated
-calib corpus (or feed raw domain text with `--corpus-apply-template` off, accepting minor
-template-token noise for a first drop-ladder). Producer + bridge + dropper are all ready + tested.
+### Qwen calib corpus BUILT (2026-07-13)
+`build_calib_corpus_qwen.py` pulls raw questions (+ reference solutions) straight from the
+cached HF benches and renders each with the **Qwen** chat template (`<|im_start|>…<|im_end|>`,
+native — not the Gemma `<bos><|turn>` corpus), balanced per bench. Output
+`results/router_calib_corpus_qwen.jsonl`: **590 rows / 138 k tok**, 8 benches — gpqa_diamond 80,
+math500 80, gsm8k 80, humaneval 80, mbpp 80, arc_challenge 80, ifeval 80, aime2024 30. Domains:
+science / math / code / reasoning / instruction. LCB skipped (cache config name malformed; code
+covered by HumanEval+MBPP). ~4300 avg selections/expert/layer over 40L×256E — ample to resolve
+the drop-72 boundary. Feed to the producer WITHOUT `--corpus-apply-template` (text pre-templated).
+Rebuild: `HF_DATASETS_OFFLINE=1 HF_HUB_OFFLINE=1 python build_calib_corpus_qwen.py --tokenizer
+<qwen-dir> --per-bench N --out results/router_calib_corpus_qwen.jsonl`. **P1 + corpus COMPLETE;
+next is the GPU0 profiling run.**
