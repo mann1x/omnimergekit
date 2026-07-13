@@ -97,5 +97,30 @@ science / math / code / reasoning / instruction. LCB skipped (cache config name 
 covered by HumanEval+MBPP). ~4300 avg selections/expert/layer over 40L×256E — ample to resolve
 the drop-72 boundary. Feed to the producer WITHOUT `--corpus-apply-template` (text pre-templated).
 Rebuild: `HF_DATASETS_OFFLINE=1 HF_HUB_OFFLINE=1 python build_calib_corpus_qwen.py --tokenizer
-<qwen-dir> --per-bench N --out results/router_calib_corpus_qwen.jsonl`. **P1 + corpus COMPLETE;
-next is the GPU0 profiling run.**
+<qwen-dir> --per-bench N --out results/router_calib_corpus_qwen.jsonl`.
+
+## P2 — competence map + drop map DONE (2026-07-13, bs2 GPU0)
+Producer got a **`--tc-only` fast path** (mandatory here): the inherited Gemma hook computes
+per-neuron activations + activation-weighted wnorm with a GPU→CPU sync **per hit-expert per
+layer** (256×40) and JSON-dumps ~419 M floats every sample → first run was 57/590 in 27 min
+(4 h ETA), GPU 0 %, an **803 MB** checkpoint. `--tc-only` records only routing frequency via one
+GPU `bincount`/layer (one sync/layer, no expert forward, no neuron_act) + `--checkpoint-every N`:
+**28 s → 1.2 s/sample, output 10 MB.** For expert-drop this is exactly right (make_drop_map's
+default `--score tc`); wnorm/rnorm stay 0 (drop `--tc-only` for the full activation-weighted path).
+
+- **Competence map** `results/competence_qwen35b.json` (10 MB): `--tc-only`, 590 rows / ~4 min,
+  8 bench categories. Every expert used (**never-selected 0/256**), per-expert global tc 96k–282k
+  (~3× spread) — clean tail for the drop.
+- **Drop map** `results/drop_map_184e.json`: `make_drop_map --drop-count 72 --score tc --agg sum
+  --mtp-strategy global` → 72/layer dropped, keep 184. **Layer-specific** (0 experts dropped in
+  all 40 layers, 0 never-dropped) — captures per-layer routing specialization, not a uniform cut.
+- **Dropper dry-run** with the real map: 80 expert + 40 router + 3 MTP sliced 256→184, 922
+  passthrough (vision/shared-expert/linear-attn/MTP-fc kept) → **26.66 B params**. Validated.
+
+Command: `expert_neuron_analysis_v5_targeted.py --model /srv/ml/models/Qwen3.6-35B-A3B
+--device cuda:0 --corpus results/router_calib_corpus_qwen.jsonl --corpus-cat-field bench
+--tc-only --checkpoint-every 25 --out results/competence_qwen35b.json`.
+
+**Next (P2 finish → P3):** run `expert_drop_qwen35b.py` for real (writes the 184e safetensors),
+then router recovery (renorm → shared-α / EAC, shared-expert-aware) → GGUF + omk_eval vs 256e.
+Consider `--agg max` (protect domain specialists) if the sum-based drop regresses a domain.

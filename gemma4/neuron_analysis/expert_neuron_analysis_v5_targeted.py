@@ -155,6 +155,15 @@ def _new_per_layer_tracker(num_layers: int, num_experts: int, intermediate_size:
     ]
 
 
+# Set by main() from --tc-only. When True, the hook records only routing
+# frequency (tc) via a single GPU bincount + one sync per layer — no per-expert
+# forward, no neuron_act, no per-expert .item()/.cpu() sync. ~100x faster on a
+# 256-expert model and needs a tiny checkpoint (no 800 MB neuron_act dump). Use
+# for expert-drop maps (make_drop_map --score tc, its default). wnorm/rnorm/
+# neuron_act stay 0 — for those, run the full path (drop --tc-only).
+_TC_ONLY = False
+
+
 def make_hooks(model, num_layers: int, tracker: list[list[dict]], weight: float):
     """Install hooks on each MoE `experts` module. Accumulates into `tracker`
     weighted by `weight` (Set-B traces use weight=3.0 per T17 design).
@@ -173,6 +182,14 @@ def make_hooks(model, num_layers: int, tracker: list[list[dict]], weight: float)
             def hook(module, args, output):
                 hs, top_k_idx, top_k_wt = args
                 n = module.num_experts
+                if _TC_ONLY:
+                    with torch.no_grad():
+                        counts = torch.bincount(top_k_idx.reshape(-1), minlength=n).cpu()
+                    row = tracker[layer_idx]
+                    for e in counts.nonzero(as_tuple=True)[0].tolist():
+                        row[e]["tc"] += int(int(counts[e]) * weight)
+                        row[e]["cc"] += int(1 * weight)
+                    return
                 with torch.no_grad():
                     mask = nn.functional.one_hot(top_k_idx, num_classes=n).permute(2, 1, 0)
                     hit = torch.greater(mask.sum(dim=(-1, -2)), 0).nonzero()
@@ -364,7 +381,7 @@ def tier_b_run(model, tokenizer, num_layers, num_experts, intermediate_size,
 def corpus_run(model, tokenizer, num_layers, num_experts, intermediate_size,
                corpus_path, text_field, cat_field, max_samples, window, overlap,
                apply_template, all_cats: dict, done_keys: set,
-               checkpoint_cb=None) -> None:
+               checkpoint_cb=None, checkpoint_every: int = 1) -> None:
     """Tier-C: routing-frequency profile over a plain calibration corpus.
 
     Each JSONL row's `text_field` is replayed through the model with the same
@@ -418,7 +435,7 @@ def corpus_run(model, tokenizer, num_layers, num_experts, intermediate_size,
             for h in hooks:
                 h.remove()
         done_keys.add(item_key)
-        if checkpoint_cb is not None:
+        if checkpoint_cb is not None and ((si + 1) % checkpoint_every == 0 or si == total - 1):
             checkpoint_cb(done_keys)
         if (si + 1) % 25 == 0 or si == total - 1:
             el = (time.time() - overall_t0) / 60
@@ -443,7 +460,7 @@ def serialize(categories: dict[str, list], num_layers: int, num_experts: int) ->
                     "wsum":  float(d["wsum"]),
                     "tc":    int(d["tc"]),
                     "cc":    int(d["cc"]),
-                    "neuron_act": d["neuron_act"].tolist(),
+                    "neuron_act": ([] if _TC_ONLY else d["neuron_act"].tolist()),
                 })
             cat[str(li)] = rows
         out[cat_name] = cat
@@ -472,7 +489,8 @@ def _deserialize_tracker(cat_rows: dict, num_layers: int, num_experts: int,
             entry["wsum"]  = float(r["wsum"])
             entry["tc"]    = int(r["tc"])
             entry["cc"]    = int(r["cc"])
-            entry["neuron_act"] = torch.tensor(r["neuron_act"], dtype=torch.float64)
+            if r.get("neuron_act"):  # empty in --tc-only checkpoints; keep zeros default
+                entry["neuron_act"] = torch.tensor(r["neuron_act"], dtype=torch.float64)
     return tracker
 
 
@@ -561,7 +579,17 @@ def main():
     ap.add_argument("--probe", action="store_true",
                     help="Load model, attach expert hooks, run one short forward to verify "
                          "the hook points accumulate tc, then exit (writes nothing).")
+    ap.add_argument("--tc-only", action="store_true",
+                    help="Record ONLY routing frequency (tc) via a GPU bincount — no per-expert "
+                         "forward, no neuron_act, tiny checkpoint. ~100x faster on 256-expert "
+                         "models; feeds make_drop_map --score tc (its default). wnorm/rnorm stay 0.")
+    ap.add_argument("--checkpoint-every", type=int, default=1,
+                    help="Corpus (Tier-C) mode: write the resume checkpoint every N samples "
+                         "(default 1). Raise to amortize serialize cost on many-category corpora.")
     args = ap.parse_args()
+
+    global _TC_ONLY
+    _TC_ONLY = args.tc_only
 
     mode = "probe" if args.probe else ("corpus" if args.corpus else "tierab")
     if mode == "tierab" and (not args.variant or not args.tier_b_json):
@@ -732,10 +760,10 @@ def main():
                    args.corpus, args.corpus_text_field, args.corpus_cat_field,
                    args.corpus_max_samples, args.window_tokens, args.window_overlap,
                    args.corpus_apply_template, all_cats, done_keys,
-                   checkpoint_cb=_ckpt_cb_c)
+                   checkpoint_cb=_ckpt_cb_c, checkpoint_every=args.checkpoint_every)
         save = {
             "metadata": {
-                "model": args.model, "mode": "corpus",
+                "model": args.model, "mode": "corpus", "tc_only": args.tc_only,
                 "num_layers": num_layers, "num_experts": num_experts,
                 "intermediate_size": intermediate_size, "hidden_size": hidden_size,
                 "corpus": args.corpus, "corpus_text_field": args.corpus_text_field,
