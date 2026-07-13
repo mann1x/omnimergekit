@@ -316,6 +316,14 @@ IMATRIX_EXCLUDE = {
     "Q6_K", "Q6_K_L",
 }
 
+# Set by --force-imatrix: override IMATRIX_EXCLUDE so imatrix is applied to ALL
+# _K/IQ tiers (incl. Q4/Q5/Q6). The default policy (Q6_K imatrix-free) is the
+# measured crossover on our Gemma families; a NEW model family whose crossover
+# is unmeasured, or a baseline where the recipe must match a low-bit sibling,
+# is a legitimate reason to force it. Also causes an imatrix to be generated
+# even when only excluded tiers are requested.
+_FORCE_IMATRIX = False
+
 
 def _uses_imatrix_by_rule(quant: str) -> bool:
     """True iff `quant` should be built WITH an imatrix under the name-based rule:
@@ -323,7 +331,7 @@ def _uses_imatrix_by_rule(quant: str) -> bool:
     technical requirements (a map that assigns IQ*/Q2_K tensors, which llama-quantize
     mandates an imatrix for) are handled separately by callers and are NOT
     suppressed by this rule."""
-    if quant in IMATRIX_EXCLUDE:
+    if quant in IMATRIX_EXCLUDE and not _FORCE_IMATRIX:
         return False
     return quant in IMATRIX_QUANTS or "IQ" in quant
 
@@ -1607,6 +1615,11 @@ def main():
                         help="Don't upload to HF, just quantize locally")
     parser.add_argument("--no-imatrix", action="store_true",
                         help="Skip imatrix computation")
+    parser.add_argument("--force-imatrix", action="store_true",
+                        help="Apply imatrix to ALL _K/IQ tiers, overriding IMATRIX_EXCLUDE "
+                             "(Q4/Q5/Q6). Use for a new model family (crossover unmeasured) or "
+                             "to match a low-bit sibling's recipe. Also forces imatrix generation "
+                             "when only excluded tiers are requested. Mutually exclusive with --no-imatrix.")
     parser.add_argument("--cal-data", default=None,
                         help="Path to calibration data for imatrix (default: bundled calibration_datav5.txt)")
     parser.add_argument("--layer-importance", default=None,
@@ -1674,6 +1687,11 @@ def main():
                              "low-bit head override. Use when the model has mtp.* tensors "
                              "but you want a non-speculative build (head follows body tier).")
     args = parser.parse_args()
+
+    if args.force_imatrix and args.no_imatrix:
+        parser.error("--force-imatrix and --no-imatrix are mutually exclusive")
+    global _FORCE_IMATRIX
+    _FORCE_IMATRIX = args.force_imatrix
 
     # Set HF token
     if args.hf_token:
