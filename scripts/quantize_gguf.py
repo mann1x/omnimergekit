@@ -56,7 +56,7 @@ BARTOWSKI_QUANTS = [
     "Q8_0",
     "Q6_K_L", "Q6_K",
     "Q5_K_L", "Q5_K_M", "Q5_K_S",
-    "Q4_K_L", "Q4_K_M", "Q4_1", "Q4_K_S", "Q4_0",
+    "Q4_K_L", "Q4_K_M", "Q4_K_S",
     "IQ4_NL", "IQ4_XS",
     "Q3_K_XL", "IQ3_M", "Q3_K_L", "Q3_K_M", "Q3_K_S", "IQ3_XS", "IQ3_XXS",
     "Q2_K_L",
