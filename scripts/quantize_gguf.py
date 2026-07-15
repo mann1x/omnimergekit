@@ -290,6 +290,21 @@ def _cd_file_base_ftype(quant: str) -> str:
         return LEGACY_CD_FILE_BASE[quant]
     return quant[3:]
 
+
+def _mtp_head_ftype(quant: str) -> str:
+    """The FTYPE blk.{N} (the MTP head) receives for this tier.
+
+    CD maps only cover body layers 0..N-1, so the MTP block falls through to
+    the tier file-base FTYPE. For plain tiers that is the quant itself. Used to
+    decide the MTP head override: if this base is a very-low-bit imatrix-required
+    type (in MTP_HEAD_OVERRIDE_TIERS), blk.{N} must be lifted or llama-quantize
+    bails ("Missing importance matrix ... in a very low-bit quantization") since
+    the imatrix never covers mtp.*. See feedback_mtp_head_imatrix_missing.
+    """
+    if quant.startswith("CD-"):
+        return _cd_file_base_ftype(quant)
+    return quant
+
 # Quants that require imatrix for good results.
 # General rule (T118): ALL K-quants (name contains "_K") + every IQ tier build
 # with imatrix by default — imatrix lifts Q6_K LCB +3pp and most K-quants.
@@ -770,8 +785,8 @@ def quantize_one(tools: dict, f16_gguf: Path, output_dir: Path,
     # speculative-decoding accept rate stays intact. The imatrix doesn't
     # cover mtp.* (which converts to blk.{N}.*), so sub-Q4 of the head
     # destroys draft quality. See module docstring + llama.cpp PR #20533.
-    if (mtp_info and quant in MTP_HEAD_OVERRIDE_TIERS
-            and mtp_head_min_type):
+    if (mtp_info and mtp_head_min_type
+            and _mtp_head_ftype(quant) in MTP_HEAD_OVERRIDE_TIERS):
         block_idx = mtp_info["mtp_block_idx"]
         cmd.extend([
             "--tensor-type",
