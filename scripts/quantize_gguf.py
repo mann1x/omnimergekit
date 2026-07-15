@@ -141,7 +141,7 @@ ALL_QUANTS = DEFAULT_QUANTS + OPT_IN_QUANTS
 MTP_DEFAULT_HEAD_MIN_TYPE = "Q4_K"
 MTP_HEAD_OVERRIDE_TIERS = {
     "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ2_M",
-    "Q2_K", "IQ3_XXS",
+    "Q2_K", "IQ3_XXS", "IQ3_XS",
 }
 
 
@@ -1761,8 +1761,17 @@ def main():
     # head to --mtp-head-min-type so speculative-decoding accept rate
     # stays intact. See MTP_HEAD_OVERRIDE_TIERS for the affected tier set.
     mtp_info = None
-    if not args.no_mtp_detect and model_path is not None:
-        mtp_info = detect_mtp(model_path)
+    # Detect MTP from the SOURCE safetensors index even when reusing an existing
+    # F16 (base_gguf.exists() sets model_path=None). detect_mtp only reads
+    # model.safetensors.index.json — it needs no convert step. Without this,
+    # reusing an F16 silently disables the blk.{N}.* override and every
+    # imatrix-mandatory low-bit tier (IQ3_XS/IQ3_XXS/IQ2_*) bails on the
+    # imatrix-less MTP head. See memory feedback_mtp_head_imatrix_missing.
+    _mtp_src = model_path
+    if _mtp_src is None and Path(args.model).is_dir():
+        _mtp_src = Path(args.model)
+    if not args.no_mtp_detect and _mtp_src is not None:
+        mtp_info = detect_mtp(_mtp_src)
         if mtp_info:
             print("\n=== MTP head detected in source ===", flush=True)
             print(f"  mtp.* tensors in safetensors: {mtp_info['mtp_tensor_count']}",
