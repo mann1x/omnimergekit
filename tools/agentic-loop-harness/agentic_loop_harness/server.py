@@ -1,7 +1,7 @@
 """llama.cpp server lifecycle for the agentic-loop harness.
 
 This is the ONE backend-specific module. It launches a `llama-server` for a given
-GGUF + (optional) chat-template override + Gemma-4 reasoning flags, waits for it
+GGUF + (optional) chat-template override + (optional) reasoning flags, waits for it
 to become healthy, and tears it down cleanly by the PID we own (never a blanket
 pkill/fuser on the port). `replay.py` talks to whatever it launches purely over
 the OpenAI-compatible HTTP API, so it stays backend-agnostic.
@@ -61,7 +61,8 @@ def build_cmd(bin_path, gguf, port, cfg, chat_template=None):
         cmd += ["-ctk", str(cfg["cache_type_k"])]
     if cfg.get("cache_type_v"):
         cmd += ["-ctv", str(cfg["cache_type_v"])]
-    # Gemma-4 reasoning flags. Null/empty disables (a non-reasoning template).
+    # Reasoning flags (model-agnostic; set per profile, never hardcoded). Null/unset
+    # omits them entirely -- a non-reasoning model/template just leaves them out.
     if cfg.get("reasoning_format"):
         cmd += ["--reasoning-format", str(cfg["reasoning_format"])]
     if cfg.get("reasoning_budget") is not None:

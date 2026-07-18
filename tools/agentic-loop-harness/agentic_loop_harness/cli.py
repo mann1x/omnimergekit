@@ -2,7 +2,7 @@
 
 Reads a run profile (YAML or JSON) that contains EVERYTHING under test -- the
 model GGUF, an optional chat-template override (or a list of them), the sampling
-matrix, the seeds, and the Gemma-4 reasoning settings -- then:
+matrix, the seeds, and the (optional) reasoning settings -- then:
 
   1. for each chat template, launches a llama-server for the GGUF with that
      template (backend=llama), or uses a running OpenAI-compatible endpoint
@@ -12,9 +12,10 @@ matrix, the seeds, and the Gemma-4 reasoning settings -- then:
   4. prints a loop/fail-rate table: rows = template x fixture, cols = sampler
      configs.
 
-This is the file Google edits: point `model.gguf` at their 12B GGUF, set
-`model.chat_template` to the jinja(s) they want to compare, and adjust
-`sampling` / `server.reasoning_*` to their own settings.
+This is the file you edit to test a model: point `model.gguf` at the target GGUF,
+set `model.chat_template` to the jinja(s) to compare, and adjust
+`sampling` / `server.reasoning_*` to that model's settings (omit them for a
+non-reasoning model).
 """
 from __future__ import annotations
 
