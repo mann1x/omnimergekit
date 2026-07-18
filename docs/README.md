@@ -58,6 +58,9 @@ Supporting tables / data:
   on solidpc)
 * [`EVAL.md`](EVAL.md) + [`../eval/EVAL_PROTOCOL.md`](../eval/EVAL_PROTOCOL.md)
   — eval suite design and omk_eval contract
+* [`MTP_BENCH.md`](MTP_BENCH.md) — MTP speculative-decoding bench + n_max /
+  drafter-quant sweeps (tooling in [`../eval/mtp/`](../eval/mtp/)). E2B →
+  `--spec-draft-n-max 2`.
 
 ## Recipes catalogue
 
