@@ -40,15 +40,15 @@ SKIP=""
 PORT=8099
 SAMPLER=""           # per-model sampler name (greedy|recommended|deployment); empty = frozen greedy templates
 SAMPLER_PROFILE=""   # eval/models/<family>.yaml | auto | path; empty = no overlay
-# ── opencoti-llamafile + MTP speculative passthrough (T87.pD server_bin) ──
-# --server-bin  : custom llama serve binary (e.g. opencoti-llamafile). When set,
-#                 omk_eval serves via backend_args.server_bin + ["--server"] prefix
-#                 (raw_args stays false so the canonical Gemma-4 reasoning/ctx/ngl
-#                 defaults + per-bench --reasoning-budget are still injected).
-# --mtp-head    : MTP/EAGLE draft assistant GGUF → appends the speculative flags
-#                 (--flash-attn on --mtp-head X --spec-type draft-assistant -ngld 99
-#                 --spec-draft-n-max $SPEC_N) to llama_extra.
-# --spec-n      : MTP draft n-max (spec_n). Default 2.
+# ── opencoti-llamafile first-tier backend (--backend llamafile) ──────────
+# Setting --server-bin OR --mtp-head selects `--backend llamafile` in omk_eval,
+# which derives the serve flags from the template (deepseek think-then-answer for
+# code benches so weak models emit fenced code; `--server` prefix) — no --metadata.
+# --server-bin  : opencoti-llamafile binary → passed as omk --llamafile-bin.
+#                 (Omit to use omk's default OMK_LLAMAFILE_BIN.)
+# --mtp-head    : MTP draft-assistant GGUF → omk --mtp-head (lossless speculative
+#                 decoding via --spec-type draft-assistant; omk emits the flags).
+# --spec-n      : MTP draft n-max → omk --spec-n. Default 2.
 # --parallel    : force omk gpu_planner parallelism (MTP needs 1 slot). "" = auto.
 # --quant       : served-name/label suffix (default q6_k; use f16 for F16 GGUFs).
 SERVER_BIN=""
@@ -94,19 +94,18 @@ export LM_EVAL_BIN="${LM_EVAL_BIN:-/root/anaconda3/envs/omnimergekit/bin/lm-eval
 export PATH=/root/anaconda3/envs/omnimergekit/bin:$PATH
 TOKENIZER="${OMK_TOKENIZER:-$WS/google/gemma-4-26B-A4B-it}"
 SERVED_NAME="${VARIANT}_${QUANT}"
-# Build the opencoti-llamafile + MTP --metadata overrides once (empty unless
-# --server-bin is set). server_prefix_args=["--server"]; llama_extra appends the
-# speculative flags AFTER omk's canonical reasoning/ctx defaults (it merges, not
-# replaces). num_concurrent follows --parallel via the CLI, so the MTP 1-slot
-# server is fed exactly one in-flight request.
-SERVERBIN_ARGS=()
-if [[ -n "$SERVER_BIN" ]]; then
-    SERVERBIN_ARGS+=(--metadata "backend_args.server_bin=$SERVER_BIN"
-                     --metadata 'backend_args.server_prefix_args=["--server"]')
-    if [[ -n "$MTP_HEAD" ]]; then
-        SERVERBIN_ARGS+=(--metadata \
-            "backend_args.llama_extra=[\"--flash-attn\",\"on\",\"--mtp-head\",\"$MTP_HEAD\",\"--spec-type\",\"draft-assistant\",\"-ngld\",\"99\",\"--spec-draft-n-max\",\"$SPEC_N\"]")
-    fi
+# Backend selection. A custom serve binary (--server-bin) or an MTP drafter
+# (--mtp-head) selects the first-tier `--backend llamafile`, which derives the
+# exact serve flags from the template on its own — deepseek think-then-answer
+# for code benches, `--server` prefix, and the draft-assistant speculative flags
+# from --mtp-head/--spec-n — so NO --metadata shoehorning is needed. Neither
+# flag → plain `--backend llama` (llama.cpp), byte-identical to before.
+BACKEND="llama"
+LLAMAFILE_ARGS=()
+if [[ -n "$SERVER_BIN" || -n "$MTP_HEAD" ]]; then
+    BACKEND="llamafile"
+    [[ -n "$SERVER_BIN" ]] && LLAMAFILE_ARGS+=(--llamafile-bin "$SERVER_BIN")
+    [[ -n "$MTP_HEAD"   ]] && LLAMAFILE_ARGS+=(--mtp-head "$MTP_HEAD" --spec-n "$SPEC_N")
 fi
 TS=$(date +%Y%m%d_%H%M%S)
 LOGS=$WS/logs
@@ -163,7 +162,7 @@ log "  variant:     $VARIANT  (served-name=$SERVED_NAME)"
 log "  gguf:        $GGUF ($(stat -c %s "$GGUF" | numfmt --to=iec))"
 log "  port:        $PORT"
 log "  quant/tok:   ${QUANT}  tokenizer=${TOKENIZER}"
-log "  server-bin:  ${SERVER_BIN:-<default llama-server>}"
+log "  backend:     ${BACKEND}  (llamafile-bin=${SERVER_BIN:-<omk default>})"
 log "  mtp:         ${MTP_HEAD:-<off>}  spec_n=${SPEC_N}  parallel=${PARALLEL:-auto}"
 log "  sampler:     ${SAMPLER:-<none/greedy>}  profile=${SAMPLER_PROFILE:-<none>}"
 log "  limit:       $LIMIT (0=full)"
@@ -219,11 +218,11 @@ for t in "${selected[@]}"; do
     check_signal || continue
     out="$RESULTS_DIR/$t"
     mkdir -p "$out"
-    # llama-server lifecycle is handled inside omk_eval (--backend llama).
+    # llama/llamafile-server lifecycle is handled inside omk_eval.
     # Each template re-spawns the server (~10s overhead per bench).
     cmd=(
         "$OMK_PY" "$OMK/eval/omk_eval.py"
-        --backend llama
+        --backend "$BACKEND"
         --template "$t"
         --quant "$QUANT"
         --model "$GGUF"
@@ -234,8 +233,8 @@ for t in "${selected[@]}"; do
     )
     [[ "$LIMIT" -gt 0 ]] && cmd+=(--limit "$LIMIT")
     [[ -n "$PARALLEL" ]] && cmd+=(--parallel "$PARALLEL")
-    # opencoti-llamafile + MTP speculative passthrough (no-op unless --server-bin).
-    [[ ${#SERVERBIN_ARGS[@]} -gt 0 ]] && cmd+=("${SERVERBIN_ARGS[@]}")
+    # opencoti-llamafile first-tier backend args (empty unless --server-bin/--mtp-head).
+    [[ ${#LLAMAFILE_ARGS[@]} -gt 0 ]] && cmd+=("${LLAMAFILE_ARGS[@]}")
     # Per-model sampler overlay (eval/models/<family>.yaml). With neither flag
     # set this is a strict no-op and the frozen greedy templates are used
     # byte-identically (EVAL_PROTOCOL.md §1.0).
