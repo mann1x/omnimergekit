@@ -162,3 +162,24 @@ make_drop_map port, all back-compatible (the balanced 184e path is byte-identica
 then `make_drop_map --agg wmax --cat-weight corpus_targeted_lcb=2.0 --floor-count <F>` →
 `expert_drop_qwen35b` → router_shared_upweight α1.2 → GGUF → LCB-55/HE+ vs the balanced 184e.
 The balanced 184e already hits LCB 96.36, so the target is pushing the frontier / trading off-domain.
+
+## P3 — coder-targeted drop maps PRODUCED + PUBLISHED (2026-07-13→2026-07-20)
+Three `wmax`-aggregated coder variants were built on top of the balanced 184e (all keep 184e/layer,
+drop 72; the balanced `drop_map_184e.json` remains the byte-identical `--agg sum` baseline). Each
+ships with the competence map it was cut from. Published to this dir (previously bs2-only):
+
+| variant | drop map | competence map | targeting |
+|---|---|---|---|
+| **coder** (LCB) | `drop_map_184e_coder.json` | `competence_qwen35b_coder.json` | `--agg wmax --cat-weight corpus_targeted_lcb=2.0` + floor-clamp; protects the LCB-medium PASS channel. |
+| **coder_lcbmpe** | `drop_map_184e_coder_lcbmpe.json` | `competence_qwen35b_coder_lcbmpe.json` | adds a **MultiPL-E** targeting channel (multi-language codegen) to the LCB weighting — the discriminator that moved MultiPL-E strongly up while holding LCB within noise. |
+| **coder_lcbmpeife** | `drop_map_184e_coder_lcbmpeife.json` | `competence_qwen35b_coder_lcbmpeife.json` | further adds an **IFEval** channel to counter the pruning-induced IFEval rumination/looping seen on the coder+MPE cut (force-keep the instruction-following experts). |
+
+- **Calib corpus** `results/router_calib_corpus_coder_lcbmpe_qwen.jsonl` (4.3 MB): the LCB+MultiPL-E
+  coder calibration set (Qwen-templated, teacher-labelled PASS subset) that the coder / coder_lcbmpe
+  maps were profiled on, alongside the base `router_calib_corpus_qwen.jsonl`.
+- **Reproduce:** `make_drop_map.py --agg wmax --cat-weight corpus_targeted_lcb=2.0
+  [--cat-weight corpus_targeted_mpe=… --cat-weight corpus_ifeval=…] --floor-count <F>` against the
+  matching `competence_qwen35b_coder*.json`. All three feed `expert_drop_qwen35b.py` → 184e coder
+  safetensors → router_shared_upweight α1.2. Per-variant eval deltas (LCB / HE+ / MultiPL-E / IFEval
+  vs the balanced 184e) live in the training-run release notes; the `.checkpoint.json` producer
+  intermediates are intentionally NOT published (regenerable, large).
