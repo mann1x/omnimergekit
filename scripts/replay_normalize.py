@@ -115,6 +115,98 @@ def convert_messages(ex: dict) -> tuple[list[dict] | None, None]:
     return out, None
 
 
+_MAX_RESP_CHARS = 2000  # cap on any single string leaf in a tool response
+
+
+def _truncate_leaves(obj, cap: int = _MAX_RESP_CHARS):
+    """Recursively cap every string leaf so a 100k tool dump can't dominate the
+    training sequence. Structure (dict/list) is preserved."""
+    if isinstance(obj, str):
+        return obj if len(obj) <= cap else obj[:cap] + "…(truncated)"
+    if isinstance(obj, list):
+        return [_truncate_leaves(x, cap) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _truncate_leaves(v, cap) for k, v in obj.items()}
+    return obj
+
+
+def _repair_truncated_json(s: str, cap: int = _MAX_RESP_CHARS):
+    """Best-effort repair of JSON the source truncated mid-value.
+
+    Several hermes ``search_files`` responses carry a JSON *string* whose value
+    was cut at a fixed char budget, so ``json.loads`` fails (unterminated
+    string/array, or a raw control char at the cut). We cap the prefix, then
+    close any still-open string/array/object by walking the bracket+quote stack.
+    Returns the parsed dict/list, or ``None`` if it still won't parse.
+    """
+    s = s[:cap]
+    stack: list[str] = []
+    in_str = esc = False
+    for ch in s:
+        if esc:
+            esc = False
+            continue
+        if in_str:
+            if ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]" and stack:
+            stack.pop()
+    if esc:            # cut mid-escape -> drop the dangling backslash
+        s = s[:-1]
+    if in_str:
+        s += '"'
+    for op in reversed(stack):
+        s += "}" if op == "{" else "]"
+    try:
+        return json.loads(s, strict=False)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _coerce_response(body):
+    """Normalize a tool-response body to a bounded, template-safe value.
+
+    A JSON *object/array* stays STRUCTURED so the Gemma-4 template renders it
+    natively as ``response:name{k:v,...}`` (only leaf strings get the ``<|"|>``
+    quote). A string that *looks* like JSON but won't parse (dataset truncated it
+    mid-value) is ``strict=False``-parsed and, failing that, repaired into valid
+    JSON — so it can NEVER render as a ``{value:<|"|>{...blob...<|"|>}``, the
+    pattern that teaches the model to emit ``<|"|>`` inside its own tool-call
+    arguments. A genuine plain-text result stays a (capped) string.
+    """
+    if isinstance(body, str):
+        s = body.strip()
+        parsed = None
+        try:
+            parsed = json.loads(s, strict=False)
+        except (json.JSONDecodeError, ValueError):
+            if s[:1] in "{[":
+                # Two upstream shapes fail a full parse: (a) a valid JSON object
+                # followed by a trailing NL hint (``{...}\n\n[Hint: ...]``) —
+                # ``raw_decode`` grabs the leading object and we keep the tail as a
+                # bounded ``_note``; (b) JSON the source truncated mid-value — repair.
+                try:
+                    obj, end = json.JSONDecoder(strict=False).raw_decode(s)
+                    parsed = obj
+                    tail = s[end:].strip()
+                    if isinstance(obj, dict) and tail:
+                        obj.setdefault("_note", tail)
+                except (json.JSONDecodeError, ValueError):
+                    parsed = _repair_truncated_json(s)
+        if isinstance(parsed, (dict, list)):
+            body = parsed
+        else:  # plain text (or a scalar) — keep as a bounded string
+            return s if len(s) <= _MAX_RESP_CHARS else s[:_MAX_RESP_CHARS] + "…(truncated)"
+    return _truncate_leaves(body)
+
+
 def _parse_tools(raw) -> list | None:
     if isinstance(raw, list):
         return raw or None
@@ -133,9 +225,11 @@ def convert_hermes(ex: dict) -> tuple[list[dict] | None, list | None]:
     system boilerplate (``<tools>`` XML + instructions) is DROPPED: the native
     template rebuilds the system+tools prefix from the ``tools`` schema. ``gpt``
     turns are split into reasoning + tool_calls + residual content; the following
-    ``tool`` turn's ``<tool_response>`` blocks become ``role:"tool"`` messages,
-    positionally paired to the calls and re-id'd to the response's own
-    ``tool_call_id`` so the template resolves the function name exactly.
+    ``tool`` turn's ``<tool_response>`` blocks are parsed to STRUCTURED objects and
+    embedded as ``tool_responses:[{name,response}]`` on the assistant turn that
+    issued the calls (the Gemma-native path), positionally paired to the calls so
+    the template resolves each function name and renders the response as
+    ``response:name{k:v,...}`` — NOT a ``<|"|>``-wrapped stringified-JSON blob.
     """
     conv = ex.get("conversations") or ex.get("conversation")
     if not isinstance(conv, list) or not conv:
@@ -144,6 +238,7 @@ def convert_hermes(ex: dict) -> tuple[list[dict] | None, list | None]:
     msgs: list[dict] = []
     call_ctr = 0
     last_calls: list[dict] = []  # tool_call dicts of the most recent assistant turn
+    last_assistant: dict | None = None  # the assistant msg that issued last_calls
 
     for t in conv:
         frm = t.get("from") or t.get("role")
@@ -155,6 +250,7 @@ def convert_hermes(ex: dict) -> tuple[list[dict] | None, list | None]:
             if val.strip():
                 msgs.append({"role": "user", "content": val.strip()})
             last_calls = []
+            last_assistant = None
         elif frm in ("gpt", "assistant"):
             reasoning, rest = split_think(val)
             calls: list[dict] = []
@@ -177,28 +273,43 @@ def convert_hermes(ex: dict) -> tuple[list[dict] | None, list | None]:
                 return ""
 
             content = _TOOLCALL_RE.sub(_grab, rest).strip()
-            msgs.append(_assistant(content, reasoning, calls or None))
+            am = _assistant(content, reasoning, calls or None)
+            msgs.append(am)
             last_calls = calls
+            last_assistant = am
         elif frm in ("tool", "observation", "tool_response", "function"):
             blocks = _TOOLRESP_RE.findall(val) or [val.strip()]
+            responses: list[dict] = []
             for i, rb in enumerate(blocks):
                 body = rb
                 resp_id = None
                 try:
-                    o = json.loads(rb)
+                    o = json.loads(rb, strict=False)
                     resp_id = o.get("tool_call_id")
                     body = o.get("content", o)
-                    if not isinstance(body, str):
-                        body = json.dumps(body, ensure_ascii=False)
                 except json.JSONDecodeError:
                     pass
+                # Bound + structure the response: objects/arrays stay native
+                # (`response:name{k:v}`), giant leaves are capped, and a truncated
+                # JSON *string* is repaired into a dict instead of being wrapped as a
+                # `{value:<|"|>{...blob...<|"|>}` (which teaches the model to emit
+                # `<|"|>` inside its own tool-call args — the v1-e1 breakage).
+                body = _coerce_response(body)
                 if i < len(last_calls):
                     cid = resp_id or last_calls[i]["id"]
                     last_calls[i]["id"] = cid  # keep call id == response id
+                    tname = last_calls[i]["function"]["name"] or "unknown"
                 else:
-                    cid = resp_id or f"call_orphan_{i}"
-                msgs.append({"role": "tool", "tool_call_id": cid, "content": body})
+                    tname = "unknown"
+                responses.append({"name": tname, "response": body})
+            # Gemma-native path: embed the structured responses on the assistant turn
+            # that issued the calls (the template's `tool_responses` branch), instead
+            # of separate ``role:"tool"`` messages (which the template forward-scans as
+            # opaque `<|"|>` string blobs).
+            if last_assistant is not None and responses:
+                last_assistant.setdefault("tool_responses", []).extend(responses)
             last_calls = []
+            last_assistant = None
 
     if not any(m["role"] == "assistant" for m in msgs):
         return None, None

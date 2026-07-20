@@ -102,7 +102,9 @@ def test_hermes_call_response_pairing():
     _assert(isinstance(tools, list) and tools[0]["function"]["name"] == "execute_code", "tools passthrough")
 
     roles = [m["role"] for m in msgs]
-    _assert(roles == ["user", "assistant", "tool", "assistant"], f"roles: {roles}")
+    # responses embed on the assistant turn (Gemma-native) -> no separate role:tool msg
+    _assert(roles == ["user", "assistant", "assistant"], f"roles: {roles}")
+    _assert(all(m["role"] != "tool" for m in msgs), "no separate role:tool messages")
 
     call_asst = msgs[1]
     _assert(call_asst["reasoning_content"] == "let me run code", "reasoning on call turn")
@@ -112,13 +114,17 @@ def test_hermes_call_response_pairing():
     # no foreign XML left in any content field
     _assert("<tool_call>" not in call_asst["content"], "no tool_call XML in content")
 
-    tool_msg = msgs[2]
+    # tool response embedded as a STRUCTURED object (renders response:name{k:v}, not
+    # a <|"|>-wrapped stringified blob that corrupts tool-call generation)
+    trs = call_asst["tool_responses"]
+    _assert(len(trs) == 1, f"one tool_response embedded: {trs}")
+    _assert(trs[0]["name"] == "execute_code", "response name resolved")
+    _assert(trs[0]["response"] == {"output": "1"}, f"response kept structured: {trs[0]['response']!r}")
+    _assert(not isinstance(trs[0]["response"], str), "response is a dict, not a string blob")
     # call id re-id'd to the response's own tool_call_id so the template resolves the name
-    _assert(tool_msg["tool_call_id"] == "functions.execute_code:0", tool_msg["tool_call_id"])
     _assert(tc["id"] == "functions.execute_code:0", f"call id repaired: {tc['id']}")
-    _assert("<tool_response>" not in tool_msg["content"], "no tool_response XML")
 
-    final = msgs[3]
+    final = msgs[2]
     _assert(final["content"] == "The pattern works.", final["content"])
     _assert("tool_calls" not in final, "final has no calls")
 
@@ -135,11 +141,43 @@ def test_hermes_multi_call_positional():
     msgs, _ = rn.normalize({"conversations": conv, "tools": None}, "hermes")
     calls = msgs[1]["tool_calls"]
     _assert(len(calls) == 2, "two calls parsed")
-    tools_msgs = [m for m in msgs if m["role"] == "tool"]
-    _assert(len(tools_msgs) == 2, "two responses")
-    # positional pairing: response order matches call order, ids matched
-    _assert(calls[0]["id"] == tools_msgs[0]["tool_call_id"] == "functions.s:1", "pair 0")
-    _assert(calls[1]["id"] == tools_msgs[1]["tool_call_id"] == "functions.s:2", "pair 1")
+    trs = msgs[1]["tool_responses"]
+    _assert(len(trs) == 2, f"two responses embedded: {trs}")
+    # positional pairing: response order matches call order, ids matched to responses
+    _assert(calls[0]["id"] == "functions.s:1", "pair 0")
+    _assert(calls[1]["id"] == "functions.s:2", "pair 1")
+    # plain-text results stay strings (correctly quoted); only JSON objects go structured
+    _assert(trs[0]["response"] == "ra" and trs[1]["response"] == "rb", f"string results: {trs}")
+
+
+def test_hermes_truncated_json_response_repaired():
+    # the real hermes failure: a search_files response whose `content` JSON string
+    # was truncated by the source at a fixed char budget (unterminated array/string).
+    # It must be repaired into a STRUCTURED dict — never left as a string that the
+    # template wraps as a `{value:<|"|>{...blob...<|"|>}`.
+    huge = '{"total_count": 1, "files": ["' + "./p/" + "x" * 5000  # no closing "]}
+    conv = [
+        {"from": "human", "value": "find files"},
+        {"from": "gpt", "value": '<tool_call>{"name": "search_files", "arguments": {"q": "*"}}</tool_call>'},
+        {"from": "tool", "value": '<tool_response>{"tool_call_id": "functions.search_files:0", '
+                                  '"name": "search_files", "content": ' + json.dumps(huge) + '}</tool_response>'},
+    ]
+    msgs, _ = rn.normalize({"conversations": conv, "tools": None}, "hermes")
+    trs = msgs[1]["tool_responses"]
+    _assert(len(trs) == 1, f"one response: {trs}")
+    resp = trs[0]["response"]
+    _assert(isinstance(resp, dict), f"truncated JSON repaired to a dict, not a string: {type(resp).__name__}")
+    _assert("total_count" in resp or "files" in resp, f"structure recovered: {resp!r}")
+    # every string leaf is capped (no 5000-char blob dominates the sequence)
+    def _max_leaf(o):
+        if isinstance(o, str):
+            return len(o)
+        if isinstance(o, list):
+            return max((_max_leaf(x) for x in o), default=0)
+        if isinstance(o, dict):
+            return max((_max_leaf(v) for v in o.values()), default=0)
+        return 0
+    _assert(_max_leaf(resp) <= rn._MAX_RESP_CHARS + 16, f"leaves capped: {_max_leaf(resp)}")
 
 
 def main():
