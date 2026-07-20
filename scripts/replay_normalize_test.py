@@ -180,6 +180,44 @@ def test_hermes_truncated_json_response_repaired():
     _assert(_max_leaf(resp) <= rn._MAX_RESP_CHARS + 16, f"leaves capped: {_max_leaf(resp)}")
 
 
+def test_strip_foreign_chatml():
+    # ChatML <|im_start|>{role}\n / <|im_end|> must never survive into a target
+    _assert(rn._strip_foreign("<|im_start|>assistant\nhi<|im_end|>") == "hi",
+            rn._strip_foreign("<|im_start|>assistant\nhi<|im_end|>"))
+    _assert(rn._strip_foreign("clean text") == "clean text", "no-op on clean")
+    # in the messages path: leaks in user AND assistant content are stripped
+    ex = {"messages": [
+        {"role": "user", "content": "Q?<|im_end|>"},
+        {"role": "assistant", "content": "answer<|im_end|>"},
+    ]}
+    msgs, _ = rn.normalize(ex, "messages")
+    _assert("im_end" not in msgs[0]["content"], f"user chatml: {msgs[0]['content']!r}")
+    _assert("im_end" not in msgs[1]["content"], f"asst chatml: {msgs[1]['content']!r}")
+
+
+def test_strip_stray_think():
+    # an UNPAIRED <think> (no closing tag) survives split_think -> must be stripped
+    r, c = rn.split_think("<think>dangling with no close and then text")
+    # split_think leaves it (no pair); _assistant/_strip_foreign cleans the token
+    ex = {"messages": [
+        {"role": "user", "content": "Q?"},
+        {"role": "assistant", "content": "<think>dangling text with no close"},
+    ]}
+    msgs, _ = rn.normalize(ex, "messages")
+    _assert("<think>" not in msgs[1]["content"], f"stray think tag: {msgs[1]['content']!r}")
+    _assert("dangling text with no close" in msgs[1]["content"], "content body kept")
+
+
+def test_hermes_chatml_leak_stripped():
+    conv = [
+        {"from": "human", "value": "hi<|im_end|>"},
+        {"from": "gpt", "value": "response text<|im_end|>"},
+    ]
+    msgs, _ = rn.normalize({"conversations": conv, "tools": None}, "hermes")
+    _assert("im_end" not in msgs[0]["content"], f"hermes user: {msgs[0]['content']!r}")
+    _assert("im_end" not in msgs[1]["content"], f"hermes asst: {msgs[1]['content']!r}")
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for t in tests:

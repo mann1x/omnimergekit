@@ -46,6 +46,25 @@ _THINK_RE = re.compile(r"<think>\s*(.*?)\s*</think>", re.DOTALL)
 _TOOLCALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 _TOOLRESP_RE = re.compile(r"<tool_response>\s*(.*?)\s*</tool_response>", re.DOTALL)
 
+# Foreign chat-control tokens that must NEVER survive into a Gemma-4 native
+# training target: ChatML `<|im_start|>{role}\n` / `<|im_end|>` headers (a
+# competing chat format), and any STRAY `<think>`/`</think>` left after
+# split_think() consumed the paired blocks (unbalanced tags in the source).
+# Training on these teaches the model to emit them as prose against its native
+# `<|channel>`/`<|tool_call>` family. Paired think + tool_call/tool_response XML
+# are handled by the converters above; this only removes the leftovers.
+_CHATML_RE = re.compile(r"<\|im_start\|>[^\n]*\n?|<\|im_end\|>")
+_STRAY_THINK_RE = re.compile(r"</?think>")
+
+
+def _strip_foreign(text: str) -> str:
+    """Remove ChatML headers + stray think tokens from a content string."""
+    if not text:
+        return text
+    text = _CHATML_RE.sub("", text)
+    text = _STRAY_THINK_RE.sub("", text)
+    return text
+
 
 def split_think(text: str) -> tuple[str | None, str]:
     """Pull a leading ``<think>...</think>`` block out of ``text``.
@@ -64,9 +83,11 @@ def split_think(text: str) -> tuple[str | None, str]:
 
 def _assistant(content: str, reasoning: str | None = None,
                tool_calls: list | None = None) -> dict:
-    a: dict = {"role": "assistant", "content": content or ""}
+    a: dict = {"role": "assistant", "content": _strip_foreign(content or "")}
     if reasoning:
-        a["reasoning_content"] = reasoning
+        reasoning = _strip_foreign(reasoning)
+        if reasoning:
+            a["reasoning_content"] = reasoning
     if tool_calls:
         a["tool_calls"] = tool_calls
     return a
@@ -81,7 +102,7 @@ def convert_instruction(ex: dict) -> tuple[list[dict] | None, None]:
     reasoning, content = split_think(out)
     if not content:  # pure-reasoning row with no answer body is unusable
         return None, None
-    return [{"role": "user", "content": instr.strip()},
+    return [{"role": "user", "content": _strip_foreign(instr.strip())},
             _assistant(content, reasoning)], None
 
 
@@ -107,6 +128,7 @@ def convert_messages(ex: dict) -> tuple[list[dict] | None, None]:
             reasoning = reasoning.strip() if isinstance(reasoning, str) else None
             out.append(_assistant(content, reasoning or None))
         elif role in ("user", "system"):
+            content = _strip_foreign(content)
             if content.strip():
                 out.append({"role": role, "content": content})
     # need at least one user + one assistant
@@ -247,8 +269,9 @@ def convert_hermes(ex: dict) -> tuple[list[dict] | None, list | None]:
         if frm in ("system",):
             continue  # native template rebuilds sys+tools from `tools`
         if frm in ("human", "user"):
-            if val.strip():
-                msgs.append({"role": "user", "content": val.strip()})
+            uc = _strip_foreign(val.strip())
+            if uc.strip():
+                msgs.append({"role": "user", "content": uc})
             last_calls = []
             last_assistant = None
         elif frm in ("gpt", "assistant"):
