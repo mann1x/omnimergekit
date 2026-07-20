@@ -1,0 +1,28 @@
+{
+  "name": "agentic_tasks_v1",
+  "note": "Multi-turn agentic coding tasks for the closed-loop driver (drive.py). Every task requires at least two tool turns, so the SECOND-turn regime -- where users report v7-coder loops ('looped on calling a tool' / 'looped during reasoning on the second attempt' in OpenCode/Kilo) and where the chat-template thinking-reinject path fires -- is always exercised. Tasks are framed around the reported triggers (solar-system-v4, snake game) plus list->write and read->modify->write sequences. Run paired on v7-coder-Q6_K and 128e-Q6_K, same sampler/template, then diff_divergence.py.",
+  "system": "You are a coding agent operating inside a project directory. You have three tools: list_directory(path), read_file(path), and write_file(path, content). Complete the user's task by calling these tools. Write real, complete code with write_file. When the task is done, reply with a one-line confirmation and stop. Be concise. Do not repeat a tool call you have already made.",
+  "default": {"reasoning_budget": 16384, "max_tokens": 32000},
+  "tasks": [
+    {"name": "list_then_index",
+     "user": "First list the project root to see what's there, then create an index.html with a simple 'Hello World' landing page. Confirm when done."},
+
+    {"name": "solar_system_v4",
+     "user": "Create a 3D solar system simulator. Ensure the planets are correctly positioned, orbit the sun, and are aligned from today's date, with user controls to speed up time. Put everything in a single new file called solar-system-v4.html, then confirm."},
+
+    {"name": "snake_game",
+     "user": "Write a snake game as a single self-contained HTML file named snake.html. Create the file, then confirm it's done."},
+
+    {"name": "read_fix_calc",
+     "seed_files": {"calc.js": "// adds two numbers\nfunction add(a, b) {\n  return a - b;\n}\nmodule.exports = { add };\n"},
+     "user": "There's a bug in calc.js: add() returns the wrong result. Read the file, fix the bug, and save it. Confirm when fixed."},
+
+    {"name": "read_extend_page",
+     "seed_files": {"site/home.html": "<!doctype html>\n<html><head><title>Home</title></head>\n<body><h1>Home</h1></body></html>\n"},
+     "user": "Read site/home.html, add a footer with a copyright line inside the body, and save the updated file. Confirm when done."},
+
+    {"name": "explore_then_build",
+     "seed_files": {"README.md": "# My Project\nA small web demo.\n", "assets/.keep": ""},
+     "user": "List the project root, read the README, then build a single-file bouncing-ball animation in ball.html that matches the project theme. Confirm when done."}
+  ]
+}
