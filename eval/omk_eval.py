@@ -406,6 +406,46 @@ def llama_bench_defaults(task: str) -> list[str]:
     return []
 
 
+def llamafile_bench_defaults(task: str) -> list[str]:
+    """Per-bench serve flags for the first-tier `opencoti-llamafile` backend.
+
+    Differs from `llama_bench_defaults` in ONE load-bearing way: code benches
+    (HE/MBPP/LCB/MultiPL-E) use the SAME think-then-answer structure as the
+    reasoning benches — `--reasoning-format deepseek` (thoughts → parsed into
+    `reasoning_content`, clean answer/code left in `content`) with a budget —
+    rather than `--jinja --reasoning off`.
+
+    Why: `--reasoning off` is not broken (it correctly suppresses the <think>
+    block), but on the opencoti-llamafile stack a WEAK model (e.g. Gemma-4 E2B,
+    2B-effective) without the think scaffold answers a complex coding prompt
+    with explanatory prose / pseudocode instead of a fenced function, so the
+    code extractor finds nothing and pass@1 collapses. Strong models (128e 26B)
+    emit clean code directly and are fine with reasoning-off, which is why the
+    plain `llama` backend keeps it. Validated 2026-07-20 on E2B F16 + MTP:
+    HumanEval 0.6% (`--reasoning off`) → 83.5% (`deepseek` + budget 12288).
+    The budget here is a fallback; the caller syncs it to the template's
+    `generation.thinking_token_budget` (12288 for code, 8192/24576 for
+    reasoning) via the existing --reasoning-budget sync.
+    """
+    t = (task or "").lower()
+    code = any(s in t for s in
+               ("humaneval", "mbpp", "livecodebench", "lcb", "multipl"))
+    return ["--jinja", "--reasoning-format", "deepseek",
+            "--reasoning-budget", "12288" if code else "8192"]
+
+
+def llamafile_mtp_extra(mtp_head: str, spec_n: int) -> list[str]:
+    """MTP speculative-decoding serve flags for the llamafile backend.
+
+    Lossless self-speculation via a draft-assistant head: the target verifies
+    every drafted token, so output is identical to non-speculative decoding —
+    only faster. `spec_n` = max draft tokens per step (`--spec-draft-n-max`).
+    """
+    return ["--flash-attn", "on", "--mtp-head", mtp_head,
+            "--spec-type", "draft-assistant", "-ngld", "99",
+            "--spec-draft-n-max", str(spec_n)]
+
+
 def launch_llama(gguf: str, port: int, log_path: Path,
                  ctx: int = 32768, ngl: int = 99, parallel: int = 2,
                  extra: list[str] | None = None,
@@ -797,7 +837,7 @@ def dispatch_lm_eval(template: dict, model_tag: str, base_url: str,
         cmd += ["--gen_kwargs", ",".join(gen_kw_parts)]
     if ba.get("apply_chat_template", False):
         cmd += ["--apply_chat_template"]
-    if ba.get("num_fewshot", 0):
+    if ba.get("num_fewshot") is not None:
         cmd += ["--num_fewshot", str(ba["num_fewshot"])]
     if ba.get("confirm_run_unsafe_code", False):
         cmd += ["--confirm_run_unsafe_code"]
@@ -1862,7 +1902,13 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="path or HF id")
     ap.add_argument("--template", required=True, help="template name or path")
-    ap.add_argument("--backend", choices=("vllm", "llama"), required=True)
+    ap.add_argument("--backend", choices=("vllm", "llama", "llamafile"),
+                    required=True,
+                    help="Serve engine. 'llama' = llama.cpp/llama-server; "
+                         "'llamafile' = opencoti-llamafile (first-tier: auto "
+                         "binary, deepseek think-then-answer for code benches, "
+                         "optional MTP drafter via --mtp-head/--spec-n); "
+                         "'vllm' = vLLM.")
     ap.add_argument("--quant", default="auto",
                     help="auto|bf16|fp16|nvfp4a16|awq|gptq|q6_k|q4_k_m|...")
     ap.add_argument("--port", type=int, default=8195)
@@ -1930,6 +1976,19 @@ def main() -> None:
     ap.add_argument("--max-parallel", type=int, default=None,
                     help="Upper cap on per-server parallel slots (default 8). "
                     "Env: OMK_MAX_PARALLEL.")
+    # ── First-tier opencoti-llamafile backend (--backend llamafile) ──────────
+    ap.add_argument("--llamafile-bin",
+                    default=os.environ.get("OMK_LLAMAFILE_BIN",
+                                           "/srv/ml/opencoti-llamafile/llamafile"),
+                    help="Path to the opencoti-llamafile binary (--backend "
+                         "llamafile). Env: OMK_LLAMAFILE_BIN. A template's "
+                         "backend_args.server_bin still overrides this.")
+    ap.add_argument("--mtp-head", default="",
+                    help="llamafile MTP: draft-assistant GGUF for lossless "
+                         "speculative decoding. Empty = no MTP.")
+    ap.add_argument("--spec-n", type=int, default=2,
+                    help="llamafile MTP: max draft tokens per step "
+                         "(--spec-draft-n-max). Only used with --mtp-head.")
     args = ap.parse_args()
 
     # Resolve template
@@ -2162,7 +2221,13 @@ def main() -> None:
             )
         else:
             # Compose llama extras: bench-typed defaults + template override.
-            llama_extra = llama_bench_defaults(template.get("task", ""))
+            # The first-tier llamafile backend uses deepseek think-then-answer
+            # for code benches too (see llamafile_bench_defaults); plain llama
+            # keeps --reasoning off for code.
+            _is_llamafile = (args.backend == "llamafile")
+            llama_extra = (llamafile_bench_defaults(template.get("task", ""))
+                           if _is_llamafile
+                           else llama_bench_defaults(template.get("task", "")))
             # Sync reasoning budget with template thinking_token_budget when the
             # bench is reasoning-typed (defaults emit --reasoning-budget 8192).
             # Without this, GPQA templates asking for 24576 silently get 8192
@@ -2192,6 +2257,16 @@ def main() -> None:
             env_extra = os.environ.get("LLAMA_EXTRA", "").strip()
             if env_extra:
                 llama_extra = shlex.split(env_extra)
+            # llamafile MTP: append lossless draft-assistant speculative flags.
+            # CLI --mtp-head wins; template backend_args.mtp_head is the fallback
+            # (spec_n likewise). Orthogonal to the reasoning flags, so appended
+            # even after an LLAMA_EXTRA override.
+            if _is_llamafile:
+                _mtp = args.mtp_head or ba.get("mtp_head", "")
+                if _mtp and "--mtp-head" not in llama_extra:
+                    _spn = (args.spec_n if args.mtp_head
+                            else int(ba.get("spec_n", args.spec_n)))
+                    llama_extra += llamafile_mtp_extra(_mtp, _spn)
             requested_ctx = int(ba.get("llama_ctx", 32768))
             # Per-slot ctx safety (ctx // parallel >= thinking_budget +
             # content_headroom) and GPU selection both live in
@@ -2240,10 +2315,13 @@ def main() -> None:
                 f"(thinking_budget={thinking_budget}, "
                 f"content_headroom={content_headroom}, ctx_max={ctx_max}) ctx={ctx} "
                 f"per_slot_ctx={ctx // parallel}")
-            if plan.gpu_ids and plan.replicas > 1 and plan.tensor_parallel == 1:
+            if (plan.gpu_ids and plan.replicas > 1 and plan.tensor_parallel == 1
+                    and not _is_llamafile):
                 # Multi-GPU: one full-model server per GPU behind a round-robin
                 # proxy on --port (backends on --port+1..+N). num_concurrent must
                 # be replicas×parallel to feed every slot — wired in P5.
+                # (llamafile is forced single-server: the fleet launcher can't
+                # carry server_bin, and MTP self-speculation is single-server.)
                 rt = int((template.get("backend_args", {}) or {})
                          .get("llama_request_timeout", 1800))
                 server = launch_llama_fleet(
@@ -2257,12 +2335,15 @@ def main() -> None:
                 # llama_extra (llama_raw_serve=true → omk injects no opinionated
                 # serve defaults). Standard GGUF templates set none of these and
                 # behave exactly as before.
-                server = launch_llama(args.model, args.port, log_path,
-                                      ctx=ctx, parallel=parallel,
-                                      extra=llama_extra, gpu_id=gpu_id,
-                                      server_bin=ba.get("server_bin"),
-                                      server_prefix=ba.get("server_prefix_args"),
-                                      raw_args=bool(ba.get("llama_raw_serve", False)))
+                server = launch_llama(
+                    args.model, args.port, log_path,
+                    ctx=ctx, parallel=parallel,
+                    extra=llama_extra, gpu_id=gpu_id,
+                    server_bin=(ba.get("server_bin")
+                                or (args.llamafile_bin if _is_llamafile else None)),
+                    server_prefix=(ba.get("server_prefix_args")
+                                   or (["--server"] if _is_llamafile else None)),
+                    raw_args=bool(ba.get("llama_raw_serve", False)))
                 serve_gpu_id = gpu_id
         try:
             wait_ready(server, served_name=served_name)

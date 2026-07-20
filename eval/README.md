@@ -74,8 +74,25 @@ Re-run with: `./validate_scorers.py --bench all`
 | Backend | When |
 |---|---|
 | vLLM (default) | BF16/FP16 if fits VRAM, else NVFP4A16/AWQ/GPTQ. New runs go here. |
-| llama.cpp | Existing GGUF tiers (Q2_K..Q6_K) we already built; Apple silicon. |
+| llama.cpp (`--backend llama`) | Existing GGUF tiers (Q2_K..Q6_K) we already built; Apple silicon. |
+| opencoti-llamafile (`--backend llamafile`) | GGUF served by the opencoti-llamafile build, with optional lossless MTP speculative decoding. First-tier: auto binary (`--llamafile-bin`, env `OMK_LLAMAFILE_BIN`), `--mtp-head`/`--spec-n` for the draft-assistant, and think-then-answer (`deepseek` + budget) for code benches so weak/small models still emit clean fenced code. |
 | Pod-side | Same `omk_eval.py` — pod is just a remote `--model` path. |
+
+`--backend llamafile` example (MTP, code bench flags derived from the template):
+
+```bash
+omk_eval.py --backend llamafile --template humaneval_full \
+    --model <f16.gguf> --tokenizer <hf-id> \
+    --mtp-head <drafter.gguf> --spec-n 2
+```
+
+Unlike `--backend llama` (which uses `--reasoning off` for code benches — correct
+on strong models), `llamafile` uses `--reasoning-format deepseek` +
+`--reasoning-budget <template.thinking_token_budget>` for code benches too: a
+weak model (e.g. Gemma-4 E2B) without the think scaffold answers coding prompts
+with prose instead of a fenced function and pass@1 collapses (E2B HumanEval
+0.6% → 83.5% with the scaffold). `--reasoning off` itself is not broken — it
+correctly suppresses `<think>`; the model just needs the scaffold to emit code.
 
 ## Templates
 
