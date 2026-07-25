@@ -1,0 +1,10 @@
+# local run artifacts — never committed
+results/
+*.egg-info/
+__pycache__/
+*.pyc
+.ruff_cache/
+# local GGUFs / model files a user drops in to test
+*.gguf
+# server logs from the driver
+*.log
