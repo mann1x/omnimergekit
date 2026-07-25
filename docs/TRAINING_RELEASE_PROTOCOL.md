@@ -55,6 +55,36 @@ Update the **same** release/tag and append:
   split into `<2 GB` parts. Big artifacts (weights / GGUF) go to HF — never split into
   a release.
 
+## Canonical builder — `scripts/build_training_release.sh`
+
+Do NOT hand-assemble releases per run (that is how asset layout drifts). The
+`an-finetune` repo ships one parametrized builder that produces the exact asset
+set above from a per-variant fact block:
+
+```
+scripts/build_training_release.sh <variant>            # dry-run: stage + gitleaks, no publish
+scripts/build_training_release.sh <variant> --publish  # gh release create (or upload --clobber if the tag exists)
+```
+
+- **Per-variant case block** (in the script) pins: `TAG` (`<variant>-<YYYYMMDD>`),
+  `TITLE`, the bs2 `out/` dir, adapter subdir (`lora` for SFT, `adapter` for
+  ORPO/GRPO), F16 GGUF path, train log, curated-data dir, and `KIND`
+  (`sft`/`orpo`/`grpo`) which selects how `datasets.tar.gz` is built.
+- **Pulls from bs2** (compute host): LoRA adapter, per-model eval summaries
+  (`eval/v9_gate` + `omk/**/<v>/summary.json`), final train metrics, and the
+  sha256 manifest (weights are hashed remotely — never transferred; they stay on
+  bs2 / go to HF, never into the release).
+- **Pulls from this repo**: the toolchain snapshot (`scripts.tar.gz` = code-only
+  `docker/ simpo/ eval/ netconfig/ a2areason/`), the mix/config, and the two
+  hand-written prose files it REQUIRES per run:
+  `docs/releases/BODY_<v>.md` (the release notes / markdown body) and
+  `docs/releases/DOC_<v>.txt` (the full run documentation asset).
+- **gitleaks-scans** the staged assets before any publish; aborts on a finding.
+- Dry-run copies staged assets to `docs/releases/staged_<v>/` for inspection.
+
+The mechanical 80% (tarballs, metrics, manifest, scan, `gh release create`) is
+identical across runs; only `BODY_<v>.md` + `DOC_<v>.txt` are authored per run.
+
 ## Constraints
 
 - **Secrets**: never archive a file containing a token/key. The gitleaks gate applies;
