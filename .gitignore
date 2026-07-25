@@ -76,3 +76,11 @@ runs/
 
 # generated code-graph output (regenerable)
 graphify-out/
+
+# aime_100 lm-eval task yaml: GENERATED per host, because dataset_kwargs.data_files
+# must be an ABSOLUTE path (HF datasets resolves relative paths against CWD and
+# lm-eval does not chdir to the task dir). Committing one host's copy guarantees a
+# stale pointer on every other host. The DATA (aime_100.jsonl) and the build report
+# ARE committed and are byte-identical across hosts.
+# Materialise with: python eval/build_aime100_dataset.py --yaml-only
+eval/lm_eval_tasks/aime100_chat/aime100_chat.yaml
