@@ -164,6 +164,184 @@ ctx — fine for HE/MBPP/LCB chat. For GPQA's 24K gen budget, use
 
 `memory/feedback_eval_token_cap_truncation.md` (write this if not present)
 
+### 1.3a PER-SLOT CTX IS MACHINE-ENFORCED — omk REFUSES to eval a mis-sized server
+
+The rule in §1.3 was written, documented, and **still violated twice**, costing
+multi-day investigations both times. Documentation alone does not work for this
+failure, because the symptom looks exactly like a model regression. It is now a
+**hard gate in code**, and this section is the operator's reference.
+
+#### The arithmetic — memorise this
+
+```
+per_slot_ctx = server -c  /  server --parallel
+```
+A request can never generate beyond **its own slot**. So:
+
+| launcher flags            | per-slot ctx | what a 12288-budget / 16384-max_gen_toks template actually gets |
+|---------------------------|-------------:|-----------------------------------------------------------------|
+| `-c 32768` (no --parallel → llamafile default 4) | 8192   | cut at ~8189 |
+| `-c 32768 --parallel 8`   | **4096**     | cut at ~4093 — ⚠️ **NOT a reliable fingerprint, see §1.3a-bis** |
+| `-c 131072 --parallel 8`  | 131072       | full 16384, correct |
+
+**Sizing rule — always compute it before launching:**
+```
+required_gen_per_slot = max( max_gen_toks , thinking_token_budget + 4096 )
+-c  >=  parallel × required_gen_per_slot
+```
+**Both terms matter — take the max, never just the thinking one.** `max_gen_toks`
+is the actual hard generation cap the client requests; `thinking_token_budget +
+4096` is the reasoning budget plus answer headroom. For the canonical 9-bench
+templates the two are *coincidentally equal* (12288 + 4096 = 16384 =
+`max_gen_toks`), which makes a thinking-only formula look correct — it is not.
+Where they diverge the larger wins:
+
+| template | max_gen_toks | budget + 4096 | required per slot |
+|---|---:|---:|---:|
+| canonical 9-bench (aime/ifeval/gpqa/gsm8k/…) | 16384 | 16384 | **16384** |
+| `*_reeval24k` | 49152 | 28672 | **49152** ← max_gen_toks dominates |
+| `gpqa_diamond_full` | 16384 | 12288 | **16384** |
+| `lcb_medium_*` (no budget) | 16384 | — | **16384** |
+| `mmlu_pro_200` / `mrcr_*` | 2048 | — | **2048** (prompt dominates, see below) |
+
+VRAM for KV is cheap (78 MiB of ~90 GB free at the old setting) — **never
+economise on `-c`.** Bump `-c` UP; do not clamp `--parallel` down, and NEVER
+lower a template's `max_gen_toks` or budget to make a server fit.
+
+**The prompt is a separate, LOUD failure — do not conflate them.** A slot must
+hold `prompt + generation`. This gate covers only the generation side, on
+purpose: a prompt that overflows its slot fails **loudly** (HTTP 400 / context
+error, and vLLM rejects outright), whereas generation overflow truncates
+**silently**. For long-context benches (`mrcr_*`, `ruler_*`, `nolima_*`) the
+prompt is the whole budget — those templates carry an explicit `llama_ctx` and
+usually force single-flight concurrency; size `-c` from the context length there,
+not from `max_gen_toks`.
+
+### 1.3a-bis A PIN IS NOT PROOF OF TRUNCATION — two mechanisms emit the same number
+
+**Read this before retracting any result on the strength of a token pin.** On
+2026-07-25 a pin at exactly **4093** was diagnosed as per-slot truncation, the
+whole AN E2B matrix was announced invalid, and the diagnosis was **wrong**. The
+two mechanisms are numerically indistinguishable:
+
+```
+per-slot ctx      :  32768 / 8          − 3  =  4093
+answer-budget left:  16384 − 12288      − 3  =  4093     ← the real cause that day
+                     max_gen_toks  thinking_budget
+```
+
+The second is not a defect at all. When a model **exhausts its whole reasoning
+budget**, the client's `max_gen_toks` leaves it exactly
+`max_gen_toks − thinking_token_budget` tokens for the answer channel; a
+ruminating model then loops through *all* of them and stops with
+`finish_reason=length`. **That pin is a model rumination signature, correctly
+measured.** Any template where `max_gen_toks − thinking_token_budget` happens to
+equal `-c / --parallel` will produce the identical integer from either cause.
+For the canonical 9-bench set that is `16384 − 12288 = 4096` — the same 4096 the
+`-c 32768 --parallel 8` mistake produces.
+
+#### The disambiguation — one request, seconds, always do this first
+
+Do **not** re-run a matrix on pin evidence alone. Query the live server directly
+and compare what was *decoded* against what was *returned*:
+
+```bash
+curl -s localhost:$PORT/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"'$NAME'","messages":[{"role":"user","content":"<a prompt that makes it ruminate>"}],
+       "max_tokens":16384,"temperature":0}' | jq '{
+     finish_reason: .choices[0].finish_reason,
+     decoded:       .usage.completion_tokens,
+     reasoning_len: (.choices[0].message.reasoning_content|length),
+     content_len:   (.choices[0].message.content|length) }'
+```
+
+Then tokenize `reasoning_content` and `content` **separately**:
+
+| observation | verdict |
+|---|---|
+| `tokens(reasoning_content) ≈ thinking_token_budget` **and** `tokens(content) ≈ max_gen_toks − budget` | **RUMINATION.** Working as configured. The score is real. Do NOT re-run. |
+| `tokens(reasoning) + tokens(content) ≈ per_slot_ctx − prompt`, reasoning well under budget, `content` ≈ empty | **TRUNCATION.** Fix `-c`/`--parallel` and re-run. |
+| `/props` shows `default_generation_settings.n_ctx` ≥ required and the pin persists | **not the slot** — by construction. Go to the budget arithmetic. |
+
+The 2026-07-25 measurement that settled it: `finish_reason=length`, decoded
+**16384**, `reasoning_content` **12286** tok, `content` **4093** tok, `content`
+non-empty (7009 chars of one LaTeX identity repeated). Per-slot was a verified
+**131072**. Truncation was impossible; the model simply ruminated to exhaustion.
+
+#### Corollary — `content_tokens == max_gen_toks − budget && finish_reason == length` is a FREE LOOP DETECTOR
+
+It is a cleaner rumination metric than anything else in this suite: unambiguous,
+already recorded, needs no extra run. Track it per cell. On the AN E2B matrix it
+separated the variants perfectly — base 0/30 pinned, v23 11/30 pinned.
+
+**Design consequence:** a 16384/12288 split leaves the answer channel only 4096
+tokens. For variants that ruminate, that converts "thought too long" into "answer
+is 4096 tokens of loop", and the answer is then unscoreable for a reason that has
+nothing to do with the bench. If you care about the answer channel, raise
+`max_gen_toks` rather than shrinking the budget.
+
+#### Why it is invisible without the gate
+
+The truncation lands **only on the variants that think long**. A pruned model
+that ruminates gets cut; a clean model that answers in 800 tokens does not. The
+result reads as a crisp quality regression, is reproducible, and is completely
+fake. Worse, if two cells ran at different `--parallel`, they are not comparable
+at all — and because launcher scripts truncate their serve log on every
+re-serve (`: >"$log"`), **per-cell attribution is unrecoverable after the fact.**
+
+#### The enforcement (two layers, both live)
+
+1. **omk launches the server** → `gpu_planner.plan_ctx()` bumps `-c` UP to fit
+   `parallel × (budget + headroom)`. Safe since P1.
+2. **someone else launches the server** (`--no-server`, i.e. every chain script)
+   → `omk_eval.assert_external_slots_fit()` reads `/props`
+   (`total_slots` + `default_generation_settings.n_ctx`, already per-slot) and
+   **raises SystemExit** when `per_slot < max(budget + headroom, max_gen_toks)`.
+   Layer 2 is the hole that produced both incidents; it is now closed.
+
+Every run logs one line — grep it to confirm the geometry:
+```
+[slot-gate] external server :8266 total_slots=8 per_slot_ctx=131072 required=16384
+```
+
+#### Auditing results after the fact
+
+`finish_reason == "length"` is authoritative where a runner records it (netconfig,
+lcb). For lm-eval benches, tokenize the completions and look for a **pin**: many
+rows at the identical max length is a ceiling, not a coincidence.
+```python
+toks = sorted(len(tk(r["filtered_resps"][0]).input_ids) for r in recs)
+pin  = sum(1 for t in toks if t >= toks[-1] - 8)   # pin >= 3 → SUSPECT, not proven
+```
+**A pin is SUSPECT, never CONTAMINATED on its own — §1.3a-bis.** Before
+retracting anything, run the decode-vs-return disambiguation there. A pin at
+`max_gen_toks − thinking_token_budget` is a rumination signature and the score is
+valid; a pin at `per_slot_ctx − prompt` with an empty answer channel is
+truncation. They are the same integer whenever the template's budget split
+matches the slot size.
+
+Two further traps in this audit:
+
+- **`p50` == `MAX` is a ceiling; `p50` == pin with `MAX` far above it is NOT.** One
+  cell is one server is one `--parallel`, and per-slot ctx is fixed at model load,
+  so a hard slot cap **cannot** let other rows in the same cell run longer. If you
+  see `p50=4093, MAX=15266`, the pin is a *mode*, not a cap — and check whether the
+  cell inherited cached rows from an earlier run at different settings (the sqlite
+  cache is keyed by prompt, not by serving config, so a resumed cell can legitimately
+  mix two geometries).
+- **Differing maxima across cells are not by themselves fatal.** A variant that
+  answers in 1869 tokens and one that runs to 16255 may simply differ in how much
+  they ruminate — which is exactly what the bench is measuring. Establish the
+  mechanism first.
+
+#### Incident log for this exact defect
+
+| date | scope | damage |
+|---|---|---|
+| 2026-05 (T172.4) | IFEval α-sweep | per-slot < reasoning_budget (SAT_COLLAPSE); sweep re-run |
+| 2026-07-25 | AN E2B `aime_30` + `ifeval_full`, all samplers | **RETRACTED — see the row below.** Initially announced as "all 51 cells discarded" on the strength of 4093-token pins read as `32768/8 − 3`. |
+| 2026-07-25 (same day, corrected) | same | **The retraction was WRONG and was itself withdrawn.** `4093 = 16384 − 12288 − 3` = the answer channel left after the thinking budget is spent; a *model* rumination signature, not truncation. Proven by a live-server probe: `finish_reason=length`, decoded 16384, `reasoning_content` 12286 tok, `content` 4093 tok non-empty, at a **verified 131072/slot**. Pins also straddled an unrelated binary change (4 cells before it, 2 after), and one cell showed `p50=4093` with `MAX=15266`, which no hard cap can produce. Standing: all `ifeval_full` cells (every one reaches 15–17k tokens), 8 of 9 base-reference benches, both domain gates. The real per-slot defect did exist but cost ≤1 question on the worst variant (v23 greedy 0.1000 → 0.0667). Full RCA: `backup_models/docs/an_e2b_4093_rca_c6_attribution.md`. **Lesson: instrument the boundary before retracting — the probe cost seconds and saved tens of GPU-hours.** |
+
 ### 1.4.5 ALWAYS pin the full eval stack across a cohort — vllm, lm-eval, drivers, torch, CUDA, cuDNN, templates
 
 **A "cohort" is any set of models whose scores will be compared in the same table or card** (e.g. `{128e, v4, v5, v5-coder}` for the canonical 9-bench, or `{v4 baseline, v5 α-sweep}` for a free-knob probe). Every model in the cohort MUST be evaluated with **bit-identical software** on every layer of the stack:
@@ -742,6 +920,14 @@ Run this mentally before every nohup/launch:
 □ git pull omnimergekit  (no stale local script)
 □ pod and local llama.cpp on same commit
 □ canonical settings table §1.3 matched
+□ A TOKEN PIN IS NOT PROOF OF TRUNCATION (§1.3a-bis). Before retracting ANY
+    result: check tokens(content) vs max_gen_toks − thinking_budget. If it
+    matches, that is RUMINATION and the score is valid. One curl settles it.
+□ PER-SLOT CTX (§1.3a): -c >= parallel × max(max_gen_toks, thinking_budget+4096).
+    BOTH terms — take the max. Compute -c/--parallel by hand.
+    32768/8 = 4096 = SILENT TRUNCATION.
+    After launch, grep the run log for `[slot-gate] ... per_slot_ctx=`
+    and confirm per_slot_ctx >= required. This has burned us TWICE.
 □ --use_cache present, path unique per (model, task)
 □ --log_samples present
 □ HF_TOKEN in env if gated dataset

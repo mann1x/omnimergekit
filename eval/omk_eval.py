@@ -552,6 +552,91 @@ def _make_llama_proxy(front_port: int, backend_ports: list[int],
     return httpd, thread
 
 
+def assert_external_slots_fit(port: int, template: dict, log) -> None:
+    """REFUSE to eval against an already-running server whose PER-SLOT ctx cannot
+    hold the template's generation budget.  Hard failure, never a warning.
+
+    ── How llama.cpp / llamafile actually divide context ──────────────────────
+        per_slot_ctx = n_ctx / n_parallel          (-c / --parallel)
+    A request can NEVER generate past its own slot.  So `-c 32768 --parallel 8`
+    caps every completion at 4096 tokens, and `--parallel 4` at 8192 — no matter
+    what max_gen_toks the client asks for.  The server logs no error: it just
+    stops early with finish_reason=length.
+
+    ── Why this is a hard gate ────────────────────────────────────────────────
+    The cut lands ONLY on the variants that think long, so it is indistinguishable
+    from a real quality regression, and it silently makes cells incomparable when
+    two runs used different --parallel.  It has now burned two multi-day
+    investigations:
+      · 2026-05  T172.4 — IFEval sweep, per-slot < reasoning_budget (SAT_COLLAPSE)
+      · 2026-07-25 — the AN aime_30/ifeval_full matrix: 4093-token pins
+        (= 32768/8 − 3) in v16 20/30, v19 25/30, v23 18/30, v21 16/30 while
+        v9/grpo-v2 reached 15–16k and v17 never passed 1869.  Because serve logs
+        are truncated on every re-serve, per-cell attribution was IMPOSSIBLE and
+        all 51 cells had to be thrown away.
+    omk's own launch path has been safe since P1 (gpu_planner.plan_ctx bumps ctx
+    UP to fit parallel × (budget + headroom)) — but EVERY external launcher
+    (`--no-server`) bypassed that.  This closes that hole for all of them.
+
+    ── How to size a server by hand ──────────────────────────────────────────
+        required_gen_per_slot = max(max_gen_toks, thinking_token_budget + 4096)
+        -c  >=  parallel × required_gen_per_slot
+    BOTH terms matter. They are coincidentally equal for the canonical 9-bench
+    templates (12288 + 4096 = 16384 = max_gen_toks), so a thinking-only formula
+    looks right and is not: `*_reeval24k` asks max_gen_toks 49152 with budget
+    24576, where max_gen_toks dominates. Hence the max() below.
+    e.g. `-c 131072 --parallel 8` = 128k per slot on a model whose n_ctx_train
+    is 131072 — VRAM for KV is cheap, do not economise here.
+
+    Scope: GENERATION only, deliberately. A slot must hold prompt + generation,
+    but a prompt that overflows fails LOUDLY (HTTP 400 / context error) while
+    generation overflow truncates SILENTLY — this gate covers the silent half.
+    Long-context templates (mrcr_*, ruler_*, nolima_*) must size -c from their
+    context length, not from max_gen_toks.
+
+    /props is the source of truth: `total_slots` and
+    `default_generation_settings.n_ctx` (which is ALREADY per-slot), so the real
+    serving geometry is checked rather than the launcher's intent.
+    """
+    import urllib.request
+
+    gen = template.get("generation", {}) or {}
+    ba = template.get("backend_args", {}) or {}
+    budget = int(gen.get("thinking_token_budget", 0) or 0)
+    max_gen = int(gen.get("max_gen_toks", 0) or 0)
+    headroom = int(ba.get("llama_content_headroom", 4096))
+    required = max(budget + headroom, max_gen)
+    if required <= 0:
+        return
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/props", timeout=30) as r:
+            props = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:                                  # noqa: BLE001
+        log(f"WARNING: could not read /props on :{port} ({e}) — cannot verify "
+            f"per-slot ctx >= {required}. Proceeding UNVERIFIED.")
+        return
+    slots = int(props.get("total_slots") or 0)
+    per_slot = int((props.get("default_generation_settings") or {}).get("n_ctx") or 0)
+    if per_slot <= 0:
+        log(f"WARNING: /props on :{port} exposed no per-slot n_ctx — proceeding "
+            f"UNVERIFIED (need >= {required}).")
+        return
+    log(f"[slot-gate] external server :{port} total_slots={slots} "
+        f"per_slot_ctx={per_slot} required={required} "
+        f"(thinking_budget={budget} + headroom={headroom}, max_gen_toks={max_gen})")
+    if per_slot < required:
+        raise SystemExit(
+            f"\nREFUSING TO EVAL: per-slot ctx {per_slot} < required {required}.\n"
+            f"  server on :{port} reports total_slots={slots}, per-slot n_ctx={per_slot}\n"
+            f"  template '{template.get('name')}' needs thinking_token_budget="
+            f"{budget} + headroom {headroom} (max_gen_toks={max_gen})\n"
+            f"  Completions would be silently truncated at ~{per_slot} tokens ONLY for\n"
+            f"  the long-thinking variants — a fake quality regression.\n"
+            f"  FIX the launcher: -c >= parallel x {required}"
+            f"  (e.g. -c {slots * required if slots else required} --parallel {slots or 1}).\n"
+            f"  Do NOT lower the template budget to make this pass.\n")
+
+
 def launch_llama_fleet(gguf: str, front_port: int, gpu_ids: list[int],
                        log_path: Path, ctx: int = 32768, ngl: int = 99,
                        parallel: int = 2, extra: list[str] | None = None,
@@ -2269,6 +2354,13 @@ def main() -> None:
         except SystemExit:
             server.kill()
             raise
+    elif args.backend == "llama":
+        # --no-server: a chain script launched the server, so gpu_planner.plan_ctx
+        # never ran and NOTHING has checked that a slot can hold this template's
+        # budget. Both the 2026-05 T172.4 IFEval sweep and the 2026-07-25 AN
+        # aime/ifeval matrix were silently truncated exactly here. Verify the real
+        # serving geometry via /props and refuse rather than produce fake numbers.
+        assert_external_slots_fit(args.port, template, log)
     base_url = f"http://localhost:{args.port}/v1"
 
     # Parallel-agnostic templates: set in-flight concurrency to the slots the
