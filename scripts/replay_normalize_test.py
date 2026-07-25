@@ -110,7 +110,11 @@ def test_hermes_call_response_pairing():
     _assert(call_asst["reasoning_content"] == "let me run code", "reasoning on call turn")
     tc = call_asst["tool_calls"][0]
     _assert(tc["function"]["name"] == "execute_code", "call name")
-    _assert(json.loads(tc["function"]["arguments"]) == {"code": "print(1)"}, "call args")
+    # arguments MUST stay a mapping so the template renders canonical bare-key DSL
+    # (`{code:<|"|>print(1)<|"|>}`), NOT a json.dumps'd string (which forces the
+    # template's string branch -> quoted-key JSON, the v9 a2a proto=0 poison).
+    _assert(tc["function"]["arguments"] == {"code": "print(1)"}, "call args")
+    _assert(isinstance(tc["function"]["arguments"], dict), "call args is a mapping, not a string")
     # no foreign XML left in any content field
     _assert("<tool_call>" not in call_asst["content"], "no tool_call XML in content")
 

@@ -287,11 +287,25 @@ def convert_hermes(ex: dict) -> tuple[list[dict] | None, list | None]:
                 cid = f"call_{call_ctr}"
                 call_ctr += 1
                 args = obj.get("arguments", {})
+                # Keep arguments as a MAPPING so the Gemma-4 template renders the
+                # canonical tool-call DSL `{key:val}` (BARE keys, chat_template
+                # `arguments is mapping` branch). Passing a JSON *string* forces the
+                # template's pre-serialized-string branch, which strips the braces and
+                # emits quoted-key JSON `{"key": val}` — the form the serve-time parser
+                # mis-binds into keys-with-literal-quotes (`args["\"task_id\""]` ->
+                # KeyError at dispatch; v9 a2a proto=0 RCA 2026-07-22). A string that is
+                # itself a JSON object is parsed back to a dict; a non-JSON string is
+                # left as-is (template string-branch, non-fatal).
+                if isinstance(args, str):
+                    try:
+                        parsed = json.loads(args)
+                    except (json.JSONDecodeError, ValueError):
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        args = parsed
                 calls.append({
                     "id": cid, "type": "function",
-                    "function": {"name": obj.get("name"),
-                                 "arguments": args if isinstance(args, str)
-                                 else json.dumps(args, ensure_ascii=False)},
+                    "function": {"name": obj.get("name"), "arguments": args},
                 })
                 return ""
 

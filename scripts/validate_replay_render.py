@@ -54,13 +54,15 @@ NATIVE = ["<|channel>", "<channel|>", "<|think|>", "<|tool_call>",
 # model reads it, never emits it). Measured 257 such benign leaves in curated
 # hermes; the narrow `value:`-envelope form has zero.
 BLOB = re.compile(r'\{value:<\|"\|>\s*[\[{]')
-# Corrupt tool-call arg KEYS — the `""task_id""` class. A native call renders
-# `call:name{"k": "v"}`, i.e. the args object opens `{"` (one quote, then a key
-# char). A double-quoted key (`call:name{""k""`) or backslash-escaped key
-# (`call:name{\"k\"`) at the args-OPEN is the corruption. Anchored on `call:NAME{`
-# so `{"`/`{\"` INSIDE argument VALUES (a write_file whose `content` is a JSON/code
-# file) never match; the `""` lookahead excludes a benign empty-key `{"":...}`.
-DQ_KEY = re.compile(r'call:[A-Za-z0-9_]+\{\s*(?:""(?=[A-Za-z_])|\\")')
+# Corrupt tool-call arg KEYS — the quoted-key class. The CANONICAL Gemma-4 call
+# renders `call:name{k:v}` — a BARE key char right after `{` (chat_template
+# `arguments is mapping` branch, `{{- key -}}:`). ANY quote at the args-OPEN is
+# corruption: a single-double-quoted key (`call:name{"task_id":` — JSON args from a
+# `json.dumps`'d string, the v9 a2a proto=0 poison), a doubled key (`{""k""`), or a
+# backslash-escaped key (`{\"k\"`). Anchored on `call:NAME{\s*` (the args-OPEN) so a
+# `"` INSIDE an argument VALUE (a write_file whose `content` is JSON/code) never
+# matches — a value can't precede the first key. `\\?"` catches all three forms.
+DQ_KEY = re.compile(r'call:[A-Za-z0-9_]+\{\s*\\?"')
 THRESHOLDS = [8192, 16384, 24576, 32768, 49152, 65536, 98304]
 
 
@@ -197,7 +199,15 @@ def length_pass(src, tokenizer, num_proc, remap, max_seq_len):
               f"retain {n-o} rows all <= {max_seq_len} tok", flush=True)
 
 
-def curate_source(src, tokenizer, num_proc, remap, max_seq_len, seed, out_dir):
+def _row_is_dirty(txt: str) -> bool:
+    """A rendered row still carrying ANY foreign token / dq-key / blob — even inside
+    a tool-call VALUE (e.g. a file whose content contains a ChatML token). Benign as
+    data, but --strict nukes them so nothing questionable reaches an expensive run."""
+    return (any(t in txt for t in FOREIGN)
+            or bool(DQ_KEY.search(txt)) or bool(BLOB.search(txt)))
+
+
+def curate_source(src, tokenizer, num_proc, remap, max_seq_len, seed, out_dir, strict=False):
     """Write a deterministic, sampled + length-purged, PRE-RENDERED jsonl for one source."""
     label, fmt = src_label(src), src["format"]
     ds = full_dataset(src, remap)
@@ -215,6 +225,11 @@ def curate_source(src, tokenizer, num_proc, remap, max_seq_len, seed, out_dir):
     before = len(ds)
     ds = ds.filter(lambda r: bool(r["text"]) and len(r["text"]) > 20
                    and 0 < r["_ntok"] <= max_seq_len)
+    nuked = 0
+    if strict:
+        pre = len(ds)
+        ds = ds.filter(lambda r: not _row_is_dirty(r["text"]))
+        nuked = pre - len(ds)
     slug = re.sub(r"[^A-Za-z0-9]+", "_", label).strip("_")
     if src.get("config"):
         slug += f"_{src['config']}"
@@ -225,8 +240,9 @@ def curate_source(src, tokenizer, num_proc, remap, max_seq_len, seed, out_dir):
             fh.write(json.dumps({"text": r["text"]}, ensure_ascii=False) + "\n")
     print(f"\n[CURATE] {label} -> {out_path}", flush=True)
     print(f"         wrote {len(ds)} rows (from {before} sampled; purged "
-          f"{before-len(ds)} empty/over-{max_seq_len}). Train via: "
-          f"{{data_files: [{out_path}], format: prerendered}}", flush=True)
+          f"{before-len(ds)} empty/over-{max_seq_len}"
+          + (f"; STRICT-nuked {nuked} dirty" if strict else "")
+          + f"). Train via: {{data_files: [{out_path}], format: prerendered}}", flush=True)
 
 
 def main() -> int:
@@ -242,6 +258,10 @@ def main() -> int:
     ap.add_argument("--out-dir", help="materialize curated prerendered jsonl per source "
                     "(requires --max-seq-len)")
     ap.add_argument("--seed", type=int, default=3407, help="sampling seed (match trainer)")
+    ap.add_argument("--strict", action="store_true",
+                    help="NUKE (drop) any curated row whose rendered text still carries a "
+                         "FOREIGN token / dq-key / blob — even benign file-content matches; "
+                         "belt-and-suspenders before an expensive run")
     ap.add_argument("--num-proc", type=int, default=12)
     args = ap.parse_args()
     remap = tuple(args.map.split("=", 1)) if args.map else None
@@ -259,7 +279,7 @@ def main() -> int:
             length_pass(src, tok, args.num_proc, remap, args.max_seq_len)
         if args.out_dir:
             curate_source(src, tok, args.num_proc, remap, args.max_seq_len,
-                          args.seed, args.out_dir)
+                          args.seed, args.out_dir, args.strict)
 
     print("\n>>> " + ("ALL SOURCES CLEAN" if all_ok else "FORMAT LEAK DETECTED"), flush=True)
     return 0 if all_ok else 1
