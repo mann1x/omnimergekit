@@ -222,6 +222,45 @@ def test_hermes_chatml_leak_stripped():
     _assert("im_end" not in msgs[1]["content"], f"hermes asst: {msgs[1]['content']!r}")
 
 
+def test_channel_presence_gate():
+    """A shard with no thought channel must FAIL, not pass silently.
+
+    Regression for the 2026-07-26 v26 finding: nous_glaive_fc rendered
+    <|turn>model in 1640/1640 rows and <|channel>thought in 0/1640, shipping a
+    no-thinking shard into a thinking mix. validate_replay_render already PRINTED
+    native_reason=0; nothing gated on it.
+    """
+    # all rows carry the channel -> clean
+    _assert(rn.check_channel_presence(100, 100, "good") is None, "full channel should pass")
+    # a couple of stragglers stay under the 98% floor -> still clean
+    _assert(rn.check_channel_presence(99, 100, "good") is None, "99% should pass")
+    # the nous_glaive case -> must fail, and say so usefully
+    msg = rn.check_channel_presence(0, 1640, "nous_glaive_fc")
+    _assert(msg is not None, "0/1640 channel MUST fail")
+    _assert("MISSING THOUGHT CHANNEL" in msg, f"bad msg: {msg!r}")
+    _assert("expect_reasoning: false" in msg, f"msg must name the opt-out: {msg!r}")
+    # partial coverage is also a defect (mixed-format shard)
+    _assert(rn.check_channel_presence(800, 1640, "half") is not None, "49% must fail")
+    # a DECLARED reasoning-free source passes...
+    _assert(rn.check_channel_presence(0, 1640, "declared", expect_reasoning=False) is None,
+            "declared reasoning-free should pass")
+    # ...but then an unexpected channel is the anomaly
+    inv = rn.check_channel_presence(5, 1640, "declared", expect_reasoning=False)
+    _assert(inv is not None and "UNEXPECTED" in inv, f"bad inverse msg: {inv!r}")
+    # empty source must not divide by zero
+    _assert(rn.check_channel_presence(0, 0, "empty") is None, "empty source must be inert")
+    # raising form
+    try:
+        rn.assert_channel_presence(0, 10, "boom")
+    except ValueError:
+        pass
+    else:
+        _assert(False, "assert_channel_presence must raise")
+    # channel_frac counts rendered targets, skipping empties
+    hit, n = rn.channel_frac(["a <|channel>thought b", "plain answer", "", None])
+    _assert((hit, n) == (1, 2), f"channel_frac wrong: {(hit, n)}")
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for t in tests:

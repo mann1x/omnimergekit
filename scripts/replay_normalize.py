@@ -39,6 +39,7 @@ sync with this file. Offline tests: ``scripts/replay_normalize_test.py``.
 """
 from __future__ import annotations
 
+import ast
 import json
 import re
 
@@ -55,14 +56,22 @@ _TOOLRESP_RE = re.compile(r"<tool_response>\s*(.*?)\s*</tool_response>", re.DOTA
 # are handled by the converters above; this only removes the leftovers.
 _CHATML_RE = re.compile(r"<\|im_start\|>[^\n]*\n?|<\|im_end\|>")
 _STRAY_THINK_RE = re.compile(r"</?think>")
+# Same argument for UNPAIRED tool XML. `_TOOLCALL_RE`/`_TOOLRESP_RE` only consume
+# BALANCED blocks, so a source turn with a missing closing tag (or a `<tool_call>`
+# mentioned inside prose/reasoning) leaves the opener in the residual content and
+# it renders verbatim into the target. Measured on the probe: 9/400 rows of
+# interstellarninja/hermes_reasoning_tool_use and 2/400 of the SHIPPING
+# jofthomas_fc_thinking shard leak exactly this way.
+_STRAY_TOOLXML_RE = re.compile(r"</?tool_call>|</?tool_response>")
 
 
 def _strip_foreign(text: str) -> str:
-    """Remove ChatML headers + stray think tokens from a content string."""
+    """Remove ChatML headers + stray think/tool tokens from a content string."""
     if not text:
         return text
     text = _CHATML_RE.sub("", text)
     text = _STRAY_THINK_RE.sub("", text)
+    text = _STRAY_TOOLXML_RE.sub("", text)
     return text
 
 
@@ -140,15 +149,34 @@ def convert_messages(ex: dict) -> tuple[list[dict] | None, None]:
 _MAX_RESP_CHARS = 2000  # cap on any single string leaf in a tool response
 
 
-def _truncate_leaves(obj, cap: int = _MAX_RESP_CHARS):
+def _truncate_leaves(obj, cap: int = _MAX_RESP_CHARS, _depth: int = 0):
     """Recursively cap every string leaf so a 100k tool dump can't dominate the
-    training sequence. Structure (dict/list) is preserved."""
+    training sequence. Structure (dict/list) is preserved.
+
+    A string leaf that is ITSELF a serialized dict/list is expanded in place. The
+    common upstream shape is a JSON envelope whose payload is a nested *string*:
+    ``{"name": "f", "content": "{'trending': [...]}"}``. The outer parse succeeds,
+    so ``_coerce_response`` never sees the inner repr, and the template then blobs
+    the leaf as ``{content:<|"|>{'trending':...<|"|>}``. Expanding here fixes every
+    nesting depth at once instead of special-casing ``content``.
+    """
     if isinstance(obj, str):
+        if _depth < 4 and obj[:1] in "{[":
+            inner = _parse_py_repr(obj)
+            if inner is None:
+                try:
+                    inner = json.loads(obj, strict=False)
+                except (json.JSONDecodeError, ValueError):
+                    inner = None
+                if not isinstance(inner, (dict, list)):
+                    inner = None
+            if inner is not None:
+                return _truncate_leaves(inner, cap, _depth + 1)
         return obj if len(obj) <= cap else obj[:cap] + "…(truncated)"
     if isinstance(obj, list):
-        return [_truncate_leaves(x, cap) for x in obj]
+        return [_truncate_leaves(x, cap, _depth) for x in obj]
     if isinstance(obj, dict):
-        return {k: _truncate_leaves(v, cap) for k, v in obj.items()}
+        return {k: _truncate_leaves(v, cap, _depth) for k, v in obj.items()}
     return obj
 
 
@@ -192,6 +220,28 @@ def _repair_truncated_json(s: str, cap: int = _MAX_RESP_CHARS):
         return None
 
 
+def _parse_py_repr(s: str):
+    """Parse a PYTHON-repr dict/list (single-quoted) into a real object.
+
+    Several tool-use corpora emit ``<tool_response>{'result': 42}</tool_response>``
+    — a Python repr, not JSON. ``json.loads`` rejects the single quotes, so the
+    body used to fall through as a plain string and the template then wrapped it as
+    ``{value:<|"|>{'result': 42}<|"|>}``: the blob leak, on 22% of the
+    interstellarninja/hermes_reasoning_tool_use pool (85/400 probed rows carried a
+    NOT-JSON tool_response). Structuring it here is what lets the template render
+    ``response:name{result:42}`` instead.
+
+    ``literal_eval`` only, never ``eval``: the input is untrusted corpus text.
+    """
+    if s[:1] not in "{[":
+        return None
+    try:
+        v = ast.literal_eval(s[:_MAX_RESP_CHARS * 4])
+    except (ValueError, SyntaxError, MemoryError, RecursionError):
+        return None
+    return v if isinstance(v, (dict, list)) else None
+
+
 def _coerce_response(body):
     """Normalize a tool-response body to a bounded, template-safe value.
 
@@ -222,6 +272,8 @@ def _coerce_response(body):
                         obj.setdefault("_note", tail)
                 except (json.JSONDecodeError, ValueError):
                     parsed = _repair_truncated_json(s)
+                if parsed is None:
+                    parsed = _parse_py_repr(s)
         if isinstance(parsed, (dict, list)):
             body = parsed
         else:  # plain text (or a scalar) — keep as a bounded string
@@ -229,15 +281,55 @@ def _coerce_response(body):
     return _truncate_leaves(body)
 
 
+def _coerce_tool_schema(t):
+    """Normalise ONE tool entry to the OpenAI ``{type, function:{...}}`` envelope.
+
+    The Gemma-4 native template indexes ``tool["function"]["name"]`` and raises
+    ``UndefinedError: 'dict object' has no attribute 'function'`` on the FLAT
+    xLAM/BFCL shape ``{name, description, parameters}``. Our two legacy FC pools
+    (jofthomas_fc_thinking, nous_glaive_fc) happen to ship the wrapped shape, so
+    the flat case never surfaced until a flat-shaped pool was probed.
+
+    Also normalises two things the flat sources do inconsistently:
+      * ``parameters.type: "dict"``  -> ``"object"``  (xLAM writes the Python type
+        name; leaving it teaches the model a non-JSON-Schema type keyword)
+      * a SIBLING ``required: [...]`` next to ``parameters`` -> folded into
+        ``parameters.required``, which is where the schema actually declares it.
+        ``required: null`` (also present in the wild) is dropped.
+    """
+    if not isinstance(t, dict):
+        return t
+    if isinstance(t.get("function"), dict):
+        return t
+    if not t.get("name"):
+        return t
+    fn = {k: v for k, v in t.items() if k not in ("required", "type")}
+    params = fn.get("parameters")
+    if isinstance(params, dict):
+        params = dict(params)
+        # `type` must be a JSON-Schema type NAME. Some rows put a whole (repr'd)
+        # property map there -- `parameters:{type:{'DESCRIPTION': ..., 'TYPE': 'STR'}}`
+        # -- which the template then renders as a `type:<|"|>{...}` blob. Any
+        # non-string, and xLAM's Python-type spelling, normalise to "object".
+        if not isinstance(params.get("type"), str) or params.get("type") == "dict":
+            params["type"] = "object"
+        req = t.get("required")
+        if isinstance(req, list) and req and not params.get("required"):
+            params["required"] = req
+        fn["parameters"] = params
+    return {"type": "function", "function": fn}
+
+
 def _parse_tools(raw) -> list | None:
-    if isinstance(raw, list):
-        return raw or None
     if isinstance(raw, str) and raw.strip():
         try:
-            v = json.loads(raw)
-            return v or None
+            raw = json.loads(raw)
         except json.JSONDecodeError:
             return None
+    if isinstance(raw, dict):  # single tool, not wrapped in a list
+        raw = [raw]
+    if isinstance(raw, list):
+        return [_coerce_tool_schema(t) for t in raw] or None
     return None
 
 
@@ -368,3 +460,72 @@ def normalize(ex: dict, fmt: str) -> tuple[list[dict] | None, list | None]:
     if conv is None:
         raise ValueError(f"unknown replay format: {fmt}")
     return conv(ex)
+
+
+# --- channel-presence gate --------------------------------------------------
+# This module maps a source's reasoning INTO `reasoning_content` so the template
+# emits `<|channel>thought ... <channel|>`. What it never did was require that
+# reasoning EXISTS: a source with no reasoning field passes through clean, renders
+# with NO thought channel, and silently trains "answer with no thinking".
+#
+# 2026-07-26: that is exactly how `nous_glaive_fc` entered the v26 mix --
+# `<|turn>model` in 1640/1640 rows, `<|channel>thought` in 0/1640, i.e. ~12.5% of
+# the mix teaching the OPPOSITE of what the other 87.5% teaches. Contradictory
+# supervision about whether to open a thinking block at all, invisible to every
+# format and repetition check (the surface tokens are all native and correct).
+#
+# The gate is deliberately opt-OUT, not opt-in: a source that genuinely carries no
+# reasoning must SAY SO in the mix YAML (`expect_reasoning: false`). Silence now
+# fails loudly instead of shipping.
+CHANNEL_OPEN = "<|channel>"
+CHANNEL_MIN_FRAC = 0.98
+
+
+def channel_frac(rendered: "list[str] | tuple[str, ...]") -> tuple[int, int]:
+    """(rows_with_thought_channel, rows_rendered) over already-rendered targets."""
+    n = 0
+    hit = 0
+    for txt in rendered:
+        if not txt:
+            continue
+        n += 1
+        hit += CHANNEL_OPEN in txt
+    return hit, n
+
+
+def check_channel_presence(n_with_channel: int, n_rendered: int, source: str = "?",
+                           expect_reasoning: bool = True,
+                           min_frac: float = CHANNEL_MIN_FRAC) -> str | None:
+    """Return an error message if the thought channel is missing, else None.
+
+    `expect_reasoning=False` inverts the check: the source is DECLARED
+    reasoning-free, so finding a thought channel is the anomaly worth reporting.
+    Either way the outcome is explicit rather than an unread counter.
+    """
+    if not n_rendered:
+        return None
+    frac = n_with_channel / n_rendered
+    if expect_reasoning:
+        if frac < min_frac:
+            return (f"MISSING THOUGHT CHANNEL: {source} renders {CHANNEL_OPEN} in "
+                    f"{n_with_channel}/{n_rendered} rows ({frac:.1%} < "
+                    f"{min_frac:.0%}). This trains 'answer with no thinking' and "
+                    f"CONTRADICTS the thinking-channel sources in the same mix. "
+                    f"Fix the source to carry reasoning, or declare it in the mix "
+                    f"YAML with `expect_reasoning: false`.")
+        return None
+    if n_with_channel:
+        return (f"UNEXPECTED THOUGHT CHANNEL: {source} is declared "
+                f"`expect_reasoning: false` but {n_with_channel}/{n_rendered} rows "
+                f"render {CHANNEL_OPEN}. Drop the declaration or fix the source.")
+    return None
+
+
+def assert_channel_presence(n_with_channel: int, n_rendered: int, source: str = "?",
+                            expect_reasoning: bool = True,
+                            min_frac: float = CHANNEL_MIN_FRAC) -> None:
+    """Raising form of :func:`check_channel_presence`, for build scripts."""
+    msg = check_channel_presence(n_with_channel, n_rendered, source,
+                                 expect_reasoning, min_frac)
+    if msg:
+        raise ValueError(msg)

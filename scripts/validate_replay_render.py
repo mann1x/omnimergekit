@@ -146,11 +146,21 @@ def audit_source(src, tokenizer, n, show, remap):
         if dq_m:
             n_dq += 1
             dq_example = dq_example or txt[dq_m.start():dq_m.start() + 120]
-    clean = bool(n_render) and not foreign_hits and not n_blob and not n_dq
+    # Channel-presence gate. n_reason was counted and PRINTED here long before it
+    # was gated on -- which is how a 1640-row no-thinking shard shipped into v26
+    # with `native_reason=0` visible in the audit output. Opt-out per source via
+    # `expect_reasoning: false` in the mix YAML; silence means "must have it".
+    chan_err = rn.check_channel_presence(
+        n_reason, n_render, label,
+        expect_reasoning=bool(src.get("expect_reasoning", True)))
+    clean = (bool(n_render) and not foreign_hits and not n_blob and not n_dq
+             and not chan_err)
     status = "OK" if clean else "FAIL"
     print(f"\n[{status}] {label}  fmt={fmt}  rendered={n_render}/{len(rows)}  "
           f"clean={n_ok}  native_reason={n_reason}  native_toolcall={n_tools}  "
           f"blob={n_blob}  dq_key={n_dq}", flush=True)
+    if chan_err:
+        print(f"     {chan_err}", flush=True)
     if foreign_hits:
         print(f"     FOREIGN TOKENS LEAKED: {foreign_hits}", flush=True)
     if n_blob:
