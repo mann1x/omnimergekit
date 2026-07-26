@@ -231,6 +231,30 @@ def test_truncated_python_repr_response_repaired():
     _assert(rn._literal_eval("__import__('os').getcwd()") is None, "no eval")
 
 
+def test_bare_array_tool_response():
+    """A tool_response that is a bare JSON ARRAY must not crash the converter.
+
+    convert_hermes assumed the `{tool_call_id, name, content}` envelope and called
+    `.get` unconditionally, so a top-level array raised
+    `AttributeError: 'list' object has no attribute 'get'`. Latent until the 51k-row
+    hermes_reasoning_tool_use audit hit one; a 400-row probe has none.
+    """
+    conv = [
+        {"from": "human", "value": "list them"},
+        {"from": "gpt", "value": '<tool_call>{"name": "ls", "arguments": {}}</tool_call>'},
+        {"from": "tool", "value": '<tool_response>[{"id": 1}, {"id": 2}]</tool_response>'},
+    ]
+    msgs, _ = rn.normalize({"conversations": conv, "tools": None}, "hermes")
+    resp = msgs[1]["tool_responses"][0]["response"]
+    _assert(isinstance(resp, list), f"array kept as a list: {type(resp).__name__} {resp!r}")
+    _assert(resp == [{"id": 1}, {"id": 2}], f"array preserved: {resp!r}")
+    # a bare array as a PYTHON repr must survive the same path
+    conv[2]["value"] = "<tool_response>[{'id': 1}, {'id': 2}]</tool_response>"
+    msgs, _ = rn.normalize({"conversations": conv, "tools": None}, "hermes")
+    _assert(msgs[1]["tool_responses"][0]["response"] == [{"id": 1}, {"id": 2}],
+            f"repr array: {msgs[1]['tool_responses'][0]['response']!r}")
+
+
 def test_strip_foreign_chatml():
     # ChatML <|im_start|>{role}\n / <|im_end|> must never survive into a target
     _assert(rn._strip_foreign("<|im_start|>assistant\nhi<|im_end|>") == "hi",

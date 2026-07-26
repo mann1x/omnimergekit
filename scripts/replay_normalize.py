@@ -502,8 +502,17 @@ def convert_hermes(ex: dict) -> tuple[list[dict] | None, list | None]:
                 resp_id = None
                 try:
                     o = json.loads(rb, strict=False)
-                    resp_id = o.get("tool_call_id")
-                    body = o.get("content", o)
+                    # A tool_response may be a bare ARRAY, not an `{tool_call_id,
+                    # name, content}` envelope. Without this isinstance guard the
+                    # converter dies with `AttributeError: 'list' object has no
+                    # attribute 'get'`. Latent since the envelope was introduced;
+                    # first hit on the 51k-row hermes_reasoning_tool_use audit
+                    # (2026-07-26) because a 400-row probe contains no such row.
+                    if isinstance(o, dict):
+                        resp_id = o.get("tool_call_id")
+                        body = o.get("content", o)
+                    else:
+                        body = o
                 except json.JSONDecodeError:
                     pass
                 # Bound + structure the response: objects/arrays stay native
