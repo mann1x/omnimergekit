@@ -162,14 +162,11 @@ def _truncate_leaves(obj, cap: int = _MAX_RESP_CHARS, _depth: int = 0):
     """
     if isinstance(obj, str):
         if _depth < 4 and obj[:1] in "{[":
-            inner = _parse_py_repr(obj)
-            if inner is None:
-                try:
-                    inner = json.loads(obj, strict=False)
-                except (json.JSONDecodeError, ValueError):
-                    inner = None
-                if not isinstance(inner, (dict, list)):
-                    inner = None
+            # Same escalation as _coerce_response, deliberately shared: a nested
+            # payload is as likely to be a repr, or truncated, as a top-level one.
+            inner = _parse_literal(obj)
+            if inner is None:  # `is None`, not falsy: {} and [] are valid payloads
+                inner = _repair_truncated_literal(obj)
             if inner is not None:
                 return _truncate_leaves(inner, cap, _depth + 1)
         return obj if len(obj) <= cap else obj[:cap] + "…(truncated)"
@@ -180,44 +177,133 @@ def _truncate_leaves(obj, cap: int = _MAX_RESP_CHARS, _depth: int = 0):
     return obj
 
 
-def _repair_truncated_json(s: str, cap: int = _MAX_RESP_CHARS):
-    """Best-effort repair of JSON the source truncated mid-value.
+_CLOSER = {"{": "}", "[": "]", "(": ")"}
 
-    Several hermes ``search_files`` responses carry a JSON *string* whose value
-    was cut at a fixed char budget, so ``json.loads`` fails (unterminated
-    string/array, or a raw control char at the cut). We cap the prefix, then
-    close any still-open string/array/object by walking the bracket+quote stack.
-    Returns the parsed dict/list, or ``None`` if it still won't parse.
+
+def _scan_literal(s: str):
+    """Walk a possibly-truncated JSON **or Python-repr** literal.
+
+    Tracks BOTH quote characters, because a Python repr quotes with ``'`` and may
+    contain ``"`` inside a string (and vice versa) — a JSON-only scanner mistakes
+    those for openers and mis-balances the stack.
+
+    Returns ``(stack, quote, esc, sep_by_depth)``: the unclosed openers, the open
+    quote char (or None), whether the text ends mid-escape, and, per nesting depth,
+    the index of the last element separator seen OUTSIDE any string. The last one is
+    what lets the caller drop a trailing half-written element and retry.
     """
-    s = s[:cap]
     stack: list[str] = []
-    in_str = esc = False
-    for ch in s:
+    quote: str | None = None
+    esc = False
+    sep_by_depth: dict[int, int] = {}
+    for i, ch in enumerate(s):
         if esc:
             esc = False
             continue
-        if in_str:
+        if quote is not None:
             if ch == "\\":
                 esc = True
-            elif ch == '"':
-                in_str = False
+            elif ch == quote:
+                quote = None
             continue
-        if ch == '"':
-            in_str = True
-        elif ch in "{[":
+        if ch in "\"'":
+            quote = ch
+        elif ch in "{[(":
             stack.append(ch)
-        elif ch in "}]" and stack:
+        elif ch in "}])" and stack:
             stack.pop()
+        elif ch == "," and stack:
+            sep_by_depth[len(stack)] = i
+    return stack, quote, esc, sep_by_depth
+
+
+def _complete_literal(s: str) -> str:
+    """Close a truncated literal's open string and containers, in order."""
+    stack, quote, esc, _ = _scan_literal(s)
     if esc:            # cut mid-escape -> drop the dangling backslash
         s = s[:-1]
-    if in_str:
-        s += '"'
+    if quote is not None:
+        s += quote
     for op in reversed(stack):
-        s += "}" if op == "{" else "]"
+        s += _CLOSER[op]
+    return s
+
+
+def _jsonish(obj, _depth: int = 0) -> bool:
+    """True when ``obj`` is built only from JSON-expressible types.
+
+    This is a REPAIR CORRECTNESS check, not a style check. Closing a truncated repr
+    can produce a syntactically valid but semantically wrong object: ``[{'id': 1},
+    {'id'`` closes to ``[{'id': 1}, {'id'}]``, where the trailing dict KEY has become
+    a ``set``. literal_eval accepts it, the template cannot render it, and json.dumps
+    raises. Rejecting non-JSON types here makes the caller trim and retry instead of
+    silently inventing a set (or tuple) that was never in the data.
+    """
+    if _depth > 12:
+        return False
+    if obj is None or isinstance(obj, (str, bool, int, float)):
+        return True
+    if isinstance(obj, list):
+        return all(_jsonish(x, _depth + 1) for x in obj)
+    if isinstance(obj, dict):
+        return all(isinstance(k, (str, bool, int, float)) or k is None
+                   for k in obj) and all(_jsonish(v, _depth + 1) for v in obj.values())
+    return False  # set, tuple, bytes, complex, ...
+
+
+def _parse_literal(s: str):
+    """Parse a complete literal as JSON, else as a Python repr. dict/list only."""
     try:
-        return json.loads(s, strict=False)
+        v = json.loads(s, strict=False)
     except (json.JSONDecodeError, ValueError):
+        v = _literal_eval(s)
+    if not isinstance(v, (dict, list)) or not _jsonish(v):
         return None
+    return v
+
+
+def _literal_eval(s: str):
+    """``ast.literal_eval`` with every failure mode swallowed. NEVER ``eval`` —
+    the input is untrusted corpus text, so only literals may be constructed."""
+    try:
+        return ast.literal_eval(s)
+    except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+        return None
+
+
+def _repair_truncated_literal(s: str, cap: int = _MAX_RESP_CHARS, tries: int = 6):
+    """Best-effort repair of a JSON **or Python-repr** literal cut mid-value.
+
+    Sources truncate tool responses at a fixed char budget, so the payload ends
+    inside a string, a list, or a key with no value yet. Closing the open string and
+    containers fixes the first two. The third needs a retry: we drop back to the last
+    element separator at the DEEPEST still-open depth and close again, which salvages
+    the largest valid prefix instead of discarding the row.
+
+    Extended from JSON-only on 2026-07-26: the 4/400 residual blob rows on
+    interstellarninja/hermes_reasoning_tool_use were truncated Python *reprs*
+    (``{'season': 2020, 'results': [{'position': 1, 'constru``), which
+    ``_parse_py_repr`` rejects outright and the JSON-only repair could not close
+    because it mis-tracked the single quotes. Returns the parsed dict/list, or
+    ``None`` if it still won't parse.
+    """
+    s = s[:cap]
+    for _ in range(max(1, tries)):
+        v = _parse_literal(_complete_literal(s))
+        if v is not None:
+            return v
+        _, quote, _, sep_by_depth = _scan_literal(s)
+        if not sep_by_depth:
+            return None
+        # Deepest depth first: that is where the truncation happened.
+        cut = sep_by_depth[max(sep_by_depth)]
+        if quote is not None and cut > s.rfind(quote):
+            # The separator we found sits inside the unterminated string; that
+            # string is the truncation, so closing it was already the right move
+            # and trimming further would not help.
+            return None
+        s = s[:cut]
+    return None
 
 
 def _parse_py_repr(s: str):
@@ -231,15 +317,15 @@ def _parse_py_repr(s: str):
     NOT-JSON tool_response). Structuring it here is what lets the template render
     ``response:name{result:42}`` instead.
 
-    ``literal_eval`` only, never ``eval``: the input is untrusted corpus text.
+    Handles a COMPLETE repr only; a truncated one goes to
+    ``_repair_truncated_literal``, which closes the open quote/containers first.
     """
     if s[:1] not in "{[":
         return None
-    try:
-        v = ast.literal_eval(s[:_MAX_RESP_CHARS * 4])
-    except (ValueError, SyntaxError, MemoryError, RecursionError):
+    v = _literal_eval(s[:_MAX_RESP_CHARS * 4])
+    if not isinstance(v, (dict, list)) or not _jsonish(v):
         return None
-    return v if isinstance(v, (dict, list)) else None
+    return v
 
 
 def _coerce_response(body):
@@ -247,11 +333,11 @@ def _coerce_response(body):
 
     A JSON *object/array* stays STRUCTURED so the Gemma-4 template renders it
     natively as ``response:name{k:v,...}`` (only leaf strings get the ``<|"|>``
-    quote). A string that *looks* like JSON but won't parse (dataset truncated it
-    mid-value) is ``strict=False``-parsed and, failing that, repaired into valid
-    JSON — so it can NEVER render as a ``{value:<|"|>{...blob...<|"|>}``, the
-    pattern that teaches the model to emit ``<|"|>`` inside its own tool-call
-    arguments. A genuine plain-text result stays a (capped) string.
+    quote). Anything that *looks* like an object/array but won't parse is escalated
+    through three fallbacks — trailing-hint, Python repr, truncation repair — so it
+    can NEVER render as a ``{value:<|"|>{...blob...<|"|>}``, the pattern that teaches
+    the model to emit ``<|"|>`` inside its own tool-call arguments. A genuine
+    plain-text result stays a (capped) string.
     """
     if isinstance(body, str):
         s = body.strip()
@@ -260,10 +346,12 @@ def _coerce_response(body):
             parsed = json.loads(s, strict=False)
         except (json.JSONDecodeError, ValueError):
             if s[:1] in "{[":
-                # Two upstream shapes fail a full parse: (a) a valid JSON object
-                # followed by a trailing NL hint (``{...}\n\n[Hint: ...]``) —
-                # ``raw_decode`` grabs the leading object and we keep the tail as a
-                # bounded ``_note``; (b) JSON the source truncated mid-value — repair.
+                # Three upstream shapes fail a full parse, cheapest first:
+                #   (a) a valid JSON object followed by a trailing NL hint
+                #       (``{...}\n\n[Hint: ...]``) -- ``raw_decode`` grabs the leading
+                #       object and we keep the tail as a bounded ``_note``;
+                #   (b) a COMPLETE Python repr (``{'result': 42}``);
+                #   (c) either syntax, TRUNCATED mid-value -- repair.
                 try:
                     obj, end = json.JSONDecoder(strict=False).raw_decode(s)
                     parsed = obj
@@ -271,9 +359,9 @@ def _coerce_response(body):
                     if isinstance(obj, dict) and tail:
                         obj.setdefault("_note", tail)
                 except (json.JSONDecodeError, ValueError):
-                    parsed = _repair_truncated_json(s)
-                if parsed is None:
                     parsed = _parse_py_repr(s)
+                if parsed is None:
+                    parsed = _repair_truncated_literal(s)
         if isinstance(parsed, (dict, list)):
             body = parsed
         else:  # plain text (or a scalar) — keep as a bounded string

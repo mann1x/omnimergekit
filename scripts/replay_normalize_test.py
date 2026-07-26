@@ -184,6 +184,53 @@ def test_hermes_truncated_json_response_repaired():
     _assert(_max_leaf(resp) <= rn._MAX_RESP_CHARS + 16, f"leaves capped: {_max_leaf(resp)}")
 
 
+def test_truncated_python_repr_response_repaired():
+    """Truncated PYTHON-repr payloads must structure too, not just truncated JSON.
+
+    The 4/400 residual blob rows on interstellarninja/hermes_reasoning_tool_use were
+    reprs cut mid-value. A JSON-only repair cannot close them: it treats the ``'``
+    quotes as literal text and the ``"`` inside a repr'd string as an opener, so the
+    bracket stack ends up wrong and the payload stays a `{value:<|"|>{...}}` blob.
+    """
+    cases = [
+        # cut inside a nested dict, one element in
+        ("{'season': 2020, 'results': [{'position': 1, 'constru", "season"),
+        # cut mid-string
+        ("{'a': 1, 'b': 'unterminated stri", "a"),
+        # cut right after a key, with no value yet -> needs the trim-and-retry path
+        ("{'a': 1, 'b': 2, 'c'", "a"),
+        # a repr holding DOUBLE quotes inside a single-quoted string, then cut
+        ("""{'msg': 'he said "hi"', 'rest': [1, 2, 3""", "msg"),
+        # list at top level
+        ("[{'id': 1}, {'id': 2}, {'id'", "id"),
+    ]
+    for src, want_key in cases:
+        got = rn._repair_truncated_literal(src)
+        _assert(isinstance(got, (dict, list)), f"repaired {src!r} -> {type(got).__name__}")
+        flat = json.dumps(got)
+        _assert(want_key in flat, f"kept {want_key!r} from {src!r}: {got!r}")
+
+    # ...and end to end through the converter, as a tool_response
+    conv = [
+        {"from": "human", "value": "standings?"},
+        {"from": "gpt", "value": '<tool_call>{"name": "standings", "arguments": {"y": 2020}}</tool_call>'},
+        {"from": "tool", "value": "<tool_response>{'season': 2020, 'results': [{'pos': 1, "
+                                  "'team': 'Mercedes'}, {'pos': 2, 'te</tool_response>"},
+    ]
+    msgs, _ = rn.normalize({"conversations": conv, "tools": None}, "hermes")
+    resp = msgs[1]["tool_responses"][0]["response"]
+    _assert(isinstance(resp, dict), f"repr repaired to dict: {type(resp).__name__} {resp!r}")
+    _assert(resp.get("season") == 2020, f"season recovered: {resp!r}")
+
+    # a COMPLETE repr still goes through the cheap path, unchanged
+    _assert(rn._parse_py_repr("{'result': 42}") == {"result": 42}, "complete repr")
+    # garbage must NOT be forced into a structure
+    _assert(rn._repair_truncated_literal("{this is not a literal at all") is None,
+            "unparseable stays None")
+    # and literal_eval must never execute: a call expression yields None, not a value
+    _assert(rn._literal_eval("__import__('os').getcwd()") is None, "no eval")
+
+
 def test_strip_foreign_chatml():
     # ChatML <|im_start|>{role}\n / <|im_end|> must never survive into a target
     _assert(rn._strip_foreign("<|im_start|>assistant\nhi<|im_end|>") == "hi",
