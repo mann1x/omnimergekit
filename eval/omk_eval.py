@@ -902,6 +902,17 @@ def dispatch_lm_eval(template: dict, model_tag: str, base_url: str,
     # LM_EVAL_REASONING_LOG-2026-05-29: sidecar per-sample reasoning length
     _rlog = out_dir / "reasoning_log.jsonl"
     os.environ["LM_EVAL_REASONING_LOG"] = str(_rlog)
+    # OMK_THINKING_DB-2026-07-26: persist the THINKING TEXT, not just its length.
+    # Fix-A drops reasoning_content once content is non-empty, and the sidecar
+    # above only kept len() -- so after a run the thinking was unrecoverable and
+    # loop-vs-rumination could not be decided without re-running the model.
+    # patch_lmeval_thinking_table.py writes it into a `thinking` table in the
+    # SAME db lm-eval uses for --use_cache below, joinable by sha256(content).
+    # lm-eval appends _rank{rank}.db to the --use_cache prefix; omk is
+    # single-process, so rank 0. Harmless when the patch is absent (the env var
+    # is simply never read).
+    os.environ["OMK_THINKING_DB"] = str(
+        cache_dir / f"{cache_prefix}_{model_tag}_rank0.db")
     log(f"lm-eval: {' '.join(shlex.quote(c) for c in cmd)}")
     return subprocess.call(cmd)
 
