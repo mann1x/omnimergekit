@@ -381,10 +381,14 @@ def llama_bench_defaults(task: str) -> list[str]:
     Coding (HE/MBPP/LCB): suppress reasoning traces so the scorer sees
     answer-only output.
 
-    Reasoning (GPQA/AIME/MMLU-Pro): deepseek-format separation + 8192-
-    token reasoning budget. The budget is load-bearing per the project
-    rule documented in CLAUDE.md — without it Gemma 4 enters re-read
-    loops on hard questions and times out.
+    Reasoning (GPQA/AIME/MMLU-Pro): deepseek-format separation + a
+    reasoning budget. The budget's PRESENCE is load-bearing per the
+    project rule in CLAUDE.md — without the flag Gemma 4 enters re-read
+    loops on hard questions and times out. Its VALUE below is only a
+    placeholder: the caller overwrites it with the template's
+    thinking_token_budget (see the sync at the llama launch site), so
+    the template is the authority and this number is what a template
+    that declares no budget would get.
 
     These are applied automatically when the template's `task` matches
     a known family; a template can still override via
@@ -402,7 +406,7 @@ def llama_bench_defaults(task: str) -> list[str]:
             "ifeval", "gsm8k", "math500", "math_500", "arc_challenge",
             "arc-challenge", "anchor")):
         return ["--reasoning-format", "deepseek",
-                "--reasoning-budget", "8192"]
+                "--reasoning-budget", "12288"]   # placeholder; template value wins
     return []
 
 
@@ -624,6 +628,35 @@ def assert_external_slots_fit(port: int, template: dict, log) -> None:
     log(f"[slot-gate] external server :{port} total_slots={slots} "
         f"per_slot_ctx={per_slot} required={required} "
         f"(thinking_budget={budget} + headroom={headroom}, max_gen_toks={max_gen})")
+    # ── The OTHER half of the geometry, which /props does not expose ──────────
+    # The slot check above only proves the request has ROOM. It cannot see
+    # --reasoning-budget, which is what actually decides how much of that room
+    # the ANSWER gets: the server forces the model out of the thinking block at
+    # its own budget, leaving max_gen_toks - served_budget for the answer. There
+    # is no /props field for it, so an external launcher must DECLARE what it
+    # served. This exists because the declaration and the template silently
+    # disagreed for months: run_v9_omk.sh hardcoded RBUDGET=12288 while the
+    # template asked for 8192 (gpqa) -- per-request thinking_token_budget is
+    # ignored, the serve flag wins, and GPQA never once ran at its declared
+    # budget. Unset = unverified (warn, proceed); set and mismatched = STOP.
+    served_budget = os.environ.get("OMK_SERVED_REASONING_BUDGET", "").strip()
+    if not served_budget:
+        log(f"WARNING: OMK_SERVED_REASONING_BUDGET not declared by the launcher — "
+            f"cannot verify the server's --reasoning-budget matches the template's "
+            f"thinking_token_budget={budget}. /props does not expose it. Proceeding "
+            f"UNVERIFIED; export it from the launcher to close this hole.")
+    elif int(served_budget) != budget:
+        raise SystemExit(
+            f"\nREFUSING TO EVAL: served reasoning budget != template budget.\n"
+            f"  launcher declares OMK_SERVED_REASONING_BUDGET={served_budget}\n"
+            f"  template '{template.get('name')}' asks thinking_token_budget={budget}\n"
+            f"  The SERVER flag wins -- the per-request value is ignored -- so the answer\n"
+            f"  channel would get max_gen_toks({max_gen}) - {served_budget} = "
+            f"{max_gen - int(served_budget)} tokens,\n"
+            f"  not the {max_gen - budget} the template intends. Rows that spend the budget\n"
+            f"  get cut mid-answer and score 0, ONLY on the variants that ruminate.\n"
+            f"  FIX the launcher: serve --reasoning-budget {budget} for this template,\n"
+            f"  or group templates by budget and serve once per group.\n")
     if per_slot < required:
         raise SystemExit(
             f"\nREFUSING TO EVAL: per-slot ctx {per_slot} < required {required}.\n"
@@ -1328,6 +1361,269 @@ def estimate_thinking_chars(completion: str) -> tuple[int, str | None]:
     return 0, None
 
 
+def cap_report(samples_path: Path, template: dict, tokenizer_id: str | None,
+               metric_key: str | None, log) -> dict:
+    """Post-run generation-cap audit: did answers / thinking run into their ceiling?
+
+    ── Why this exists ────────────────────────────────────────────────────────
+    A generation ceiling does not announce itself. The completion simply stops
+    mid-sentence, the scorer marks it wrong, and the cell reports a plausible
+    low score. Twice now that has been mistaken for a model property:
+      · 2026-05-22  GPQA 22/198 truncated at thinking_token_budget=12288; the
+        9pp "regression" was the cap. Diagnosed, written into the template's
+        vllm override, and then LOST because nothing checked it per-run.
+      · 2026-07-28  AN aime_30/aime_100: answers pinned at 4093 tokens
+        (= 16384 max_gen_toks - 12288 thinking_token_budget, minus the
+        detokenize->retokenize delta). Found only by re-tokenizing samples
+        months later. base 0/30 rows capped vs v27 6/30 -- a 20pp differential
+        score tax read as a reasoning gap.
+
+    ── The arithmetic that surprises people ───────────────────────────────────
+        answer_allowance = max_gen_toks - thinking_token_budget
+    The thinking budget is SUBTRACTED from the total generation allowance, not
+    additional to it. At 16384/12288 an answer gets 4096 tokens, and only after
+    the model has been forced out of its thinking block. This is independent of
+    n_ctx, so a bigger context never fixes it -- the 2026-07-25 geometry
+    correction (32768 -> 131072 per slot) left the pile-up exactly unchanged.
+
+    ── Must work whatever the thinking config is ──────────────────────────────
+    Reasoning lands in one of two places, and the ceiling differs:
+      SPLIT  (`--reasoning-format deepseek`, a vllm reasoning parser): the
+             thinking is in `reasoning_content` and never reaches the samples
+             file. What we can see is the ANSWER, whose ceiling is
+             `max_gen_toks - thinking_token_budget`. The thinking's own cap is
+             NOT checkable from samples -- it is not there to measure.
+      INLINE (reasoning off, no parser, or `<think>` kept in the text): the
+             whole generation is in the content, so the ceiling is the full
+             `max_gen_toks` -- and the thinking IS visible, so it is covered by
+             the same length check.
+    Applying the SPLIT ceiling to an INLINE cell is a false positive: inline
+    content routinely runs past `max_gen - budget` with nothing wrong. So the
+    regime is DETECTED per cell (sidecar key / inline markers), never assumed
+    from the template declaring a budget.
+
+    ── The regime-independent signal ──────────────────────────────────────────
+    Budgets can be unset, mis-declared, or overridden by the server (the runner
+    hardcoded `--reasoning-budget` for months while templates said otherwise),
+    so arithmetic alone is not trustworthy. A cap has a signature that needs no
+    configuration at all: **many rows stop at the exact same length**. Free
+    generation produces a smooth length distribution; a ceiling produces a
+    spike. So ties-at-the-maximum are the primary detector, and the arithmetic
+    is used only to LABEL which ceiling was hit (`max_gen_toks`,
+    `answer_allowance`, or `unexplained` when it matches neither -- which is
+    itself worth surfacing, since that is what an undeclared server-side cap
+    looks like).
+
+    Returns a dict for summary.json['generation_caps'] and emits one
+    `>>> OMK_CAP_CHECK` line so a grep over logs answers "was this cell capped?"
+    without re-tokenizing anything.
+    """
+    gen = template.get("generation", {}) or {}
+    max_gen = int(gen.get("max_gen_toks", 0) or 0)
+    budget = int(gen.get("thinking_token_budget", 0) or 0)
+    name = template.get("name")
+    if max_gen <= 0 or not samples_path.exists():
+        return {"status": "not_applicable",
+                "reason": "no max_gen_toks in template" if max_gen <= 0 else "no samples file"}
+    allowance = max_gen - budget if budget > 0 else max_gen
+    # Tokenizer round-trip is not exact: the server counts tokens it generated, we count
+    # tokens of the detokenized text. The observed delta is a few tokens (4093 vs 4096), so
+    # a row within TOL of a ceiling is treated as sitting ON it. Without TOL the 2026-07-28
+    # pile-up would have been missed entirely -- it never once landed on 4096 exactly.
+    TOL = 16
+    try:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(tokenizer_id) if tokenizer_id else None
+    except Exception as e:                                          # noqa: BLE001
+        log(f"[cap-check] tokenizer unavailable ({e}) — cap audit SKIPPED for {name}")
+        return {"status": "unverified", "reason": f"tokenizer unavailable: {e}",
+                "max_gen_toks": max_gen, "thinking_token_budget": budget,
+                "answer_allowance": allowance}
+    if tok is None:
+        return {"status": "unverified", "reason": "no tokenizer_id",
+                "max_gen_toks": max_gen, "thinking_token_budget": budget,
+                "answer_allowance": allowance}
+
+    def _text(s: dict) -> str:
+        """Raw generation, NOT the post-filter text.
+
+        A generation cap applies to what the MODEL emitted, so the length has to be measured
+        on that. `filtered_resps` is post-processed and on code tasks is not even a superset
+        of the generation: HumanEval assembles prompt-scaffold + completion into a runnable
+        program, so it is LONGER than what was generated (measured 2026-07-28: resps 242
+        chars vs filtered_resps 590 on the same row). Ranking `filtered_resps` first inflated
+        every code row and would eventually manufacture a false CAPPED. `resps` first fixes
+        it, and is a no-op wherever the filter is pass-through -- verified on AIME, where
+        resps == filtered_resps on 130/130 rows across v27 aime_30 and base aime_100, so the
+        AIME cap measurements are unaffected by this change.
+        """
+        if isinstance(s.get("completion"), str) and s["completion"]:
+            return s["completion"]
+        for key in ("resps", "filtered_resps"):
+            v = s.get(key)
+            while isinstance(v, list) and v:
+                v = v[0]
+            if isinstance(v, str):
+                return v
+        return ""
+
+    def _correct(s: dict) -> float | None:
+        keys = [metric_key] if metric_key else []
+        keys += ["exact_match", "acc", "pass_at_1", "pass@1", "score"]
+        for k in keys:
+            if not k or k not in s:
+                continue
+            v = s[k]
+            if isinstance(v, dict):
+                v = next(iter(v.values()), None)
+            if isinstance(v, list):
+                v = v[0] if v else None
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    # Markers that mean the reasoning is IN the content (so max_gen_toks is the real ceiling).
+    INLINE = ("<think", "</think", "<|channel", "analysis<|message|>", "◁think▷")
+    SIDECAR_KEYS = ("reasoning_content", "reasoning", "resps_reasoning", "thinking")
+    seen: set = set()
+    lens: list[int] = []
+    corrects: list[float | None] = []
+    sidecar_seen = inline_seen = False
+    for i, line in enumerate(samples_path.read_text().split("\n")):
+        if not line.strip():
+            continue
+        try:
+            s = json.loads(line)
+        except Exception:                                           # noqa: BLE001
+            continue
+        did = s.get("doc_id", s.get("task_id", f"__idx_{i}"))
+        if did in seen:
+            continue
+        seen.add(did)
+        txt = _text(s)
+        if any(k in s and s[k] for k in SIDECAR_KEYS):
+            sidecar_seen = True
+        if any(m in txt for m in INLINE):
+            inline_seen = True
+        try:
+            lens.append(len(tok(txt, add_special_tokens=False).input_ids))
+        except Exception:                                           # noqa: BLE001
+            lens.append(0)
+        corrects.append(_correct(s))
+
+    n_rows = len(lens)
+    if not n_rows:
+        return {"status": "unverified", "reason": "no rows parsed"}
+    # Regime decides WHICH ceiling is real. Inline reasoning legitimately exceeds the answer
+    # allowance, so applying that ceiling there would be a false positive.
+    if inline_seen:
+        regime = "inline"
+    elif sidecar_seen or budget > 0:
+        regime = "split"
+    else:
+        regime = "unknown"
+    ceilings: dict[str, int] = {"max_gen_toks": max_gen}
+    # A budget >= max_gen_toks leaves no answer room at all, so the "allowance" is zero or
+    # negative and is not a ceiling anything can land on -- it is a misconfigured template.
+    # Templates do carry vestigial budgets (humaneval_full declares 12288 while running
+    # reasoning-off), so this is a real case, not a hypothetical.
+    if regime != "inline" and 0 < budget < max_gen:
+        ceilings["answer_allowance"] = max_gen - budget
+    elif budget >= max_gen > 0:
+        log(f"[cap-check] template '{name}' declares thinking_token_budget={budget} >= "
+            f"max_gen_toks={max_gen}: no answer room. Treating max_gen_toks as the only "
+            f"ceiling; fix the template if the budget was meant to apply.")
+
+    longest = max(lens)
+    ties_at_max = sum(1 for x in lens if x >= longest - TOL)
+    # The two ceilings need DIFFERENT tests.
+    #   max_gen_toks is a hard stop: nothing can exceed it, so ">= cap - TOL" is correct.
+    #   answer_allowance is NOT a hard stop: it is what remains AFTER a fully-spent thinking
+    #     budget, so a row that thought less legitimately writes a longer answer. Testing it
+    #     as a lower bound would flag every long-answer row on a low-rumination model -- the
+    #     mirror image of the bug being hunted. It is a narrow BAND: |len - allowance| <= TOL.
+    hits: dict[str, list[int]] = {}
+    for lbl, c in ceilings.items():
+        if lbl == "max_gen_toks":
+            idx = [i for i, x in enumerate(lens) if x >= c - TOL]
+        else:
+            idx = [i for i, x in enumerate(lens) if abs(x - c) <= TOL]
+        if idx:
+            hits[lbl] = idx
+    matched = ",".join(hits) if hits else None
+    # Primary detector: a spike at the top. Free generation does not put several independent
+    # completions within a few tokens of one another at the maximum -- a ceiling does. This
+    # needs no budget, no parser, and no template correctness, which is the point: the config
+    # has already been wrong once (server overrode the template for months) and the samples
+    # still told the truth.
+    # ...but only on a sample big enough for a spike to MEAN anything. The declared ceilings
+    # above are backed by arithmetic and are trustworthy at any n; this branch is pure shape,
+    # so on a handful of rows "two completions within TOL of the longest" is as likely to be a
+    # coincidence as a cap -- three same-format short answers land on the same length by chance.
+    # Below the floor the pile-up is REPORTED but not asserted (see the log line), so a small
+    # smoke can still show it without a fabricated CAPPED verdict. n=3 tripped this in the unit
+    # smoke on 2026-07-28.
+    MIN_PILEUP_ROWS = 10
+    pileup = ties_at_max >= 2 and n_rows >= MIN_PILEUP_ROWS
+    if hits:
+        capped_idx = sorted({i for idx in hits.values() for i in idx})
+    elif pileup:
+        # No declared ceiling explains it, yet several rows stop at the same length. That is
+        # the shape of a cap nobody declared -- an undeclared server flag, a client-side
+        # max_tokens, a stop condition. Surface it rather than silently pass.
+        matched = "unexplained"
+        capped_idx = [i for i, x in enumerate(lens) if x >= longest - TOL]
+    else:
+        capped_idx = []
+        if ties_at_max >= 2 and n_rows >= 3:
+            log(f"[cap-check] {ties_at_max}/{n_rows} completions sit within {TOL} tokens of the "
+                f"longest ({longest}) and no declared ceiling explains it, but n={n_rows} is "
+                f"below the {MIN_PILEUP_ROWS}-row floor for calling an undeclared cap. NOT "
+                f"asserting CAPPED; re-check on a full-size run if this looks like a wall.")
+    capped = len(capped_idx)
+    scored = [corrects[i] for i in capped_idx if corrects[i] is not None]
+    capped_correct = sum(1 for c in scored if c > 0)
+    pct = round(100.0 * capped / n_rows, 2) if n_rows else 0.0
+    rep = {
+        "status": "checked",
+        "reasoning_regime": regime,   # inline | split | unknown — decides the ceiling
+        "max_gen_toks": max_gen,
+        "thinking_token_budget": budget,
+        "answer_allowance": ceilings.get("answer_allowance"),
+        "ceiling_hit": matched,       # max_gen_toks | answer_allowance | unexplained | None
+        "tolerance_tokens": TOL,
+        "n": n_rows,
+        "max_completion_tokens": longest,
+        "ties_at_max": ties_at_max,
+        "capped_total": capped,
+        "capped_pct": pct,
+        "capped_correct": capped_correct,
+        "capped_scored": len(scored),
+        # Only meaningful in the split regime: reaching the answer allowance is only possible
+        # once the thinking budget was spent. In inline/unknown we cannot say, and don't.
+        "thinking_exhausted_inferred": (
+            capped if (regime == "split" and matched == "answer_allowance") else None),
+        "verdict": "CAPPED" if capped else "CLEAN",
+    }
+    if capped:
+        # Ceiling if every capped row had instead been answered correctly. An UPPER bound,
+        # generous to the capped model -- it assumes more tokens would have meant a right
+        # answer, which is exactly the assumption a reader should see stated rather than
+        # silently make.
+        rep["score_upper_bound_note"] = (
+            f"{capped}/{n_rows} rows stopped at the '{matched}' ceiling; of those, "
+            f"{capped_correct}/{len(scored)} scored. Score is truncation-taxed by up to "
+            f"{round(100.0 * (capped - capped_correct) / n_rows, 2)}pp.")
+    log(f">>> OMK_CAP_CHECK template={name} verdict={rep['verdict']} regime={regime} "
+        f"ceiling_hit={matched} max_gen_toks={max_gen} thinking_budget={budget} "
+        f"answer_allowance={ceilings.get('answer_allowance')} "
+        f"capped={capped}/{n_rows} ({pct}%) ties_at_max={ties_at_max} "
+        f"capped_correct={capped_correct}/{len(scored)} max_completion_tokens={longest}")
+    return rep
+
+
 def compute_token_stats(samples_path: Path, tokenizer_id: str | None = None) -> dict:
     """Aggregate prompt/completion/thinking tokens + finish_reasons from a
     samples.jsonl file. Per protocol v2 §2.4, this block is mandatory in
@@ -2026,6 +2322,13 @@ def main() -> None:
     ap.add_argument("--max-parallel", type=int, default=None,
                     help="Upper cap on per-server parallel slots (default 8). "
                     "Env: OMK_MAX_PARALLEL.")
+    ap.add_argument("--print-serve-plan", action="store_true",
+                    help="Resolve the template for --backend (+ any --sampler overlay "
+                    "and --metadata) and print the serving budget it needs as shell "
+                    "KEY=VALUE lines, then exit 0 without touching a server. Lets an "
+                    "external runner size --reasoning-budget/-c from the SAME resolution "
+                    "the cell will use, instead of hardcoding a number that silently "
+                    "disagrees with the template (see the 2026-07-28 RBUDGET defect).")
     args = ap.parse_args()
 
     # Resolve template
@@ -2042,7 +2345,7 @@ def main() -> None:
 
     # Apply per-engine overrides. vLLM and llama.cpp need different
     # max_gen_toks / thinking_token_budget tuning (vLLM Fix-A truncation
-    # at 12k vs llama.cpp's canonical 8k budget on Gemma 4). A template can
+    # at 12k vs a per-engine budget on Gemma 4). A template can
     # carry a `backend_overrides:` section keyed by --backend value:
     #   backend_overrides:
     #     vllm:
@@ -2115,6 +2418,24 @@ def main() -> None:
                          f"template '{template['name']}' (found {type(_dst).__name__})")
             _dst.update(_kv)
         log(f"applied --metadata overrides: {_md}")
+
+    # ── Serve-plan emit. Placed HERE, after backend_overrides + sampler overlay +
+    #    --metadata, so what a runner reads is exactly what the cell will request --
+    #    the whole point is that the served budget and the requested budget come from
+    #    one resolution. Prints shell-eval-able KEY=VALUE and exits before any
+    #    dependency check or server contact, so it is safe to call with nothing running.
+    if args.print_serve_plan:
+        _g = template.get("generation", {}) or {}
+        _mg = int(_g.get("max_gen_toks", 0) or 0)
+        _tb = int(_g.get("thinking_token_budget", 0) or 0)
+        print(f"OMK_TEMPLATE={template['name']}")
+        print(f"OMK_MAX_GEN_TOKS={_mg}")
+        print(f"OMK_THINKING_BUDGET={_tb}")
+        print(f"OMK_ANSWER_ALLOWANCE={max(_mg - _tb, 0) if 0 < _tb < _mg else _mg}")
+        # What one slot must hold for this cell to be honest: the same rule
+        # assert_external_slots_fit() enforces against the live server.
+        print(f"OMK_MIN_SLOT_CTX={max(_tb + 4096, _mg)}")
+        sys.exit(0)
 
     # Pre-flight: dependency check BEFORE launching any server.
     _check_dependencies(template)
@@ -2259,10 +2580,11 @@ def main() -> None:
         else:
             # Compose llama extras: bench-typed defaults + template override.
             llama_extra = llama_bench_defaults(template.get("task", ""))
-            # Sync reasoning budget with template thinking_token_budget when the
-            # bench is reasoning-typed (defaults emit --reasoning-budget 8192).
-            # Without this, GPQA templates asking for 24576 silently get 8192
-            # and truncate ~20-30% of reasoning chains on Gemma 4.
+            # Sync reasoning budget with the template's thinking_token_budget: the
+            # bench-typed defaults emit only a PLACEHOLDER value, and the server flag
+            # beats any per-request field, so without this line the template's budget
+            # would have no consumer at all on this path. That failure is silent and
+            # asymmetric -- it truncates only the variants that think longest.
             tb = ((template.get("generation") or {}).get("thinking_token_budget"))
             if tb is not None and "--reasoning-budget" in llama_extra:
                 idx = llama_extra.index("--reasoning-budget")
@@ -2491,6 +2813,25 @@ def main() -> None:
     else:
         smoke_failed = False
 
+    # Generation-cap audit (2026-07-28). Runs on every cell, after scoring so capped rows
+    # can be correlated with whether they scored. A cap is a HARD warning, not a note: it
+    # taxes the long-thinking variant only, so it is indistinguishable from a quality
+    # regression in any table that does not surface it.
+    caps = cap_report(samples, template, (args.tokenizer or args.model), chosen_metric, log)
+    if caps.get("verdict") == "CAPPED":
+        warns.append(
+            f"GENERATION CAP ({caps['ceiling_hit']}, regime={caps['reasoning_regime']}): "
+            f"{caps['capped_total']}/{caps['n']} completions ({caps['capped_pct']}%) stopped "
+            f"at the same length ({caps['max_completion_tokens']} tok, "
+            f"ties_at_max={caps['ties_at_max']}); max_gen_toks={caps['max_gen_toks']}, "
+            f"thinking_token_budget={caps['thinking_token_budget']}, "
+            f"answer_allowance={caps['answer_allowance']}. Of the capped rows, "
+            f"{caps['capped_correct']}/{caps['capped_scored']} scored. This score is "
+            f"truncation-taxed and is NOT comparable to a cell run at a different budget. "
+            f"Raising n_ctx does NOT fix it — raise max_gen_toks or lower the thinking budget.")
+    elif caps.get("status") in ("unverified", "not_applicable"):
+        warns.append(f"generation-cap audit {caps['status']}: {caps.get('reason')}")
+
     _sg = template.get("generation", {}) or {}
     summary = {
         "template": template["name"],
@@ -2519,6 +2860,9 @@ def main() -> None:
         "filter": chosen_filter,
         "scores": score_dict,
         "token_stats": stats,
+        # Generation-cap audit. Present on EVERY cell so "was this score truncation-taxed?"
+        # is answered by reading summary.json, never by re-tokenizing samples later.
+        "generation_caps": caps,
         "sanity_warnings": warns,
         # Wall-clock duration of this template's run (server spin-up + eval +
         # scoring). Persisted so future dual-GPU splits can be balanced on real

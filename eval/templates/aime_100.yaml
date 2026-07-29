@@ -23,8 +23,13 @@ selection:
   type: filter
   all: true
 generation:
-  max_gen_toks: 16384
-  thinking_token_budget: 12288    # same budget as aime_30 — comparability across the pair
+  # BUDGET RAISED 2026-07-28 in lockstep with aime_30 -- the pair is only usable as
+  # screen+confirmation if both sides carry the same answer allowance. See aime_30.yaml for the
+  # full rationale: the old 16384/12288 left 16384-12288 = 4096 tokens for the answer after a
+  # spent thinking budget, and every row cut there scored 0. 65536-49152 = 16384 instead.
+  # NOT COMPARABLE ACROSS THE CHANGE -- pre-2026-07-28 aime_100 cells ran under the old ceiling.
+  max_gen_toks: 65536
+  thinking_token_budget: 49152    # same budget as aime_30 — comparability across the pair
   temperature: 0.0
   top_p: 1.0
   top_k: 0

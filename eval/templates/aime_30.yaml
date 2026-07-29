@@ -7,8 +7,22 @@ selection:
   type: filter
   all: true
 generation:
-  max_gen_toks: 16384
-  thinking_token_budget: 12288    # 2026-05-12: clip Gemma 4 reasoning loops; see EVAL_PROTOCOL §3
+  # BUDGET RAISED 2026-07-28 (explicit decision, not a silent edit). thinking_token_budget is
+  # SUBTRACTED from max_gen_toks: at the old 16384/12288 a row that spent its reasoning budget
+  # was forced out of the thinking block with exactly 16384-12288 = 4096 tokens left for the
+  # ANSWER, and answers cut there re-tokenize to 4093. Measured on the AN cohort: 34/1142 v27
+  # rows and 44/1142 v28 rows hit that wall, against 2/701 for base -- and EVERY walled row
+  # scores 0. On aime_30 greedy that is 6/30 for v27 vs 0-1/30 for base, i.e. a ~20pp score tax
+  # falling hardest on the model that ruminates MOST, inside what reads as a reasoning
+  # comparison. It is independent of n_ctx (16384-12288 = 4096 at 32768 and at 131072 alike),
+  # which is why the 2026-07-25 geometry fix did not move it. AIME needs long thinking, so the
+  # fix is headroom, not a shorter leash: 65536-49152 = 16384 for the answer, 4x the old room
+  # and 8x the largest correct AIME answer observed (2087 tok).
+  #
+  # NOT COMPARABLE ACROSS THE CHANGE: any aime_30 cell run before 2026-07-28 was measured under
+  # a 4096-token answer ceiling. Do not pool old and new cells in one table -- re-run the arm.
+  max_gen_toks: 65536
+  thinking_token_budget: 49152    # 2026-05-12: clip Gemma 4 reasoning loops; see EVAL_PROTOCOL §3
   temperature: 0.0
   top_p: 1.0
   top_k: 0
