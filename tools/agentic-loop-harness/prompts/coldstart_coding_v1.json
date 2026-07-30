@@ -1,0 +1,24 @@
+{
+  "name": "coldstart_coding_v1",
+  "note": "Open-ended coding asks from EMPTY context -- the regime where users report v7-coder loops/over-thinks at Q6_K while base 128e completes directly. Taken verbatim-in-spirit from the HF discussion reports (DPS-900 / vilenpro) and the 2026-06-08 loop RCA (flexbox-center + viewport-meta were the reliable triggers). Run paired on v7-coder-Q6_K and 128e-Q6_K, same sampler, to find the v7-only failures.",
+  "system": "You are a coding agent working in a project directory. Complete the user's task directly and write the code. Be concise.",
+  "default": {"max_tokens": 32000, "reasoning_budget": 16384},
+  "prompts": [
+    {"name": "list_dir_trivial",
+     "user": "List the current directory, please."},
+    {"name": "snake_game",
+     "user": "Write a snake game as a single self-contained HTML file."},
+    {"name": "bouncing_ball",
+     "user": "Write a simple bouncing-ball animation as a single HTML file using CSS for the styling."},
+    {"name": "solar_system_v4",
+     "user": "Create a 3D solar system simulator. Ensure the planets are correctly positioned and orbit the sun accurately and are aligned from today's date. Include user controls to speed up time. Put everything in a single new file called solar-system-v4.html."},
+    {"name": "threejs_scene",
+     "user": "Create a 3D rotating-cube scene using Three.js as a single HTML file. Load Three.js from a CDN."},
+    {"name": "flexbox_center",
+     "user": "My .box div won't center. Fix the CSS so .box is perfectly centered both horizontally and vertically in the viewport. Give me the corrected CSS."},
+    {"name": "viewport_meta",
+     "user": "My page isn't scaling correctly on mobile. Fix the viewport meta tag and the initialScale setting and show me the corrected HTML head."},
+    {"name": "medium_website",
+     "user": "Build a small but polished landing page (hero section, three feature cards, footer) as a single HTML file with inline CSS and JS."}
+  ]
+}
