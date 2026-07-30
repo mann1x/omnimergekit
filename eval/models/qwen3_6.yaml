@@ -1,0 +1,41 @@
+# Per-model sampling profile - Qwen3.6-35B-A3B family (256e base + 184e prune + coder).
+#
+# GREEDY IS NON-VIABLE for this family on open-ended thinking benches: the base
+# Qwen3.6-35B-A3B (256e) AND the 184e prune both degenerate at temp=0 (early-EOS
+# fragments, token repetition, ~90k-char runaway loops) - confirmed 2026-07-13 on
+# math500 limit-5 (256e greedy=0.40 with fragments). The model's own
+# generation_config ships do_sample=true / temp=1.0 / top_p=0.95 / top_k=20.
+# So this cohort is reported at `recommended` (temp 0.6, the DeepSeek-R1/Qwen
+# thinking-math standard, lower-variance than the vendor 1.0). Paired with the
+# chat-template think-fix (dangling <think> prefill removed) this gives clean,
+# non-degenerate CoT. See recipes/qwen3_6_35b_a3b_prune/STATE.md.
+
+family: qwen3.6-35B-A3B
+match:
+  - "Qwen3.6-*"
+  - "*-35B-A3B*"
+  - "*qwen184e*"
+  - "*qwen256e*"
+  - "*qwencoder*"
+
+samplers:
+  greedy:                 # anchor only; NOT used for this family (degenerates)
+    temperature: 0.0
+    top_p: 1.0
+    top_k: 0
+    do_sample: false
+  recommended:            # temp 0.6 - thinking-math standard
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+    do_sample: true
+  vendor:                 # exact generation_config.json values
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 20
+    do_sample: true
+
+bench_policy:
+  default: recommended    # uniform across all 9 benches (user decision 2026-07-13)
+
+protocol_overrides: {}
