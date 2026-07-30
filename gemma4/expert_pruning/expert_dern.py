@@ -26,7 +26,6 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
-import numpy as np
 from safetensors import safe_open
 from safetensors.torch import save_file
 from tqdm import tqdm
@@ -438,7 +437,7 @@ def main():
         contributions, num_layers, num_experts, target_experts)
 
     # Print per-layer summary
-    print(f"\nPer-layer contribution retention:")
+    print("\nPer-layer contribution retention:")
     for li in range(num_layers):
         total = sum(contributions[li])
         kept = sum(contributions[li][e] for e in keep_map[li])
@@ -510,7 +509,7 @@ def main():
             f"{elapsed:.0f}s")
 
     # Pass 2: Write all tensors
-    print(f"\nPass 2: Writing tensors...")
+    print("\nPass 2: Writing tensors...")
 
     new_weight_map = {}
     current_shard = {}

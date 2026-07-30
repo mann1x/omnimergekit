@@ -79,7 +79,7 @@ for li in range(NUM_LAYERS):
 # Save
 with open('scripts/hybrid_124e_drop_map.json', 'w') as f:
     json.dump({str(li): hybrid_drop[li] for li in range(NUM_LAYERS)}, f, indent=2)
-print(f'\nSaved to scripts/hybrid_124e_drop_map.json')
+print('\nSaved to scripts/hybrid_124e_drop_map.json')
 
 avg_keep = (NUM_EXPERTS - DROP_K)
 print(f'Per-layer keep: {avg_keep} (vs 128e=128, 109e=109)')

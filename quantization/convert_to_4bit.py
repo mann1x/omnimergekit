@@ -5,8 +5,6 @@ This avoids loading bf16 weights into VRAM during inference.
 """
 
 import argparse
-import gc
-import json
 import os
 import shutil
 import time
@@ -16,6 +14,15 @@ import torch
 
 os.environ["HF_TOKEN"] = open(os.path.expanduser("~/.cache/huggingface/token")).read().strip()
 
+# NOTE: the three imports below are deliberately NOT at the top of the file, and the two
+# `noqa: E402` marks are load-bearing, not cosmetic. Order of operations matters:
+#   1. HF_TOKEN must be in os.environ before anything touches huggingface_hub;
+#   2. bnb.nn.Params4bit.__new__ must be patched before transformers constructs any
+#      Params4bit (it passes _is_hf_initialized, which upstream bnb rejects);
+#   3. caching_allocator_warmup must be neutered before the model is loaded, or the
+#      warmup allocates the full bf16 footprint in VRAM — the exact thing this script
+#      exists to avoid.
+# Moving them to the top silently breaks 4-bit conversion. Do not 'clean this up'.
 import bitsandbytes as bnb
 _orig = bnb.nn.Params4bit.__new__
 def _p(cls, *a, **k):
@@ -23,10 +30,10 @@ def _p(cls, *a, **k):
     return _orig(cls, *a, **k)
 bnb.nn.Params4bit.__new__ = _p
 
-import transformers.modeling_utils as _mu
+import transformers.modeling_utils as _mu  # noqa: E402  (see note above)
 _mu.caching_allocator_warmup = lambda *a, **k: None
 
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig  # noqa: E402
 
 
 def main():

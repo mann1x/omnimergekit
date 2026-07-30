@@ -17,7 +17,6 @@ Merge logic:
 """
 import json
 import glob
-import os
 
 REPO = "/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models"
 

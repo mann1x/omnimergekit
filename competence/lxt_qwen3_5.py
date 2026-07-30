@@ -92,7 +92,6 @@ def qwen3_5_rms_norm_forward(self, x):
     the variance term), but uses `self.eps` and the Gemma-style
     `(1.0 + self.weight)` scale that Qwen3_5 inherits.
     """
-    input_dtype = x.dtype
     x32 = x.to(torch.float32)
     variance = x32.pow(2).mean(-1, keepdim=True)
     x32 = x32 * stop_gradient(torch.rsqrt(variance + self.eps))

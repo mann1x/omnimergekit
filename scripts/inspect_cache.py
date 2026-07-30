@@ -1,4 +1,4 @@
-import sqlite3, pickle, sys, statistics
+import sqlite3, pickle, sys
 db = sys.argv[1]
 con = sqlite3.connect(db)
 rows = con.execute("SELECT key, value FROM unnamed").fetchall()
@@ -41,4 +41,4 @@ if lengths:
             head = s[:200].replace('\n','\\n')
             print(f"---sample {i+1} (len={len(s)})---")
             print(head)
-        except: pass
+        except Exception: pass

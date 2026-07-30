@@ -22,12 +22,10 @@ import json
 import os
 import re
 import shutil
-import time
 from collections import defaultdict
 from pathlib import Path
 
 import torch
-import numpy as np
 from safetensors import safe_open
 from safetensors.torch import save_file
 from tqdm import tqdm
@@ -226,7 +224,7 @@ def main():
     expert_wnorm = combined_wnorm  # for downstream code
 
     # Print per-layer summary
-    print(f"\nPer-layer selection:")
+    print("\nPer-layer selection:")
     for li in range(num_layers):
         total = sum(expert_wnorm[li])
         kept = sum(expert_wnorm[li][e] for e in keep_map[li])
@@ -260,7 +258,7 @@ def main():
     # Pre-compute residual expert per layer
     residual_data = {}  # li -> (gate_up_residual, down_residual, source_counts)
     if has_residual:
-        print(f"\nBuilding residual experts...")
+        print("\nBuilding residual experts...")
         for li in tqdm(range(num_layers), desc="Residual"):
             gu_key = f"model.language_model.layers.{li}.experts.gate_up_proj"
             dn_key = f"model.language_model.layers.{li}.experts.down_proj"
@@ -290,7 +288,7 @@ def main():
     max_shard_bytes = int(5 * 1024**3)
     total_size = 0
 
-    print(f"\nWriting tensors...")
+    print("\nWriting tensors...")
     for shard_name in tqdm(sorted(shard_keys.keys()), desc="Shards"):
         sf = shard_files[shard_name]
         for key in shard_keys[shard_name]:

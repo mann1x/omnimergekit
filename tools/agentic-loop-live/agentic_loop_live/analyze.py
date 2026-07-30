@@ -15,7 +15,7 @@ import os
 import re
 import zlib
 
-from .compact import classify_resp, RUNAWAY_MIN_COMPLETION, THINK_CAP, CORRUPT, _usage
+from .compact import classify_resp, THINK_CAP, CORRUPT, _usage
 
 LOOP = {"DEGENERATE", "TOOL_LOOP"}
 

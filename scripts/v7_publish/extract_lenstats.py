@@ -2,7 +2,7 @@
 """Extract canonical-bench length stats (chars + tokens p50/p90/max) + score
 for the 4 cohorts 128e / v6-coder / v7-coder / v7-coderx, from omk_eval
 summary.json token_stats. One served-dir per bench (auto-discovered)."""
-import json, glob, os, sys
+import json, glob, os
 
 COHORTS = [
     ("128e",      "/srv/ml/eval_results_128e_bs2"),

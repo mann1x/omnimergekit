@@ -10,14 +10,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import gc
 import os
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import torch
-from tqdm import tqdm
 
 
 TOPICS = {
@@ -183,7 +181,7 @@ def main():
 
     # Analysis
     print(f"\n{'='*80}")
-    print(f"  EXPERT TOPIC SPECIALIZATION ANALYSIS")
+    print("  EXPERT TOPIC SPECIALIZATION ANALYSIS")
     print(f"{'='*80}")
 
     # For each topic, compute which experts are most activated (globally across layers)
@@ -197,7 +195,7 @@ def main():
         topic_expert_importance[topic] = dict(expert_imp)
 
     # Find topic-specific experts: high activation for one topic, low for others
-    print(f"\n  Top 10 experts per topic (by routing weight share):")
+    print("\n  Top 10 experts per topic (by routing weight share):")
     for topic in TOPICS:
         imp = topic_expert_importance[topic]
         sorted_experts = sorted(imp.items(), key=lambda x: x[1], reverse=True)
@@ -212,7 +210,7 @@ def main():
                   f"specificity={specificity:.2f}x vs other topics")
 
     # How many unique experts does each topic use significantly?
-    print(f"\n  Expert utilization per topic (experts with >1% of max importance):")
+    print("\n  Expert utilization per topic (experts with >1% of max importance):")
     for topic in TOPICS:
         imp = topic_expert_importance[topic]
         if not imp:
@@ -225,7 +223,7 @@ def main():
               f"top-8 share: {top8_share:.1f}%")
 
     # Per-layer analysis for math vs creative (most different expected)
-    print(f"\n  Per-layer: math vs creative expert overlap:")
+    print("\n  Per-layer: math vs creative expert overlap:")
     print(f"    {'Layer':>5}  {'Math top-8':>30}  {'Creative top-8':>30}  {'Overlap':>7}")
     for layer_idx in range(num_layers):
         math_experts = topic_profiles["math"][0].get(layer_idx, {})
@@ -242,7 +240,7 @@ def main():
               f"{str(sorted(creative_ids)):>30}  {overlap:>3}/8")
 
     # Find experts that are exclusive to one topic
-    print(f"\n  Topic-exclusive experts (>3x specificity, appear in top-20 for topic):")
+    print("\n  Topic-exclusive experts (>3x specificity, appear in top-20 for topic):")
     for topic in TOPICS:
         imp = topic_expert_importance[topic]
         sorted_e = sorted(imp.items(), key=lambda x: x[1], reverse=True)[:20]

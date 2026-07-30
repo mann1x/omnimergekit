@@ -12,7 +12,6 @@ This script bridges that gap by adding the `language_model.` prefix to
 keys that need it. Used by the M4 ex-LRP pipeline.
 """
 import argparse
-import sys
 from pathlib import Path
 
 from safetensors.torch import load_file, save_file

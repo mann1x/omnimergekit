@@ -1,0 +1,42 @@
+# Lint configuration only — this repo is run in place, not installed as a package.
+# Deliberately no [project]/[build-system] table: adding one would make `pip install .`
+# look supported when it is not.
+#
+# Added 2026-07-30. Before this, `ruff check .` ran on implicit defaults and reported 372
+# findings, so nobody could tell a real regression from standing noise. That noise was hiding
+# a live bug: `scripts/analyze_track_results.py` had `rstats[thinking_ratio]` (missing quotes)
+# — an F821 that raises NameError on every run where reasoning stats are present.
+# The rules below are the standard the tree meets as of this commit.
+
+[tool.ruff]
+target-version = "py311"          # the omnimergekit conda env is Python 3.11.15
+line-length = 100                 # the convention in the maintained modules
+                                  # (E501 is intentionally NOT selected — see lint.ignore)
+
+[tool.ruff.lint]
+# Ruff's default set, pinned explicitly so an upstream default change cannot silently
+# widen or narrow what this repo enforces.
+select = ["E4", "E7", "E9", "F"]
+
+# The pure-formatting subset of E4/E7. This codebase deliberately writes dense one-liners in
+# its diagnostic/analysis scripts (`if not x: continue`, `a=1; b=2`, `import json, sys`).
+# Rewriting those lines in working scripts is churn with a real chance of breaking them.
+#
+# NOT ignored, and never to be added here: every `F` rule (F401 unused import, F821 undefined
+# name, F841 dead assignment), all of `E9` (syntax/IO errors), and E722 (bare except) — those
+# catch real defects, which is the whole point of keeping this file honest.
+ignore = [
+    "E401",   # multiple imports on one line
+    "E701",   # multiple statements on one line (colon)
+    "E702",   # multiple statements on one line (semicolon)
+    "E731",   # lambda assignment
+    "E741",   # ambiguous variable name (l/I/O)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Adapted copies of upstream lm-eval task utils. Their `import antlr4` / `import sympy` sit
+# inside a `try:` as an availability probe guarded by `assert version(...)`, so "unused" is
+# exactly wrong here: removing them would silently disable the guard on a SCORING path, and
+# scoring provenance is not something to trade for a lint tick. Keep the diff to upstream
+# minimal — do not restyle these files.
+"eval/lm_eval_tasks/**" = ["F401"]

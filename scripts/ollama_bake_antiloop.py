@@ -3,7 +3,7 @@
 Per-tag: pull -> create(+PARAMS) -> verify(params added, template/renderer/parser preserved)
 -> push -> rm (bound disk). Resumable via .done markers. CSS-noise tags filtered out.
 Origin: HF v7-coder discussion #1 loop complaint RCA (2026-06-08)."""
-import os, re, subprocess, sys, time, urllib.request
+import os, re, subprocess, time, urllib.request
 
 NS = "mannix"
 MODELS = ["gemma4-98e-v7-coder", "gemma4-98e-v7-coderx", "gemma4-98e-v6-coder"]

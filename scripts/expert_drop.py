@@ -17,13 +17,11 @@ Usage:
 
 import argparse
 import json
-import os
 import re
 import shutil
 from collections import defaultdict
 from pathlib import Path
 
-import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 from tqdm import tqdm
@@ -209,7 +207,7 @@ def main():
     with open(output_dir / "expert_drop_metadata.json", "w") as f:
         json.dump(meta, f, indent=2)
 
-    print(f"\nDone!")
+    print("\nDone!")
     print(f"  Expert tensors pruned: {n_expert_tensors}")
     print(f"  Router tensors pruned: {n_router_tensors}")
     print(f"  Total size: {total_size / 1024**3:.1f} GB ({total_size / 2 / 1e9:.1f}B params @ bf16)")

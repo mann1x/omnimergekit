@@ -14,7 +14,6 @@ import os
 import time
 import json
 import torch
-import numpy as np
 from collections import defaultdict
 from torch import nn
 
@@ -205,7 +204,7 @@ def merge_trackers(target, source, num_layers, num_experts):
 
 
 def main():
-    print(f"=== Expert + Neuron Analysis v5 (adds organic chemistry) ===")
+    print("=== Expert + Neuron Analysis v5 (adds organic chemistry) ===")
     PROMPTS["gpqa_organic"] = load_gpqa_oc_prompts()
     total_prompts = sum(len(v) for v in PROMPTS.values())
     print(f"Total: {total_prompts} prompts in {len(PROMPTS)} categories")

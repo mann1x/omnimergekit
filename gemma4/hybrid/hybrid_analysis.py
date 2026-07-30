@@ -192,7 +192,7 @@ for li in range(NUM_LAYERS):
 hybrid_drop = {li: sorted(set(range(NUM_EXPERTS)) - set(hybrid_keep[li])) for li in range(NUM_LAYERS)}
 with open('scripts/hybrid_drop_map.json', 'w') as f:
     json.dump({str(li): hybrid_drop[li] for li in range(NUM_LAYERS)}, f, indent=2)
-print(f'\nSaved hybrid drop map to scripts/hybrid_drop_map.json')
+print('\nSaved hybrid drop map to scripts/hybrid_drop_map.json')
 
 avg = sum(len(v) for v in hybrid_keep.values()) / NUM_LAYERS
 print(f'Average experts per layer: {avg:.1f}')

@@ -5,7 +5,7 @@ Strategy: the llama.cpp PEG parser bug only triggers with --reasoning-format dee
 We restart the server WITHOUT that flag and reask each question. If the first seed
 fails to produce a valid letter, try other seeds.
 """
-import json, re, sys, time, urllib.request
+import json, re, time, urllib.request
 
 SAMPLES = "eval_results/gpqa_full/109e_v3_Q6K/109e_v3_Q6K/samples_gpqa_diamond_cot_zeroshot_2026-04-11T09-52-03.920413.jsonl"
 URL = "http://localhost:8099/v1/chat/completions"

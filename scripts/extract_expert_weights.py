@@ -5,7 +5,7 @@ Router tensors per Gemma 4 26B-A4B:
   router.per_expert_scale shape (n_surviving=62,)    - per-expert mixing scale
   router.proj.weight      shape (62, 2816)           - routing projection
 """
-import json, sys, os, statistics
+import json, os, statistics
 from pathlib import Path
 import torch
 from safetensors.torch import safe_open
@@ -83,7 +83,7 @@ def main():
                         try: surviving[int(k)] = v[tag]
                         except ValueError: pass
                         break
-    print(f"# Expert weights snapshot — A2 publish candidate")
+    print("# Expert weights snapshot — A2 publish candidate")
     print(f"# Drop map: {DROP_MAP.name} (layers with surviving expert ids: {len(surviving)})")
     print()
     print("=== A2 (pre-EAC) ===", flush=True)
@@ -137,7 +137,6 @@ def main():
     print()
     print("SURVIVING EXPERT IDs (which physical experts the 62 positions map to)")
     if surviving:
-        sample_layers = sorted(surviving.keys())[:5] + ["..."] + sorted(surviving.keys())[-5:] if len(surviving) > 10 else sorted(surviving.keys())
         for L in sorted(surviving.keys()):
             ids = surviving[L]
             if isinstance(ids, list):
