@@ -40,10 +40,8 @@ from __future__ import annotations
 import argparse
 import gc
 import json
-import os
 import re
 import shutil
-import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -498,7 +496,7 @@ def print_expert_stats(profiles: dict, num_layers: int, num_experts: int, top_n:
 
     # Distribution analysis
     importances = [imp for _, imp in sorted_global]
-    print(f"\n  Importance distribution:")
+    print("\n  Importance distribution:")
     print(f"    Max: {importances[0]:.6f}  Min: {importances[-1]:.6f}  Ratio: {importances[0]/max(importances[-1],1e-10):.1f}x")
     print(f"    Mean: {np.mean(importances):.6f}  Std: {np.std(importances):.6f}  CV: {np.std(importances)/np.mean(importances):.2f}")
     print(f"    Top 32 capture: {sum(importances[:32])/sum(importances)*100:.1f}% of total importance")
@@ -518,7 +516,7 @@ def print_expert_stats(profiles: dict, num_layers: int, num_experts: int, top_n:
         print(f"    #{len(sorted_global)-top_n+rank+1:3d}  Expert {eid:3d}  importance={imp:.6f}  freq={freq:.4f}  avg_weight={wt:.4f}")
 
     # Per-layer detailed stats
-    print(f"\n  Per-layer stats:")
+    print("\n  Per-layer stats:")
     print(f"    {'Layer':>5}  {'Active':>6}  {'Top Expert':>10}  {'Top Imp':>8}  {'Gini':>6}  {'Top8 %':>7}")
     print(f"    {'─'*5}  {'─'*6}  {'─'*10}  {'─'*8}  {'─'*6}  {'─'*7}")
     for layer_idx in sorted(profiles.keys()):
@@ -542,7 +540,7 @@ def print_expert_stats(profiles: dict, num_layers: int, num_experts: int, top_n:
               f"{top_expert[1]['importance']:>8.4f}  {gini:>6.3f}  {top8_share:>6.1f}%")
 
     # Activation-pattern similarity (for display only)
-    print(f"\n  Computing activation-pattern similarity (for reference)...")
+    print("\n  Computing activation-pattern similarity (for reference)...")
     act_similarity = compute_expert_similarity(profiles, num_layers, num_experts)
 
     sim_pairs = []
@@ -551,7 +549,7 @@ def print_expert_stats(profiles: dict, num_layers: int, num_experts: int, top_n:
             sim_pairs.append((i, j, act_similarity[i, j]))
     sim_pairs.sort(key=lambda x: x[2], reverse=True)
 
-    print(f"\n  Top 10 most similar expert pairs (activation patterns):")
+    print("\n  Top 10 most similar expert pairs (activation patterns):")
     for i, (e1, e2, sim) in enumerate(sim_pairs[:10]):
         imp1 = global_importance[e1]
         imp2 = global_importance[e2]
@@ -575,7 +573,6 @@ def perform_expert_merge(source_dir: Path, output_dir: Path,
 
     weight_map = index["weight_map"]
     text_cfg = config["text_config"]
-    num_layers = text_cfg["num_hidden_layers"]
     num_experts_orig = text_cfg["num_experts"]
     # All layers must produce the same number of output experts
     target_experts = len(per_layer_groups[next(iter(per_layer_groups))])
@@ -745,7 +742,7 @@ def perform_expert_merge(source_dir: Path, output_dir: Path,
         sum(1 for g in groups if len(g) > 1)
         for groups in per_layer_groups.values()
     )
-    print(f"\nExpert merge complete!")
+    print("\nExpert merge complete!")
     print(f"  {num_experts_orig} -> {target_experts} experts per layer")
     print(f"  Total merges across all layers: {total_merged}")
     print(f"  Total size: {total_size / 1024**3:.1f} GB ({total_size / 2 / 1e9:.1f}B params @ bf16)")
@@ -762,7 +759,7 @@ def verify_merged_model(model_dir: Path, original_profiles: dict,
     3. Routing entropy is in a reasonable range
     """
     print(f"\n{'='*60}")
-    print(f"  POST-MERGE VERIFICATION")
+    print("  POST-MERGE VERIFICATION")
     print(f"{'='*60}")
 
     # Profile the merged model
@@ -821,7 +818,7 @@ def verify_merged_model(model_dir: Path, original_profiles: dict,
         for issue in issues:
             print(issue)
     else:
-        print(f"\n  No routing issues detected.")
+        print("\n  No routing issues detected.")
 
     return merged_profiles, issues
 
@@ -977,7 +974,7 @@ def main():
 
         print(f"  Done! -> {output_dir}")
 
-    print(f"\nAll variants saved.")
+    print("\nAll variants saved.")
 
 
 if __name__ == "__main__":

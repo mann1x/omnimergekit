@@ -22,7 +22,6 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
-from tqdm import tqdm
 
 
 # Same prompt set as original (trimmed to 3 per topic for speed)
@@ -252,7 +251,7 @@ def main():
     print(f"\nSaved to {args.output}")
 
     # Summary
-    print(f"\n=== Per-layer total_moe_norm (mean across topics) ===")
+    print("\n=== Per-layer total_moe_norm (mean across topics) ===")
     layer_scores = defaultdict(list)
     for topic in TOPICS:
         for li in range(num_layers):

@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "single-turn-seed-harness"
+version = "0.1.0"
+description = "Reproduce the June single-turn HumanEval+/MultiPL-E seed sweep that isolated the Gemma-4 chat-template reasoning re-injection failure. Grades each response with the hammer classifier and reports a per-template fail-rate for an OLD-vs-NEW template comparison."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+dependencies = ["datasets>=2.0"]
+
+[project.scripts]
+single-turn-seed-harness = "single_turn_seed_harness.cli:main"
+
+[tool.setuptools]
+packages = ["single_turn_seed_harness"]

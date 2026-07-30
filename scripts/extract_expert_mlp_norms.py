@@ -7,9 +7,8 @@ Gemma 4 26B-A4B fused-experts layout per layer:
   router.{scale, proj.weight, per_expert_scale}
   layer_scalar           -- single scalar
 """
-import json, sys, os, statistics, time
+import json, os, statistics, time
 from pathlib import Path
-import torch
 from safetensors.torch import safe_open
 
 A2 = Path("/srv/ml/google/gemma-4-A4B-62e-fc15_25-p8-s1_0p1_20-it")
@@ -60,8 +59,8 @@ def collect_expert_norms(p, label):
     return out
 
 def main():
-    print(f"# Per-expert MLP-norm snapshot — Gemma 4 26B-A4B 62e A2 vs A2_EAC")
-    print(f"# Each layer: fused experts.down_proj (62,2816,704) + experts.gate_up_proj (62,1408,2816)")
+    print("# Per-expert MLP-norm snapshot — Gemma 4 26B-A4B 62e A2 vs A2_EAC")
+    print("# Each layer: fused experts.down_proj (62,2816,704) + experts.gate_up_proj (62,1408,2816)")
     print()
     print("Loading A2 (pre-EAC) ...", flush=True)
     a2 = collect_expert_norms(A2, "A2")

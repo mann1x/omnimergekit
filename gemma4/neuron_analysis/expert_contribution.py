@@ -13,17 +13,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import gc
 import json
 import os
 from collections import defaultdict
-from functools import wraps
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch import nn
-from tqdm import tqdm
 
 
 TOPICS = {
@@ -267,11 +264,11 @@ def main():
 
     # ── Print analysis ──
     print(f"\n{'='*90}")
-    print(f"  EXPERT CONTRIBUTION ANALYSIS (weighted output norm to residual stream)")
+    print("  EXPERT CONTRIBUTION ANALYSIS (weighted output norm to residual stream)")
     print(f"{'='*90}")
 
     # Per-topic: how concentrated is the actual contribution?
-    print(f"\n  Contribution concentration per topic (weighted output norm):")
+    print("\n  Contribution concentration per topic (weighted output norm):")
     print(f"    {'Topic':>10}  {'Top-1%':>8}  {'Top-8%':>8}  {'Top-16%':>8}  {'Top-32%':>8}  "
           f"{'Gini':>6}  {'80% needs':>9}")
     for topic in TOPICS:
@@ -301,7 +298,7 @@ def main():
               f"{top32_pct:>7.1f}%  {gini:>6.3f}  {needs_80:>5}")
 
     # Per-layer distribution (math)
-    print(f"\n  Per-layer contribution distribution (math topic):")
+    print("\n  Per-layer contribution distribution (math topic):")
     print(f"    {'Layer':>5}  {'MoE norm':>10}  {'Top-1 expert':>12}  {'Top-1 %':>7}  "
           f"{'Top-8 %':>7}  {'Active':>6}  {'Bottom-64 %':>11}")
     for layer_idx in range(num_layers):
@@ -321,7 +318,7 @@ def main():
               f"{active:>6}  {bottom64_w/total_w*100:>10.1f}%")
 
     # Compare math vs creative top contributors
-    print(f"\n  Top-10 contributing experts: math vs creative (by weighted output norm)")
+    print("\n  Top-10 contributing experts: math vs creative (by weighted output norm)")
     math_total = defaultdict(float)
     creative_total = defaultdict(float)
     for li in range(num_layers):
@@ -349,7 +346,7 @@ def main():
     print(f"\n  Math vs Creative top-32 overlap: {overlap}/32 shared")
 
     # Per-layer overlap of top-8
-    print(f"\n  Per-layer top-8 overlap (math vs creative):")
+    print("\n  Per-layer top-8 overlap (math vs creative):")
     for li in range(num_layers):
         m_experts = {e["id"]: e["weighted_norm"] for e in all_topic_results["math"][li]["experts"]}
         c_experts = {e["id"]: e["weighted_norm"] for e in all_topic_results["creative"][li]["experts"]}
@@ -373,7 +370,7 @@ def main():
             }
     with open("eval_results/expert_contributions.json", "w") as f:
         json.dump(save_data, f, indent=2)
-    print(f"\n  Saved to eval_results/expert_contributions.json")
+    print("\n  Saved to eval_results/expert_contributions.json")
 
 
 if __name__ == "__main__":

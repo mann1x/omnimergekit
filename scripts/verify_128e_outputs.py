@@ -4,7 +4,7 @@ Re-generates the first N multilingual + a few constrained prompts at the IDENTIC
 loop_screen.py settings (greedy, rep_pen 1.0, max_new 2048, chat template, eager)
 and prints per-prompt char/word length + tail + detect_loop. If lengths are
 substantive and varied, the 0% is a true negative."""
-import json, sys, time, torch
+import json, sys, torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 sys.path.insert(0, "/srv/ml/repos/omnimergekit/scripts")
 from audit_full_bench import detect_loop

@@ -4,10 +4,9 @@ Comprehensive analysis of track results across the cohort.
 Reports: score, length distributions, rumination/looping/under-thinking/over-thinking signals.
 Author: claude opus 4.7  2026-05-29
 """
-import json, sys, os, re
+import json, os
 from pathlib import Path
 from collections import defaultdict, Counter
-from statistics import median, quantiles
 
 BM = Path("/srv/ml")
 COHORT = [
@@ -97,11 +96,10 @@ def analyze_bench(served, bench, base_dir):
         n_empty = 0
         n_short = 0
         budget = BENCHES[bench]["budget"]
-        n_sat = 0
         for line in samples_p.open():
             try:
                 d = json.loads(line)
-            except: continue
+            except json.JSONDecodeError: continue
             r = d.get("resps", [[]])[0]
             if isinstance(r, list) and r: r = r[0]
             if not isinstance(r, str): continue
@@ -109,7 +107,6 @@ def analyze_bench(served, bench, base_dir):
             if len(r) == 0: n_empty += 1
             if 0 < len(r) < 50: n_short += 1
             if detect_repetition(r): n_loop += 1
-            # Check saturation: if completion_tokens for this sample is near budget
         out["n_samples"] = len(chars)
         if chars:
             p10, p50, p90, mx = pcts(chars)
@@ -151,7 +148,7 @@ def parse_reasoning_log(rl_path):
                 d = json.loads(line)
                 content_chars.append(d.get("content_chars", 0))
                 reasoning_chars.append(d.get("reasoning_chars", 0))
-            except: pass
+            except (json.JSONDecodeError, AttributeError): pass
     if not content_chars: return None
     return {
         "n": len(content_chars),
@@ -167,7 +164,7 @@ def parse_reasoning_log(rl_path):
     }
 
 def main():
-    print(f"# Comprehensive cohort report")
+    print("# Comprehensive cohort report")
     print(f"_Generated: {os.popen('date -Iseconds').read().strip()}_")
     print()
     print("## Legend")
@@ -212,7 +209,7 @@ def main():
             rl = find_reasoning_log(served_from_disp.get(disp, ""), bench, base_dir_from_disp.get(disp, ""))
             rstats = parse_reasoning_log(rl)
             think_p50 = str(rstats["reasoning_p50"]) if rstats else "-"
-            think_pct = f"{100*rstats[thinking_ratio]:.0f}%" if rstats else "-"
+            think_pct = f"{100*rstats['thinking_ratio']:.0f}%" if rstats else "-"
             rows.append([disp, score_s, str(ct50), str(ct90), str(ctmx), sat, str(chars50), str(chars90), loop_pct, empty_pct, short_pct, think_p50, think_pct])
         if not rows: print("_no data yet_"); print(); continue
         widths = [max(len(str(r[i])) for r in rows + [["model","score","C-tok-p50","C-tok-p90","C-tok-max","sat","char-p50","char-p90","loop%","empty%","short%","think-p50","think%"]]) for i in range(13)]

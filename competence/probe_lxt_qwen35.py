@@ -21,7 +21,7 @@ def main():
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
     print("=" * 60)
-    print(f"[probe2] lxt.efficient × qwen3_5 smoke test")
+    print("[probe2] lxt.efficient × qwen3_5 smoke test")
     print(f"[probe2] model: {model_path}")
     print(f"[probe2] device: {device}, dtype: {dtype}")
     print("=" * 60)

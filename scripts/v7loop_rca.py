@@ -10,7 +10,7 @@
 # rumination, not a Q4_K_M defect. This harness proves/refutes by isolating the variable.
 #
 # Each config launches its own llama-server on GPU1:8200, runs the prompts, kills it.
-import argparse, json, os, signal, subprocess, sys, time, urllib.request
+import argparse, json, os, signal, subprocess, time, urllib.request
 from collections import Counter
 from pathlib import Path
 

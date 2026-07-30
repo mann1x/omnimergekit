@@ -19,7 +19,7 @@ import signal
 import subprocess
 import time
 
-from . import compact, fixtures, proxy as proxy_mod
+from . import compact, fixtures
 
 _SES_RE = re.compile(r"ses_[A-Za-z0-9]+")
 

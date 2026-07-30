@@ -3,7 +3,7 @@
 If this produces the 'post-EAC = 1/5 loop' pattern, the apparent recovery was always a
 canary-code artifact — EAC never actually fixed anything.
 """
-import sys, os, json
+import sys
 from pathlib import Path
 sys.path.insert(0, "/srv/ml/scripts")
 import router_kd as rk
@@ -14,11 +14,11 @@ A2 = "/srv/ml/google/gemma-4-A4B-62e-fc15_25-p8-s1_0p1_20-it"  # plain A2 base b
 CANARY = Path("/srv/ml/scripts/ifeval_rumination_canaries.json")
 MAX_NEW = 4096  # script default
 
-print(f"=== H3: canary on plain A2 with CURRENT router_kd.py code ===", flush=True)
+print("=== H3: canary on plain A2 with CURRENT router_kd.py code ===", flush=True)
 print(f"variant: {A2}")
 print(f"canary : {CANARY}")
 print(f"max_new: {MAX_NEW}")
-print(f"router_kd.py mtime: 19:26 UTC (after vanilla RKD 18:43, before iterate 20:46)", flush=True)
+print("router_kd.py mtime: 19:26 UTC (after vanilla RKD 18:43, before iterate 20:46)", flush=True)
 print()
 print("Loading tokenizer...", flush=True)
 tok = AutoTokenizer.from_pretrained(A2)

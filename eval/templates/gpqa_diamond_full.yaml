@@ -19,7 +19,14 @@ generation:
   # llama.cpp canonical (Gemma 4 26B-A4B Q6_K, 4h55m for 198q on 3090).
   # Empirical: budget=8192 + max_gen=16384 keeps 95th-pct response ≤9k tokens.
   max_gen_toks: 16384
-  thinking_token_budget: 8192
+  # CORRECTED 2026-07-28: was 8192, which was a WRONG DECLARATION, not a different intent.
+  # 12288 is the canonical Gemma-4 reasoning budget and what ~40 other templates declare; the
+  # llama.cpp path has been SERVING 12288 for this bench all along (the runner passed it), so
+  # this line disagreeing with reality is what needs fixing -- existing llama-path GPQA cells
+  # ran at 12288 and remain VALID. Note the serve flag wins over any per-request value, so a
+  # stale declaration here is invisible at runtime and only surfaces once something compares
+  # the two (omk_eval now hard-fails on served != declared).
+  thinking_token_budget: 12288
   temperature: 0.0                # greedy — matches v4 published + v5-coder pod recipe
   top_p: 1.0
   top_k: 0

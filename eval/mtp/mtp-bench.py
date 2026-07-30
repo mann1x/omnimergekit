@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, json, sys, time
+import argparse, json, time
 from urllib import request
 
 PROMPTS = [

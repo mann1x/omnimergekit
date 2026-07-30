@@ -2,7 +2,6 @@
 import json, statistics
 from pathlib import Path
 from safetensors.torch import safe_open
-import torch
 
 A2_EAC = Path("/srv/ml/google/gemma-4-A4B-62e-fc15_25-p8-s1_0p1_20-eac-it")
 wmap = json.load(open(A2_EAC/"model.safetensors.index.json"))["weight_map"]
@@ -14,7 +13,7 @@ for shard_name in shards_to_check:
     current = A2_EAC / shard_name
     backup = A2_EAC / (shard_name + ".pre_eac_calibrate")
     if not backup.exists():
-        print(f"  no .pre_eac_calibrate for this shard")
+        print("  no .pre_eac_calibrate for this shard")
         continue
     print(f"  current SHA  : {open(current,'rb').read(8).hex()}..."[:40] + f"   size={current.stat().st_size:,}  inode={current.stat().st_ino}")
     print(f"  backup  SHA  : {open(backup,'rb').read(8).hex()}..."[:40] + f"   size={backup.stat().st_size:,}  inode={backup.stat().st_ino}")
@@ -43,7 +42,7 @@ for shard_name in shards_to_check:
     print(f"  total L2(diff): {total_l2**0.5:.6f}")
     print(f"  max abs delta : {max_abs_delta:.6f}")
     print(f"  max rel delta : {max_rel_delta:.6e}")
-    print(f"  tensors changed by kind (sample):")
+    print("  tensors changed by kind (sample):")
     for kind, deltas in sorted(delta_by_kind.items())[:10]:
         mean_mad = statistics.mean(d[1] for d in deltas)
         print(f"    {kind:>30}  count={len(deltas):3d}  mean(max_delta)={mean_mad:.6e}")

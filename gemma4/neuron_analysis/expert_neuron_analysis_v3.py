@@ -13,11 +13,9 @@ Total: 5 domains x 8 prompts + 9 GPQA hard = 49 prompts.
 """
 
 import os
-import sys
 import time
 import json
 import torch
-import numpy as np
 from collections import defaultdict
 from torch import nn
 
@@ -283,7 +281,7 @@ def main():
         }
         all_results[category] = cat_tracker
 
-    print(f"\n=== Completion Stats ===")
+    print("\n=== Completion Stats ===")
     for cat, stats in completion_stats.items():
         print(f"  {cat}: {stats['completed']}/{stats['total']} completed, "
               f"{stats['filtered']} filtered")

@@ -5,7 +5,7 @@ rows = []
 for f in sorted(glob.glob(os.path.join(root, "**", "summary.json"), recursive=True)):
     try:
         d = json.load(open(f))
-    except Exception as e:
+    except Exception:
         continue
     # bench name = the directory just under root, or after marker
     rel = os.path.relpath(f, root)

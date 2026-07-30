@@ -244,7 +244,7 @@ def compute_wanda_masks(model_path, act_norms, contrib_norms,
     for sf in shard_files.values():
         del sf
 
-    print(f"\n  Per-layer retained importance:")
+    print("\n  Per-layer retained importance:")
     for li in range(num_layers):
         ri = retained_importance[li] if not np.isnan(retained_importance[li]) else 0.0
         bar = "█" * int(ri / 100 * 30)
@@ -436,7 +436,7 @@ def main():
     else:
         normalized = np.ones(num_layers)
 
-    print(f"\n  Layer contribution (normalized):")
+    print("\n  Layer contribution (normalized):")
     for li in range(num_layers):
         bar = "█" * int(normalized[li] * 30)
         print(f"    L{li:2d}: {normalized[li]:.3f} {bar}")

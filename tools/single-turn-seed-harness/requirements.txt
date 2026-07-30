@@ -1,0 +1,9 @@
+# single-turn-seed-harness runtime dependencies.
+#
+# The harness core (classify / sweep / cli) is pure Python standard library --
+# the HTTP driver uses urllib, the classifier uses re + json + collections -- so
+# it needs no GPU / torch / numpy. The ONLY third-party dependency is HuggingFace
+# `datasets`, used solely to load the HumanEval+ and MultiPL-E prompt sets. If
+# you materialise the prompt set some other way (e.g. a local JSONL), you can
+# drop this too.
+datasets>=2.0

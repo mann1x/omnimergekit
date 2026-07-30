@@ -29,11 +29,10 @@ import os
 import re
 import shutil
 import time
-from collections import defaultdict, Counter
+from collections import defaultdict
 from pathlib import Path
 
 import torch
-import numpy as np
 from safetensors import safe_open
 from safetensors.torch import save_file
 from tqdm import tqdm
@@ -321,7 +320,7 @@ def main():
         tqdm.write(f"  L{li:2d}: {n_asgn} assigned, {elapsed:.0f}s")
 
     # Pass 2: Write tensors
-    print(f"\nPass 2: Writing tensors...")
+    print("\nPass 2: Writing tensors...")
     new_weight_map = {}
     current_shard = {}
     current_size = 0

@@ -39,7 +39,8 @@ _sce_accept_tos() {
 }
 
 # apply_lmeval_patches <env_python> <patches_csv>
-# patches_csv ∈ {unbound, fix-a} (comma-separated). No-op for unknown tokens.
+# patches_csv ∈ {unbound, fix-a, thinking} (comma-separated; apply order matters —
+# `thinking` stacks on `fix-a`). No-op for unknown tokens.
 apply_lmeval_patches() {
     local env_py="$1" csv="${2:-}"
     [ -n "$csv" ] || return 0
@@ -53,6 +54,9 @@ apply_lmeval_patches() {
                 "$env_py" "$PATCHES_DIR/lm_eval_unbound_guard.py" "$lm_dir/models/api_models.py" ;;
             fix-a)
                 "$env_py" "$PATCHES_DIR/fix_a_lm_eval_patch.py" "$lm_dir/models/openai_completions.py" ;;
+            thinking)
+                # MUST run after fix-a: it stacks on Fix-A's `tmp[...] = text`.
+                "$env_py" "$PATCHES_DIR/patch_lmeval_thinking_table.py" "$lm_dir/models/openai_completions.py" ;;
             *) _sce_log "unknown patch '$p' — skip" ;;
         esac
     done

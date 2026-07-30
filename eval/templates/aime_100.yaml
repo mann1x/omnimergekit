@@ -1,0 +1,52 @@
+# AIME 2018-2023 — 100 problems. LOW-VARIANCE CONFIRMATION set for aime_30.
+#
+# aime_30 (AIME 2024, n=30) is the screening bench: one question = 0.0333, so a 1-2
+# question move there is inside noise. aime_100 exists to confirm or kill a move: n=100,
+# one question = 0.01. Use it to CONFIRM, not to replace aime_30.
+#
+# Disjointness (asserted at build time, see lm_eval_tasks/aime100_chat/build_report.json):
+#   - problem-level disjoint from the AN SFT training pool `aime_hist` (excluded by exact
+#     id `aime-{Year}-{Problem Number}`)
+#   - disjoint from the aime_30 anchor BY YEAR (aime_30 = Maxwell-Jia/AIME_2024; this set
+#     stops at 2023)
+# Rebuild with:  HF_TOKEN=... python eval/build_aime100_dataset.py
+#
+# GREEDY ONLY, deliberately (2026-07-25 decision): across the whole AN cohort the sampler
+# does not move AIME — base 0.3667/0.3667, v16 0.1667/0.1667, gepo 0.1667/0.1667 on
+# greedy/vendor. A vendor cell would cost 45 min/model and buy nothing, so the confirmation
+# run is 1 cell per model (base + tuned = 2 cells, ~45 min each).
+name: aime_100
+backend: lm-eval
+task: aime100_chat
+n: 100
+selection:
+  type: filter
+  all: true
+generation:
+  # BUDGET RAISED 2026-07-28 in lockstep with aime_30 -- the pair is only usable as
+  # screen+confirmation if both sides carry the same answer allowance. See aime_30.yaml for the
+  # full rationale: the old 16384/12288 left 16384-12288 = 4096 tokens for the answer after a
+  # spent thinking budget, and every row cut there scored 0. 65536-49152 = 16384 instead.
+  # NOT COMPARABLE ACROSS THE CHANGE -- pre-2026-07-28 aime_100 cells ran under the old ceiling.
+  max_gen_toks: 65536
+  thinking_token_budget: 49152    # same budget as aime_30 — comparability across the pair
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: exact_match
+  filter: strict
+  validated_against: gneubig/aime-1983-2024
+  validation_date: "2026-07-25"
+backend_args:
+  apply_chat_template: true
+  num_fewshot: 0
+  batch_size: 1
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+  lm_eval_include_path: lm_eval_tasks/aime100_chat
+cache:
+  sqlite_prefix: aime_100
+reports:
+  token_stats: true

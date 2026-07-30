@@ -10,7 +10,6 @@ and only does it once in the forward pass (1 step).
 """
 
 import os
-import sys
 import time
 import json
 import torch
@@ -181,11 +180,11 @@ def analyze(tracker, num_layers, num_experts):
 
 def print_results(all_results, num_layers, num_experts):
     print(f"\n{'='*90}")
-    print(f"  EXPERT CONTRIBUTION ANALYSIS (weighted output norm)")
+    print("  EXPERT CONTRIBUTION ANALYSIS (weighted output norm)")
     print(f"{'='*90}")
 
     # Concentration per topic
-    print(f"\n  Contribution concentration per topic:")
+    print("\n  Contribution concentration per topic:")
     print(f"    {'Topic':>10}  {'Top-1%':>8}  {'Top-8%':>8}  {'Top-32%':>8}  "
           f"{'Gini':>6}  {'80%need':>7}")
     for topic in TOPICS:
@@ -206,7 +205,7 @@ def print_results(all_results, num_layers, num_experts):
               f"{sum(sc[:32])/total*100:>7.1f}%  {gini:>6.3f}  {n80:>5}")
 
     # Per-layer (math)
-    print(f"\n  Per-layer (math):")
+    print("\n  Per-layer (math):")
     print(f"    {'Layer':>5}  {'Top-1':>12}  {'Top1%':>6}  {'Top8%':>6}  {'Act':>4}  {'Bot64%':>7}")
     for li in range(num_layers):
         d = all_results["math"][li]
@@ -234,7 +233,7 @@ def print_results(all_results, num_layers, num_experts):
     mtot = sum(v for _, v in ms)
     ctot = sum(v for _, v in cs_)
 
-    print(f"\n  Top-10: math vs creative")
+    print("\n  Top-10: math vs creative")
     for r in range(10):
         me, mv = ms[r]
         ce, cv = cs_[r]
@@ -245,7 +244,7 @@ def print_results(all_results, num_layers, num_experts):
     print(f"\n  Top-32 overlap: {len(m32 & c32)}/32")
 
     # Per-layer top-8 overlap
-    print(f"\n  Per-layer top-8 overlap (math vs creative):")
+    print("\n  Per-layer top-8 overlap (math vs creative):")
     for li in range(num_layers):
         me = {e["id"]: e["wnorm"] for e in all_results["math"][li]["experts"]}
         ce = {e["id"]: e["wnorm"] for e in all_results["creative"][li]["experts"]}
@@ -302,7 +301,7 @@ def main():
 
     # Per-layer drop candidate map at various thresholds
     print(f"\n{'='*90}")
-    print(f"  PER-LAYER DROP CANDIDATES")
+    print("  PER-LAYER DROP CANDIDATES")
     print(f"{'='*90}")
 
     # Aggregate across all topics
@@ -313,7 +312,7 @@ def main():
                 agg[li][e["id"]] += e["wnorm"]
 
     thresholds = [0.90, 0.95, 0.99]
-    print(f"\n  Experts needed to reach X% of total contribution:")
+    print("\n  Experts needed to reach X% of total contribution:")
     print(f"    {'Layer':>5}  {'Active':>6}  {'90%':>5}  {'95%':>5}  {'99%':>5}  "
           f"{'Drop@95%':>8}  {'Drop@99%':>8}")
     total_drop_95 = 0
@@ -336,7 +335,7 @@ def main():
         print(f"    {li:>5}  {active:>6}  {needs[0.90]:>5}  {needs[0.95]:>5}  {needs[0.99]:>5}  "
               f"{drop_95:>8}  {drop_99:>8}")
 
-    print(f"\n    Total droppable experts across all layers:")
+    print("\n    Total droppable experts across all layers:")
     print(f"      At 95%: {total_drop_95}/{num_experts*num_layers} "
           f"({total_drop_95/num_experts/num_layers*100:.1f}%)")
     print(f"      At 99%: {total_drop_99}/{num_experts*num_layers} "
@@ -344,7 +343,7 @@ def main():
 
     # Per-layer drop lists at 99% threshold
     drop_map = {}
-    print(f"\n  Drop candidates per layer (99% threshold):")
+    print("\n  Drop candidates per layer (99% threshold):")
     for li in range(num_layers):
         experts = agg[li]
         total = sum(experts.values())
@@ -367,7 +366,7 @@ def main():
     # Save drop map
     with open("eval_results/expert_drop_map.json", "w") as f:
         json.dump({str(li): ids for li, ids in drop_map.items()}, f, indent=2)
-    print(f"  Saved drop map to eval_results/expert_drop_map.json")
+    print("  Saved drop map to eval_results/expert_drop_map.json")
 
 
 if __name__ == "__main__":
