@@ -1,0 +1,98 @@
+# ============================================================================
+# STACK LABEL: Generic / Gemma-4  ·  ROLE: SFT (Unsloth + TRL)
+# ----------------------------------------------------------------------------
+# Canonical home for the Gemma-4 supervised-fine-tune image. Consumed by
+# an-finetune (docker/run.sh builds `unsloth-an:latest` from a mirror of this
+# file on the run host, bs2).
+#
+# ONE LABELED DOCKERFILE PER STACK. This file is the Generic/Gemma-4 SFT stack
+# and nothing else. If another model family needs a different stack, ADD a new
+# labeled Dockerfile (Dockerfile.sft-<family>) -- do NOT loosen or fork the pins
+# here. Changing this file changes the training stack for every Gemma-4 run and
+# therefore breaks comparability with every arm trained on the previous pin, so
+# an edit is a deliberate, recorded act: bump the pins, note it in
+# docs/STACK_HISTORY.md, and re-baseline.
+#
+# ============================ WHY EVERYTHING IS PINNED ======================
+# Until 2026-07-30 this file read:
+#     pip install --upgrade "transformers>=5.5.0" trl peft accelerate
+#     pip install --upgrade --no-deps "torchao>=0.16.0" unsloth unsloth_zoo
+# with `FROM unsloth/unsloth:latest`. Only transformers carried a floor; the base
+# image tag floats and every other package was whatever pip resolved on build day.
+#
+# That is not a theoretical hazard. bug-535: TRL's `add_eos` appends
+# `tokenizer.eos_token` guarded by a STRING endswith test, and for Gemma-4 the
+# eos_token is `<turn|>` (id 106) while the chat template emits `<turn|>\n` --
+# trailing newline -- so the guard never fires and a SECOND terminator is trained
+# into all 25,263 rows. The defect lives entirely in a trl internal. An unpinned
+# `--upgrade` can change that behaviour under us in either direction while every
+# corpus gate keeps passing, because the gates read the FILE and this happens in
+# the TENSOR. A training stack that can drift silently cannot anchor a comparison.
+#
+# The pins below are the EXACT versions of the image that trained v28/v29 and
+# that all bug-535 measurements were taken on (`unsloth-an:latest`, id 548e05398972,
+# captured 2026-07-30). Pinning them is therefore a no-op for behaviour and a
+# large gain in reproducibility: it freezes the arm rather than changing it.
+#
+# The base image is pinned BY DIGEST, not by `:latest`. Pinning pip while leaving
+# the FROM floating is half a pin -- the base ships torch/triton/xformers/vllm/
+# bitsandbytes, i.e. the whole CUDA half of the stack.
+# ============================================================================
+FROM unsloth/unsloth@sha256:f21629b9ae4ed11231768edfaed0f40d41d85d6ea9a71e8096a3d96ea0311772
+
+LABEL org.opencontainers.image.title="omk-sft-gemma-4" \
+      org.opencontainers.image.description="Generic/Gemma-4 SFT stack (Unsloth + TRL), fully pinned" \
+      org.opencontainers.image.source="https://github.com/mann1x/omnimergekit" \
+      omk.stack.label="generic-gemma-4" \
+      omk.stack.role="sft" \
+      omk.stack.pinned="2026-07-30"
+
+# Faster large-shard pulls from the Hub; quieter tokenizers.
+ENV HF_HUB_ENABLE_HF_TRANSFER=1 \
+    TOKENIZERS_PARALLELISM=false \
+    PYTHONUNBUFFERED=1
+
+# The base image (unsloth 2026.5.9 line) ships transformers 4.57.6, which PREDATES
+# Gemma 4 -- loading fails with "model type `gemma4` not recognized". Gemma 4 needs
+# transformers 5.x. So the SFT stack is upgraded on top, while PROTECTING the
+# Blackwell-built CUDA wheels (torch 2.10.0+cu128, triton, xformers, vllm,
+# bitsandbytes) which must NOT change or sm_120 support breaks:
+#   - transformers/trl/peft/accelerate: python-only, safe to replace (deps).
+#   - torchao/unsloth/unsloth_zoo: --no-deps so pip cannot pull a different torch.
+# EVERY version is exact (==). No floors, no --upgrade-to-whatever-is-newest.
+RUN pip install --no-cache-dir pyyaml hf_transfer \
+    && pip install --no-cache-dir \
+        "transformers==5.14.1" \
+        "trl==1.8.0" \
+        "peft==0.19.1" \
+        "accelerate==1.14.0" \
+    && pip install --no-cache-dir --no-deps \
+        "torchao==0.17.0" \
+        "unsloth==2026.7.3" \
+        "unsloth_zoo==2026.7.3" \
+    && python - <<'PYEOF'
+import torch, transformers, torchao, trl, peft, accelerate, datasets, yaml, hf_transfer  # noqa: F401
+from transformers.models.auto import configuration_auto as c
+# The CUDA half of the stack comes from the (digest-pinned) base image and must be untouched.
+assert torch.__version__.startswith("2.10.0"), "torch changed: " + torch.__version__
+assert "gemma4" in c.CONFIG_MAPPING_NAMES, "gemma4 not registered in transformers"
+# Assert the resolved versions ARE the pins. A silent resolver surprise fails the BUILD,
+# not a 6-hour training run.
+want = {"transformers": "5.14.1", "trl": "1.8.0", "peft": "0.19.1",
+        "accelerate": "1.14.0", "torchao": "0.17.0"}
+got = {"transformers": transformers.__version__, "trl": trl.__version__,
+       "peft": peft.__version__, "accelerate": accelerate.__version__,
+       "torchao": torchao.__version__}
+bad = {k: (v, want[k]) for k, v in got.items() if v != want[k]}
+assert not bad, f"PIN MISMATCH got/want: {bad}"
+print("build OK (pinned):", got, "| torch", torch.__version__)
+PYEOF
+# NOTE: do NOT `import unsloth` here -- Unsloth runs a hard GPU-accelerator check on
+# import, which fails during a GPU-less docker build. It imports fine at run time
+# (run.sh passes --gpus), so the real check is the --smoke run.
+
+WORKDIR /workspace/an-finetune
+
+# Override the base image's default (Jupyter+SSH) -- this image is for headless
+# training runs. run.sh passes the actual `python train_gemma4_e2b.py ...` command.
+CMD ["bash"]
