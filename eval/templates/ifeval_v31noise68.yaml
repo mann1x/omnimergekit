@@ -1,0 +1,46 @@
+# ifeval_v31noise68 — noise control for ifeval_v31reg68. 68 IFEval docs drawn uniformly at
+# random (seed 20260801) from the same 541-doc population, on the KEY and never the outcome.
+#
+# THE COMPARISON THIS TEMPLATE EXISTS FOR is v31-against-v31: this run versus the parent
+# ifeval_full v31 run of 2026-08-01 11:54Z, per doc. The score itself is nearly meaningless;
+# the DISCORDANCE is the measurement. Read it against 114/541 = 21.1% (v30-vs-v31) before
+# believing any IFEval delta between two checkpoints.
+#
+# The `generation:` block is copied VERBATIM from ifeval_full.yaml, exactly as
+# ifeval_v31reg68 does -- a control run at a different budget or sampler would measure the
+# budget change rather than the noise. Greedy, per canonical doctrine. If ifeval_full's
+# frozen block ever changes, this changes with it or the comparison is void.
+name: ifeval_v31noise68
+backend: lm-eval
+task: ifeval_v31noise68
+n: 68
+selection:
+  type: filter
+  all: true
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288    # 2026-05-12: clip Gemma 4 reasoning loops; see EVAL_PROTOCOL §3
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: prompt_level_strict_acc
+  filter: none
+  validated_against: google/ifeval
+  validation_date: "2026-08-01"
+sanity:
+  # Same rationale as ifeval_full: IFEval prompts legitimately produce very short answers,
+  # so the default p10>=60 char threshold false-alarms.
+  min_p10_chars: 5
+backend_args:
+  apply_chat_template: true
+  num_fewshot: 0
+  batch_size: 1
+  lm_eval_include_path: lm_eval_tasks/ifeval_v31reg
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: ifeval_v31noise68
+reports:
+  token_stats: true

@@ -1,0 +1,45 @@
+# ifeval_v31noise68 — the NOISE CONTROL for ifeval_v31reg68. Same 541-doc parent population,
+# but 68 keys drawn uniformly at random (seed 20260801) instead of selected on v31's failures.
+#
+# Purpose: measure how much the same model disagrees with ITSELF across two runs at greedy.
+# ifeval_v31reg68 cannot answer that -- its docs were conditioned on an outcome, so a re-run
+# regresses to the mean whether or not anything real is happening. This one is not conditioned
+# on anything, so its per-doc flip rate vs the parent run IS the harness noise floor.
+#
+# Read it against 114/541 = 21.1%, the v30-vs-v31 discordance. A control rate near that
+# number means the -4.07 pp IFEval delta is run-to-run variance and must not be attributed to
+# the corpus or the epoch. A control rate near zero means the delta is real and the reg68
+# instability is specific to the ruminating tail.
+#
+# Everything except the doc selection is identical to the stock ifeval task and to
+# ifeval_v31reg68 -- same scorers, re-exported from lm_eval.tasks.ifeval.utils.
+task: ifeval_v31noise68
+dataset_path: google/IFEval
+dataset_name: null
+output_type: generate_until
+test_split: train
+num_fewshot: 0
+process_docs: !function utils_ifeval.select_ifeval_v31noise68
+doc_to_text: prompt
+doc_to_target: 0
+generation_kwargs:
+  until: []
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 16384
+process_results: !function utils_ifeval.process_results
+metric_list:
+  - metric: prompt_level_strict_acc
+    aggregation: mean
+    higher_is_better: true
+  - metric: inst_level_strict_acc
+    aggregation: !function utils_ifeval.agg_inst_level_acc
+    higher_is_better: true
+  - metric: prompt_level_loose_acc
+    aggregation: mean
+    higher_is_better: true
+  - metric: inst_level_loose_acc
+    aggregation: !function utils_ifeval.agg_inst_level_acc
+    higher_is_better: true
+metadata:
+  version: 1.0

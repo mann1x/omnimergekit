@@ -1,0 +1,47 @@
+# ifeval_v31reg68 — the 68-prompt regression slice of IFEval (v30 pass -> v31 fail,
+# greedy). Purpose: ask an intermediate checkpoint the SAME question the 541-doc run
+# answered, at 1/8 the cost, so an epoch-2 vs epoch-3 comparison is affordable.
+#
+# The `generation:` block below is copied VERBATIM from ifeval_full.yaml. That is the
+# whole point: a subset run whose sampler, token budget or thinking budget differs from
+# the parent is measuring a different thing, and the difference would show up as a model
+# effect. Greedy, exactly as the canonical doctrine requires. If ifeval_full's frozen
+# block ever changes, this one changes with it or the comparison is void.
+#
+# READ THE DENOMINATOR. n=68, and by construction v30 = 1.00 / v31 = 0.00 on this task.
+# The score is "fraction of v31's regression this checkpoint avoids", NOT an IFEval
+# score. Never put a number from this template in a table beside ifeval_full.
+name: ifeval_v31reg68
+backend: lm-eval
+task: ifeval_v31reg68
+n: 68
+selection:
+  type: filter
+  all: true
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288    # 2026-05-12: clip Gemma 4 reasoning loops; see EVAL_PROTOCOL §3
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: prompt_level_strict_acc
+  filter: none
+  validated_against: google/ifeval
+  validation_date: "2026-08-01"
+sanity:
+  # Same rationale as ifeval_full: IFEval prompts legitimately produce very short
+  # answers, so the default p10>=60 char threshold false-alarms.
+  min_p10_chars: 5
+backend_args:
+  apply_chat_template: true
+  num_fewshot: 0
+  batch_size: 1
+  lm_eval_include_path: lm_eval_tasks/ifeval_v31reg
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: ifeval_v31reg68
+reports:
+  token_stats: true

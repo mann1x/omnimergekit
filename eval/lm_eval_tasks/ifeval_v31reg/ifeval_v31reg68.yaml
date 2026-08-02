@@ -1,0 +1,40 @@
+# ifeval_v31reg68 — IFEval restricted to the 68 prompts v30 passed and v31 failed at
+# greedy (derived by an-finetune/eval/ifeval_delta.py). Identical to the stock `ifeval`
+# task except process_docs pre-selects those 68 dataset keys; the strict/loose scorers
+# are re-exported from lm_eval.tasks.ifeval.utils so the numbers are directly comparable
+# to the parent run's per-doc results.
+#
+# The denominator is 68, NOT 541. A score here reads as "the fraction of v31's regression
+# this checkpoint does NOT have" -- it is not an IFEval score and must never be tabulated
+# beside one. By construction v30 scores 1.00 and v31 scores 0.00 on this task; those two
+# are the calibration ends, not results.
+task: ifeval_v31reg68
+dataset_path: google/IFEval
+dataset_name: null
+output_type: generate_until
+test_split: train
+num_fewshot: 0
+process_docs: !function utils_ifeval.select_ifeval_v31reg68
+doc_to_text: prompt
+doc_to_target: 0
+generation_kwargs:
+  until: []
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 16384
+process_results: !function utils_ifeval.process_results
+metric_list:
+  - metric: prompt_level_strict_acc
+    aggregation: mean
+    higher_is_better: true
+  - metric: inst_level_strict_acc
+    aggregation: !function utils_ifeval.agg_inst_level_acc
+    higher_is_better: true
+  - metric: prompt_level_loose_acc
+    aggregation: mean
+    higher_is_better: true
+  - metric: inst_level_loose_acc
+    aggregation: !function utils_ifeval.agg_inst_level_acc
+    higher_is_better: true
+metadata:
+  version: 1.0
