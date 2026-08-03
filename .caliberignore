@@ -1,0 +1,32 @@
+# Files excluded from Caliber's context analysis ONLY.
+#
+# These are all TRACKED in git and must stay that way -- they are eval evidence
+# and calibration corpora that the recipes reference by path, and several are
+# irreproducible without re-renting a pod. This file does not touch git; it only
+# keeps ~90 MB of sample dumps and corpora out of the AI context window that
+# Caliber builds when it regenerates agent configs.
+#
+# Added 2026-08-03 after `caliber refresh` flagged exactly these 14 as
+# "large files may bloat your AI context window".
+
+# lm-eval per-sample dumps from the gpt-oss-20b canonical suite (~29 MB).
+# Raw model generations -- no structure Caliber can learn a convention from.
+eval_results_vllm_suite/gpt_oss_canonical/arc_challenge_full_gptoss/arc_challenge_full_gptoss/gpt_oss_20b_mxfp4/lm_eval_out/gpt_oss_20b_mxfp4/samples_arc_challenge_full_chat_2026-05-17T16-01-11.181813.jsonl
+eval_results_vllm_suite/gpt_oss_canonical/gpqa_diamond_full_gptoss/gpqa_diamond_full_gptoss/gpt_oss_20b_mxfp4/lm_eval_out/gpt_oss_20b_mxfp4/samples_gpqa_diamond_cot_zeroshot_2026-05-17T15-26-38.448195.jsonl
+eval_results_vllm_suite/gpt_oss_canonical/gsm8k_100_gptoss/gsm8k_100_gptoss/gpt_oss_20b_mxfp4/lm_eval_out/gpt_oss_20b_mxfp4/samples_gsm8k_2026-05-17T13-25-31.291152.jsonl
+eval_results_vllm_suite/gpt_oss_canonical/humanevalplus_full_gptoss/humanevalplus_full_gptoss/gpt_oss_20b_mxfp4/lm_eval_out/gpt_oss_20b_mxfp4/samples_humaneval_plus_chat_2026-05-17T14-03-18.110632.jsonl
+
+# Qwen3.6-35B-A3B prune recipe: per-expert competence maps + its router
+# calibration corpus (~41 MB). Numeric tensors keyed by expert id.
+recipes/qwen3_6_35b_a3b_prune/results/competence_qwen35b.json
+recipes/qwen3_6_35b_a3b_prune/results/competence_qwen35b_coder.json
+recipes/qwen3_6_35b_a3b_prune/results/competence_qwen35b_coder_lcbmpe.json
+recipes/qwen3_6_35b_a3b_prune/results/competence_qwen35b_coder_lcbmpeife.json
+recipes/qwen3_6_35b_a3b_prune/results/router_calib_corpus_coder_lcbmpe_qwen.jsonl
+
+# Router / imatrix calibration corpora (~19 MB). Prompt text, not source.
+scripts/calibration_datav5.txt
+scripts/router_calib_corpus.jsonl
+scripts/router_calib_corpus.txt
+scripts/router_calib_corpus_9bench_balanced.jsonl
+scripts/router_calib_corpus_ifeval_heavy.jsonl
