@@ -12,10 +12,11 @@ Tools for **model merging**, **expert pruning**, **differential competence-map e
 | `competence/` | Differential competence-map pipeline: extract per-source per-task fisher signal → combine across tasks → feed into `omnimergekit.py --fisher`. |
 | `gemma4/` | Gemma 4 MoE surgery: expert drop, DERN-style redistribution, CD-maps for contribution-aware quants, hybrid-expert assembly. |
 | `quantization/` | `quantize_gguf.py` (multi-tier quants with imatrix), `convert_to_4bit.py`, `publish_model.py` (HF push with frontmatter). |
-| `eval/` | Eval drivers — GPQA Diamond, LiveCodeBench (lcb_llama_server.py), HE/MBPP rescore-with-fence-strip helpers. |
-| `recipes/` | End-to-end pipelines: 4B MicroCoder series, Gemma 4 109e/98e/120e/128e, 27B Omnimerge. |
+| `eval/` | Eval drivers — GPQA Diamond, LiveCodeBench (lcb_llama_server.py), HE/MBPP rescore-with-fence-strip helpers, plus the IFEval v31 regression slice `eval/lm_eval_tasks/ifeval_v31reg/` (`ifeval_v31reg68` + its `ifeval_v31noise68` control). |
+| `recipes/` | End-to-end pipelines: 4B MicroCoder series, Gemma 4 109e/98e/120e/128e, 27B Omnimerge, Qwen3.6-35B-A3B → ~26B expert prune (`recipes/qwen3_6_35b_a3b_prune/`). |
 | `pod/` | RunPod / Vast.ai helpers (setup, parallel run, retrieve, README publish). |
-| `scripts/` | Ollama publish (`ollama_push_*.sh`, `ollama_backfill_latest.sh`) and inspection (`ollama_inspect_model.py` — pulls GGUF metadata + layers from registry.ollama.ai / ollama.com for any published model). See `docs/OLLAMA_TOOLING.md`. |
+| `scripts/` | Ollama publish (`ollama_push_*.sh`, `ollama_backfill_latest.sh`, `ollama_republish_v6.py`, `ollama_set_renderer_parser.py`), GGUF metadata rewrite (`gguf_retag_republish.py` — in-place EOG + chat-template retag of published tiers) and inspection (`ollama_inspect_model.py` — pulls GGUF metadata + layers from registry.ollama.ai / ollama.com for any published model). See `docs/OLLAMA_TOOLING.md`. |
+| `tools/` | Standalone loop harnesses, each with its own `requirements.txt` / `install.sh` and no shared imports: `tools/agentic-loop-harness/` (frozen-replay), `tools/agentic-loop-live/` (drives a live opencode agent), `tools/single-turn-seed-harness/` (single-turn seed sweep), `tools/opencode-loop-harness/`. |
 | `docs/` | Method docs, experiment journals, recipe deep-dives. See `V6_CODER_INVESTIGATION.md` for the v5-coder vs v6-coder regression analysis and C11 recipe path. |
 | `experiments/` | Per-experiment notebooks / logs. |
 
@@ -96,6 +97,7 @@ These are baked into the recipe scripts. They cost real compute or a published-m
 - **Never run `lm_eval` on a chat model via `/v1/completions` without an explicit chat template.** Gemma 4 / Qwen3.5 reasoning variants emit fenced code that scorers can't `exec()`. Use `/v1/chat/completions + apply_chat_template`, or rescore samples with the fence-strip helpers in `eval/`.
 - **Gemma 4 needs `--reasoning-format deepseek --reasoning-budget 8192`** when served via `llama-server`. Without budget, it emits malformed channel tokens and crashes eval mid-run.
 - **Qwen3.5 has hybrid linear/full attention.** Without `flash-linear-attention` and `causal-conv1d` installed, gradient extraction OOMs at >1k context. Either install them or use chunked-grad-accum (`competence_extract.py --chunk-len`).
+- **A regression slice is not a benchmark score.** `eval/templates/ifeval_v31reg68.yaml` copies its `generation:` block verbatim from `ifeval_full.yaml`, and by construction scores 1.00 for v30 / 0.00 for v31 — read it as "fraction of the regression avoided", never beside `ifeval_full`, and always against the `ifeval_v31noise68.yaml` control.
 
 ## Published artifacts using this kit
 
