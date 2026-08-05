@@ -9,15 +9,41 @@
 #
 # Idempotent: a tier whose vision tag is already on ollama.com is skipped.
 # Usage: build_vision_ollama_tiers.sh <tier> [<tier> ...]
+#
+# Model-agnostic since 2026-08-05: REPO / MMPROJ / WORK are env overrides so the
+# same script drives other families (e.g. Qwen3.6 OmniMerge v4, whose projector is
+# qwen3vl_merger rather than Gemma4's). The T185 Gemma4 values remain the defaults
+# so existing invocations are byte-for-byte unchanged. Override, never fork:
+#   REPO=mannix/omnimerge-v4-mtp \
+#   MMPROJ=/mnt/sdc/ml/v4vision/mmproj-Qwen3.6-27B-Omnimerge-v4-F16.gguf \
+#   WORK=/mnt/sdc/ml/v4vision/vision_work \
+#   build_vision_ollama_tiers.sh q4_K_M q6_K q8_0
 set -uo pipefail
 
-REPO="mannix/gemma4-98e-v6-coder"
-MMPROJ="/mnt/sdc/ml/gguf/v6coder/mmproj-gemma4.gguf"
-BLOBS="/root/.ollama/models/blobs"
-MANIFESTS="/root/.ollama/models/manifests"
-WORK="/mnt/sdc/ml/gguf/v6coder/vision_work"
+REPO="${REPO:-mannix/gemma4-98e-v6-coder}"
+MMPROJ="${MMPROJ:-/mnt/sdc/ml/gguf/v6coder/mmproj-gemma4.gguf}"
+WORK="${WORK:-/mnt/sdc/ml/gguf/v6coder/vision_work}"
 mkdir -p "$WORK"
 LOG(){ echo "[vis $(date -u +%H:%M:%S)] $*"; }
+
+# Resolve the store the DAEMON actually uses -- never assume /root/.ollama. `ollama` runs under
+# its own systemd User= (User=ollama on bs2 -> /usr/share/ollama/.ollama/models), so a hardcoded
+# /root path GCs a store nothing writes to: the real library grows unbounded while the log
+# cheerfully reports purges. Order: explicit env > OLLAMA_MODELS > the unit's User= home > /root.
+resolve_store(){
+  [ -n "${OLLAMA_MODELS:-}" ] && { echo "$OLLAMA_MODELS"; return; }
+  local u home
+  u=$(systemctl show ollama -p User --value 2>/dev/null)
+  if [ -n "$u" ]; then
+    home=$(getent passwd "$u" | cut -d: -f6)
+    [ -n "$home" ] && [ -d "$home/.ollama/models" ] && { echo "$home/.ollama/models"; return; }
+  fi
+  echo "/root/.ollama/models"
+}
+STORE="$(resolve_store)"
+BLOBS="${BLOBS:-$STORE/blobs}"
+MANIFESTS="${MANIFESTS:-$STORE/manifests}"
+LOG "ollama store: $STORE"
 
 [ -f "$MMPROJ" ] || { LOG "FATAL: mmproj missing $MMPROJ"; exit 1; }
 MMSHA="sha256-$(sha256sum "$MMPROJ" | cut -d' ' -f1)"
@@ -27,6 +53,13 @@ gc_blobs(){
   # delete blob files not referenced by ANY current manifest, except the mmproj blob
   local ref; ref=$(mktemp)
   grep -rhoE "sha256[:-][0-9a-f]{64}" "$MANIFESTS" 2>/dev/null | sed 's/sha256:/sha256-/' | sort -u > "$ref"
+  # An EMPTY reference set is a bug signal (wrong/missing MANIFESTS dir), never a licence to
+  # delete the whole library -- without this guard a mis-resolved store makes every blob look
+  # orphaned and gc wipes the user's entire model collection in one pass.
+  if [ ! -s "$ref" ]; then
+    LOG "  gc: REFUSING -- 0 manifest refs found under $MANIFESTS (wrong store?); nothing purged"
+    rm -f "$ref"; return 0
+  fi
   local n=0
   for b in "$BLOBS"/sha256-*; do
     [ -e "$b" ] || continue
