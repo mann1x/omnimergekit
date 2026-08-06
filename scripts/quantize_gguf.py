@@ -30,12 +30,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pwd
 import shutil
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+from functools import lru_cache
 from pathlib import Path
 from queue import Queue
 from threading import Thread, Event
@@ -1367,12 +1369,48 @@ def check_ollama_preflight(ollama_target: str, allow_private: bool = False) -> N
     )
 
 
+@lru_cache(maxsize=1)
+def _ollama_store() -> Path:
+    """Resolve the model store the ollama DAEMON actually uses.
+
+    `/root/.ollama/models` is NOT a safe default: ollama runs under its own
+    systemd `User=` (on linode-blackswan-2: `User=ollama` ->
+    /usr/share/ollama/.ollama/models), and a stale root-run store can still
+    exist and look plausible — 34 GB of blobs on bs2 — while being dead.
+    Pointing the blob logic at the dead store is silently expensive: the
+    pre-stage hardlink lands where `ollama create` never looks (so it copies
+    the full 20 GB anyway), and — the real damage — the post-push purge finds
+    no manifest and frees nothing, so the LIVE store grows by every tier
+    pushed and never shrinks. A 12-tier publish leaks ~150-200 GB that way.
+
+    Order: explicit OLLAMA_MODELS > the unit's `User=` home > /root fallback.
+    Same resolution rule as scripts/build_vision_ollama_tiers.sh; see
+    memory/feedback_ollama_store_is_the_daemon_users_home.md.
+    """
+    env = os.environ.get("OLLAMA_MODELS")
+    if env:
+        return Path(env)
+    try:
+        user = subprocess.run(["systemctl", "show", "ollama", "-p", "User", "--value"],
+                              capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception:  # noqa: BLE001 — systemd may be absent (pods, containers)
+        user = ""
+    if user:
+        try:
+            home = pwd.getpwnam(user).pw_dir
+        except KeyError:
+            home = ""
+        if home and (Path(home) / ".ollama" / "models").is_dir():
+            return Path(home) / ".ollama" / "models"
+    return Path("/root/.ollama/models")
+
+
 def _prestage_ollama_blob(gguf_path: Path, label: str) -> bool:
     """Pre-stage GGUF as ollama blob via hardlink so `ollama create` skips
     the multi-minute "gathering model components" file-copy step.
 
     Why: on disk-constrained pods, `ollama create FROM /abs/path.gguf` copies
-    the entire GGUF into /root/.ollama/models/blobs/sha256-<hash>. For a 20+
+    the entire GGUF into <store>/blobs/sha256-<hash>. For a 20+
     GB tier this needs 20+ GB of free space AND several minutes; if the disk
     is tight the copy stalls at "gathering model components" until the
     daemon's internal timeout, then we waste a 3-attempt retry loop per quant.
@@ -1384,7 +1422,7 @@ def _prestage_ollama_blob(gguf_path: Path, label: str) -> bool:
     Returns True if the blob is in place (or already was). False = the caller
     should still proceed (ollama will do its own copy on `create`).
     """
-    blob_dir = Path("/root/.ollama/models/blobs")
+    blob_dir = _ollama_store() / "blobs"
     if not blob_dir.is_dir():
         return False
     sidecar = _sha256_sidecar_path(gguf_path)
@@ -1413,13 +1451,18 @@ def _prestage_ollama_blob(gguf_path: Path, label: str) -> bool:
         return True
     except OSError as e:
         if getattr(e, "errno", None) == 18:  # EXDEV: cross-device
-            try:
-                os.symlink(str(gguf_path.resolve()), str(blob_path))
-                print(f"{label}: pre-staged ollama blob sha256-{sha[:12]}... (symlink, cross-fs)", flush=True)
-                return True
-            except OSError as e2:
-                print(f"{label}: blob pre-stage failed ({e2}); ollama will copy", flush=True)
-                return False
+            # DO NOT fall back to a symlink. `ollama create` cannot read a symlinked blob:
+            # it hangs on "gathering model components" and fails every attempt. Measured on
+            # bs2 2026-08-05 (GGUF on /mnt/sdc, store on /), the symlink cost per tier was
+            #   3 failed `ollama create` attempts, then the end-of-run retry re-DOWNLOADING
+            #   the whole 12-16 GB tier from HF, and finally a full copy anyway because the
+            #   dead symlink still occupied the blob path (EEXIST on the second pre-stage).
+            # Returning False here lets ollama copy on the FIRST attempt: one local copy,
+            # no failed creates, no redundant HF download. The pre-stage is a same-filesystem
+            # optimisation only -- across filesystems there is nothing to optimise.
+            print(f"{label}: blob pre-stage skipped (cross-fs: {gguf_path} vs {blob_dir}); "
+                  f"ollama will copy once", flush=True)
+            return False
         print(f"{label}: blob pre-stage failed ({e}); ollama will copy", flush=True)
         return False
 
@@ -1478,7 +1521,7 @@ def push_to_ollama_from_local(gguf_path: Path, ollama_target: str,
                        capture_output=True, text=True)
         # purge any partial blobs
         import glob
-        for partial in glob.glob("/root/.ollama/models/blobs/sha256-*-partial*"):
+        for partial in glob.glob(str(_ollama_store() / "blobs" / "sha256-*-partial*")):
             try:
                 os.remove(partial)
             except OSError:
@@ -1514,20 +1557,54 @@ def push_to_ollama_from_local(gguf_path: Path, ollama_target: str,
 
     # Capture blob digests from the manifest BEFORE removing the ref
     blobs = set()
-    mf_disk = Path(f"/root/.ollama/models/manifests/registry.ollama.ai/{ollama_target}/{tag}")
+    store = _ollama_store()
+    mf_disk = store / "manifests" / "registry.ollama.ai" / ollama_target / tag
     if mf_disk.exists():
         import re
         blobs = set(re.findall(r"sha256:[0-9a-f]{64}", mf_disk.read_text()))
+    else:
+        # No manifest under the resolved store means the purge below frees NOTHING
+        # and the tier's blob (up to ~22 GB) stays resident forever. Say so loudly:
+        # silently skipping the purge is how a multi-tier publish eats a disk.
+        print(f"{label}: WARNING — no manifest at {mf_disk}; blob purge will free "
+              f"nothing (wrong store?). Check `systemctl show ollama -p User`.",
+              flush=True)
 
     # Remove local ref + force-purge blobs (belt + suspenders against ollama GC bugs)
     subprocess.run(["ollama", "rm", target_tag], capture_output=True, text=True)
     for b in blobs:
-        fn = Path("/root/.ollama/models/blobs") / b.replace("sha256:", "sha256-")
+        fn = store / "blobs" / b.replace("sha256:", "sha256-")
         for p in (fn, Path(str(fn) + "-partial")):
             try:
                 p.unlink()
             except (OSError, FileNotFoundError):
                 pass
+
+    # Manifest-driven purge is NOT sufficient on its own. Measured on bs2 2026-08-05: of
+    # 10 tiers pushed, 3 were purged and 7 left their full-size blob resident (88 GiB
+    # leaked) despite the manifest being found and no warning firing. The manifest is a
+    # second source of truth that can disagree with what is actually on disk.
+    #
+    # We do not need it: ollama's blob digest for the model layer IS the GGUF's own
+    # sha256, so the file we just pushed tells us exactly which blob to remove. Delete by
+    # our own digest and REPORT the bytes freed, so a leak is visible in the log instead
+    # of only showing up later as a full disk.
+    try:
+        own_sha = None
+        sc = _sha256_sidecar_path(gguf_path)
+        if sc.exists():
+            own_sha = sc.read_text().split()[0].strip().lower()
+        if own_sha and len(own_sha) == 64:
+            own_blob = store / "blobs" / f"sha256-{own_sha}"
+            if own_blob.is_file():
+                freed = own_blob.stat().st_size
+                own_blob.unlink()
+                print(f"{label}: purged residual blob sha256-{own_sha[:12]}... "
+                      f"({freed / 1024**3:.1f} GiB) — manifest purge had missed it",
+                      flush=True)
+    except OSError as exc:
+        print(f"{label}: residual-blob purge failed ({exc}); check "
+              f"{store}/blobs for orphans", flush=True)
 
     return success
 
