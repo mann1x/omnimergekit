@@ -8,11 +8,17 @@ The check must behave correctly whatever the thinking config is:
 and it must still catch a cap that no config declares (case 6), because the config has
 already been wrong once (the runner overrode the template's budget for months).
 
-Two further guards on what gets MEASURED and when a verdict may be asserted at all:
+Further guards on what gets MEASURED and when a verdict may be asserted at all:
   case 7  the length must come from the raw generation, not from post-filter text that a
           task assembled (HumanEval builds a runnable program around the completion)
   case 8  the undeclared-cap branch is shape-only, so below a row floor it is reported but
           never promoted to a verdict -- equal lengths on 3 rows are a coincidence
+  case 9  ...and the row floor is not enough: TOL is an absolute +/-16-token band, so on a
+          bench whose whole answer distribution is narrower than that, the band swallows the
+          population and every row "ties at the max" by construction (real: 100 math500
+          answers of 32..63 chars reported as 43 capped with a 20pp tax)
+  case 10 the mirror of 9 -- a genuine wall standing above a real body must still be CAPPED,
+          so the case-9 guard cannot be satisfied by a detector that simply never fires
 """
 import json
 import os
@@ -156,6 +162,33 @@ with tempfile.TemporaryDirectory() as td:
           [("verdict", "CLEAN"), ("ceiling_hit", None), ("ties_at_max", 3),
            ("capped_total", 0)])
 
+    print("=" * 100)
+    # The row floor (CASE 8) is not enough: a coincidence of equal lengths is FAR likelier on
+    # many SHORT rows than on few rows, and TOL is an absolute +/-16-token band. On a bench
+    # whose whole answer distribution is narrower than that band the band swallows the entire
+    # population and ties_at_max counts nearly every row by construction.
+    # Real shape, measured on an-finetune v34ab1/math500_100_wide (2026-08-07): 100 math500
+    # answers, ALL of them 32..63 chars (~8..16 tokens), on a 32768/12288 template. The branch
+    # reported "43/100 capped at an undeclared 28-token ceiling, up to 20pp of truncation tax"
+    # against a 20480-token allowance. Nothing was truncated -- "\boxed{42}" is just short.
+    sp7 = Path(td) / "shortanswers.jsonl"
+    build(sp7, [(8 + (i % 9), 1.0) for i in range(100)])
+    check("CASE 9 whole distribution inside the TOL band: short answers, NOT a cap",
+          cap_report(sp7, WIDE, "unsloth/gemma-4-E2B-it", "exact_match", log),
+          [("verdict", "CLEAN"), ("ceiling_hit", None), ("capped_total", 0), ("n", 100)])
+
+    print("=" * 100)
+    # ...and the mirror: the SAME 100-row sample with a genuine wall bolted on. Half the rows
+    # stop dead at 3000 tokens with a 200..900 body beneath. Nothing declares 3000. This is
+    # what CASE 9's guard must NOT suppress -- without this pairing, "CASE 9 passes" is
+    # equally satisfied by a detector that never fires at all.
+    sp8 = Path(td) / "realwall.jsonl"
+    build(sp8, [(3000, 0.0)] * 50 + [(200 + 14 * i, 1.0) for i in range(50)])
+    check("CASE 10 real wall above a real body: must STILL be CAPPED",
+          cap_report(sp8, HUGE, "unsloth/gemma-4-E2B-it", "exact_match", log),
+          [("verdict", "CAPPED"), ("ceiling_hit", "unexplained"), ("capped_total", 50),
+           ("n", 100)])
+
 print("=" * 100)
-print("UNIT-SMOKE: " + ("PASS — all 8 cases" if not fails else "FAIL\n  " + "\n  ".join(fails)))
+print("UNIT-SMOKE: " + ("PASS — all 10 cases" if not fails else "FAIL\n  " + "\n  ".join(fails)))
 sys.exit(1 if fails else 0)

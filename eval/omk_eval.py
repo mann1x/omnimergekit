@@ -1613,7 +1613,47 @@ def cap_report(samples_path: Path, template: dict, tokenizer_id: str | None,
     # smoke can still show it without a fabricated CAPPED verdict. n=3 tripped this in the unit
     # smoke on 2026-07-28.
     MIN_PILEUP_ROWS = 10
-    pileup = ties_at_max >= 2 and n_rows >= MIN_PILEUP_ROWS
+    # ...and only when the pile-up is actually a SPIKE. The row-count floor guards against a
+    # coincidence on few rows; it does nothing about the far commoner case — many rows that
+    # are all SHORT. TOL is an absolute ±16-token band, so on a bench whose whole answer
+    # distribution is narrower than 16 tokens ("\boxed{42}") the band swallows the entire
+    # population and `ties_at_max` counts nearly every row by construction. Measured on
+    # v34ab1/math500_100_wide (2026-08-07): all 100 completions were 32..63 CHARS, and the
+    # branch reported "43/100 capped at an undeclared 28-token ceiling, up to 20pp of
+    # truncation tax" against a 20480-token allowance. Nothing was truncated. Seven of the
+    # eight `unexplained` cells in the V34 cohort are this shape (longest 28..222 tokens).
+    #
+    # Two independent conditions, both of which a genuine undeclared cap passes easily:
+    #   ABS   a wall below MIN_ABS_CAP_TOKENS is not a wall. No serving stack silently stops
+    #         generation after ~200 tokens; that length is an ANSWER, not a truncation.
+    #   SPIKE a ceiling stands above the BODY — the rows that were NOT truncated. Require the
+    #         bottom of the tie band to clear SPIKE_OVER_MEDIAN x the body median, so
+    #         "everything is this long" cannot register as "everything stopped here". The
+    #         median must exclude the tied rows: they are the suspected cap, and leaving them
+    #         in lets a big pile-up drag the median up to meet itself (with them included, the
+    #         genuine 4-at-2000-in-a-150..1290-body case scores median 1100 instead of 720 and
+    #         is wrongly rejected).
+    # Both only ever REMOVE verdicts, and the shape they remove is the one that cannot be a
+    # cap — so the undeclared-cap detection this branch exists for is untouched (test CASE 6:
+    # 4 rows dead at 2000 among a 150..1290 body, still CAPPED).
+    MIN_ABS_CAP_TOKENS = 256
+    SPIKE_OVER_MEDIAN = 2.0
+    body = sorted(x for x in lens if x < longest - TOL)
+    # Every row inside the tie band => no body to stand above, so the spike test has nothing
+    # to say and only the absolute floor applies.
+    body_median = body[len(body) // 2] if body else None
+    spike = body_median is None or (longest - TOL) >= SPIKE_OVER_MEDIAN * body_median
+    plausible = longest >= MIN_ABS_CAP_TOKENS and spike
+    pileup = ties_at_max >= 2 and n_rows >= MIN_PILEUP_ROWS and plausible
+    if not plausible and ties_at_max >= 2 and n_rows >= MIN_PILEUP_ROWS:
+        why = ("below the %d-token floor for a plausible cap" % MIN_ABS_CAP_TOKENS
+               if longest < MIN_ABS_CAP_TOKENS else
+               "not a spike: the tie band starts at %d, under %.1fx the median of the %d "
+               "un-tied rows (%d)"
+               % (longest - TOL, SPIKE_OVER_MEDIAN, len(body), body_median))
+        log(f"[cap-check] {ties_at_max}/{n_rows} completions tie at the longest ({longest} "
+            f"tok) but that is {why}. Answers of similar length, not a cap. NOT asserting "
+            "CAPPED.")
     if hits:
         capped_idx = sorted({i for idx in hits.values() for i in idx})
     elif pileup:
@@ -1624,7 +1664,10 @@ def cap_report(samples_path: Path, template: dict, tokenizer_id: str | None,
         capped_idx = [i for i, x in enumerate(lens) if x >= longest - TOL]
     else:
         capped_idx = []
-        if ties_at_max >= 2 and n_rows >= 3:
+        # Only the row-count reason belongs here now. Without the n_rows bound this message
+        # also fired on the implausible-pile-up path above and blamed the sample size for a
+        # rejection that had nothing to do with it ("n=100 is below the 10-row floor").
+        if ties_at_max >= 2 and 3 <= n_rows < MIN_PILEUP_ROWS:
             log(f"[cap-check] {ties_at_max}/{n_rows} completions sit within {TOL} tokens of the "
                 f"longest ({longest}) and no declared ceiling explains it, but n={n_rows} is "
                 f"below the {MIN_PILEUP_ROWS}-row floor for calling an undeclared cap. NOT "
