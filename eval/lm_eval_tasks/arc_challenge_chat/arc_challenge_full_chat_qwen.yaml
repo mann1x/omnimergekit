@@ -1,0 +1,48 @@
+# Qwen-family variant of arc_challenge_full_chat. METHOD-IDENTICAL -- same
+# dataset, same 0-shot prompt, same utils_chat letter extractor, same greedy
+# block -- with the plain-text "Question:" stop REMOVED.
+#
+# WHY (2026-08-20, CoderX gate 1b). Same collision as
+# lm_eval_tasks/aime24_chat/aime24_chat_qwen.yaml and the T177
+# minerva_math500_qwen fix: Qwen3.x CoT verbalizes "Question:" / "Problem:"
+# inside its <think> block, llama.cpp matches stop words on the raw stream
+# before the reasoning channel is split, and the whole generation dies a few
+# tokens in.
+#
+# LOWER RISK HERE THAN ON AIME, BUT NOT ZERO: the arc_challenge_100 template
+# forces enable_thinking=false / `--reasoning off`, so there is normally no
+# CoT for the delimiter to hide in. The stop is nonetheless VESTIGIAL --
+# num_fewshot: 0 means no next exemplar to delimit, and the turn ends on
+# <|im_end|> -- and the prompt itself contains the literal string "Question:",
+# which the model can echo when restating the item. Removing it costs nothing
+# and closes the last instance of the family.
+#
+# Separate task, not an edit: every existing Gemma-4 arc_challenge_full_chat
+# cell keeps its exact basis.
+task: arc_challenge_full_chat_qwen
+dataset_path: allenai/ai2_arc
+dataset_name: ARC-Challenge
+output_type: generate_until
+training_split: train
+validation_split: validation
+test_split: test
+fewshot_split: train
+doc_to_text: 'Given the following question and four candidate answers (A, B, C and D), choose the best answer.\nQuestion: {{question.strip()}}\nA. {{choices.text[0]}}\nB. {{choices.text[1]}}\nC. {{choices.text[2]}}{% if choices.text|length > 3 %}\nD. {{choices.text[3]}}{% endif %}\nYour response should end with "The best answer is [the_answer_letter]" where the [the_answer_letter] is one of A, B, C or D.'
+fewshot_delimiter: "\n\n"
+doc_to_target: "{{ 'ABCD'[answerKey|int - 1] if answerKey|string in '1234' else answerKey }}"
+num_fewshot: 0
+process_results: !function utils_chat.process_results
+generation_kwargs:
+  max_gen_toks: 512
+  do_sample: false
+  temperature: 0.0
+  until:
+    - "</s>"
+    - "<|im_end|>"
+    - "<|eot_id|>"
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 0.0

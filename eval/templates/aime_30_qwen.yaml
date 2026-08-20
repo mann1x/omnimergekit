@@ -1,0 +1,60 @@
+# AIME 2024 — 30 problems (full set), QWEN-FAMILY variant of aime_30.
+#
+# Identical to aime_30 in every axis that scores -- same dataset, same 30 docs,
+# same frozen greedy generation block, same 65536/49152 budgets, same extractor
+# and metric -- except it runs task `aime24_chat_qwen`, which drops the
+# plain-text "Question:" stop.
+#
+# WHY THIS EXISTS (2026-08-20). aime24_chat carries
+# `until: ["Question:", ...]`, vestigial on a num_fewshot: 0 chat task. Qwen3.x
+# reasoning opens with "**Understand the Question:**"; llama.cpp matches stop
+# words on the raw token stream BEFORE --reasoning-format deepseek splits the
+# thinking channel, so the stop fires inside <think> and kills the generation
+# ~65 chars in. Confirmed on math500_100 the same day: 80/100 armJ rows under
+# 100 chars, 0/200 completions containing the delimiter, 0.22 vs 0.70.
+# See lm_eval_tasks/aime24_chat/aime24_chat_qwen.yaml for the full RCA and
+# lm_eval_tasks/qwen/minerva_math500_qwen.yaml for the T177 precedent.
+#
+# NOT COMPARABLE TO aime_30 CELLS FROM THE BROKEN BASIS. Any Qwen aime_30 cell
+# is a stop-collision measurement, not an AIME measurement. Re-run both arms
+# here; never pool. Gemma-4 aime_30 cells are unaffected (its CoT does not
+# emit the delimiter) but are still a different task id -- do not mix.
+#
+# GEOMETRY. max_gen_toks is 65536, so the per-slot n_ctx must exceed
+# 65536 + prompt. The qwen_suite cohort ran aime_30 at 45056/slot, which is
+# SAT_COLLAPSE-shaped (slot smaller than the generation budget); the runner for
+# this template must pin >= 69632/slot and verify the `new slot, n_ctx = N`
+# readback (bug-597: llama_ctx is the TOTAL pool, divided by --parallel).
+name: aime_30_qwen
+backend: lm-eval
+task: aime24_chat_qwen      # qwen-safe extractor + stops; see lm_eval_tasks/aime24_chat/
+n: 30
+selection:
+  type: filter
+  all: true
+generation:
+  # Budget rationale copied verbatim from aime_30 (2026-07-28 decision):
+  # thinking_token_budget is SUBTRACTED from max_gen_toks, so 65536-49152 leaves
+  # 16384 for the answer -- 8x the largest correct AIME answer observed (2087 tok).
+  max_gen_toks: 65536
+  thinking_token_budget: 49152
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: exact_match
+  filter: strict
+  validated_against: HuggingFaceH4/aime_2024
+  validation_date: "2026-05-12"
+backend_args:
+  apply_chat_template: true
+  num_fewshot: 0
+  batch_size: 1
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+  lm_eval_include_path: lm_eval_tasks/aime24_chat
+cache:
+  sqlite_prefix: aime_30_qwen
+reports:
+  token_stats: true

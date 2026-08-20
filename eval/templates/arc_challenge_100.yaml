@@ -1,0 +1,89 @@
+# ARC-Challenge, 100-question GUARDRAIL subset.
+#
+# WHAT THIS IS FOR. A general-knowledge regression guardrail for a CODER release -- "did the
+# cut damage ARC" -- run instead of the full 1172 because 2x1172 generations of a non-code
+# MC bench is poor value for a coder cohort.
+#
+# RESOLUTION. At n=100 and p ~= 0.93 the binomial sigma is ~2.6pp, so it resolves a gap of
+# roughly 5pp or more and is blind below that. (n=30 would have been ~4.6pp -- barely more
+# than a liveness ping, which is why this is 100.) The full 1172 would be ~0.75pp.
+#
+# STILL NOT A CROSS-TABLE ROW. A 100-question draw is a different batch composition, hence a
+# different basis, from anyone's full-1172 ARC figure -- report it with its n and never beside
+# one (feedback_batch_composition_is_an_eval_basis, feedback_gate_scope_must_match_sample_size).
+# It IS a valid paired comparison between arms, because every arm draws the same 100 docs.
+#
+# WHICH 100. The FIRST 100 docs of the split. On the lm-eval backend omk_eval passes
+# `--limit n`, which takes first-N; a `selection.indices` list is NOT honored there (only
+# shadow tasks that filter in process_docs, e.g. humanevalplus_30, honor indices).
+#
+# Everything else -- task, generation block, scoring metric/filter, thinking budget, the
+# llama backend_overrides -- is copied byte-for-byte from arc_challenge_full.yaml, so the
+# only axis that moves is n.
+# ARC-Challenge — full 1172 test items, chat-completions variant.
+# Chat path is required for instruction-tuned models (raw completions can
+# emit explanatory prose ahead of the letter answer and break the regex).
+name: arc_challenge_100
+backend: lm-eval
+task: arc_challenge_full_chat_qwen   # qwen-safe stops; see lm_eval_tasks/arc_challenge_chat/
+# ^ 2026-08-20: was arc_challenge_full_chat, which carries a vestigial
+#   `until: ["Question:"]` on a num_fewshot: 0 task. Qwen3.x CoT verbalizes that
+#   delimiter and llama.cpp matches stop words on the raw stream before the
+#   reasoning channel is split, killing the generation (confirmed on math500_100
+#   the same day: 0.22 vs 0.70, 80/100 rows truncated at ~65 chars). This template
+#   forces enable_thinking=false so the risk was low, but the stop is dead weight
+#   and the prompt itself contains "Question:". No cells existed on the old task
+#   id, so there is no basis to bridge.
+n: 100
+selection:
+  # first-100 comes from lm-eval `--limit`, which omk derives from template.n above.
+  # The selection block is copied from arc_challenge_full.yaml verbatim, as the header
+  # promises. 2026-08-20: this previously read `type: first_n`, which is NOT in the
+  # validator's set ['explicit','filter','indices','langs','problems'] -- omk_eval
+  # refused the template with rc=1 before serving anything, and gate9d aborted both
+  # arc cells on `per_slot=unknown` (correctly refusing to bank a null).
+  type: filter
+  all: true
+generation:
+  max_gen_toks: 16384         # MCQ → model usually emits a short letter; cap unused but per spec
+  thinking_token_budget: 12288    # 2026-05-12: clip Gemma 4 reasoning loops; see EVAL_PROTOCOL §3
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: exact_match
+  filter: flexible-extract
+  validated_against: allenai/ai2_arc
+  validation_date: "2026-05-12"
+sanity:
+  # ARC-Challenge answers are a single letter (or letter + brief justification).
+  # Default p10>=60 threshold is too strict for this bench.
+  min_p10_chars: 1
+backend_args:
+  apply_chat_template: true
+  num_fewshot: 0
+  batch_size: 1
+  # ARC-Challenge is MCQ: model needs to emit a single letter as the final
+  # answer. With enable_thinking=true the model reasons silently in the
+  # channel and the chat-completions `content` field ends up empty (resps
+  # are all-blank → exact_match=0). Validated empirically on 128e 2026-05-12.
+  # Run without parser/thinking so the answer goes straight into `content`.
+  vllm_reasoning_parser: ""
+  vllm_default_chat_template_kwargs: {enable_thinking: false}
+  lm_eval_include_path: lm_eval_tasks/arc_challenge_chat
+cache:
+  sqlite_prefix: arc_challenge_100
+reports:
+  token_stats: true
+# Per-engine override: arc is in the llama bench-defaults reasoning-typed list
+# and gets `--reasoning-format deepseek --reasoning-budget <budget>`. On
+# pruned Gemma 4 variants the model emits its reasoning to the channel but
+# then the chat-completions content only gets a truncated markdown bullet
+# `*   ` (4 chars) for ~70% of items → score below random. Force no reasoning
+# channel on llama.cpp to mirror the validated 128e recipe (enable_thinking=false).
+backend_overrides:
+  llama:
+    backend_args:
+      llama_extra_replace: true
+      llama_extra: ["--jinja", "--reasoning", "off"]

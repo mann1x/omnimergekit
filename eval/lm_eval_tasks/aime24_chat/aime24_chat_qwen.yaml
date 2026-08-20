@@ -1,0 +1,49 @@
+# Qwen-family variant of aime24_chat. METHOD-IDENTICAL to aime24_chat -- same
+# dataset, same 0-shot prompt, same utils_chat extractor, same greedy block --
+# with the plain-text "Question:" stop REMOVED.
+#
+# WHY (2026-08-20, CoderX gate 1). This is the T177 bug (see
+# lm_eval_tasks/qwen/minerva_math500_qwen.yaml) in a task T177 never covered.
+# Qwen3.x reasoning opens with an enumerated plan whose first item is almost
+# always "**Understand the Question:**" / "**Understand the Problem:**".
+# llama.cpp matches stop words on the RAW token stream, before
+# --reasoning-format deepseek splits <think> into reasoning_content, so a stop
+# word landing inside the thinking block terminates the WHOLE generation a few
+# tokens in => empty content => [invalid] => ~0%.
+#
+# MEASURED on math500_100 (the same collision, same cohort, same day):
+#   armJ  reasoning p50=65 chars, content p50=0, 80/100 rows under 100 chars,
+#         0/100 completions containing "Problem:" anywhere -> score 0.22
+#   pub   reasoning p50=0 (skips thinking on 63/100)         -> score 0.70
+# A -48pp "capability gap" that was entirely the stop sequence.
+#
+# The stop is VESTIGIAL here regardless: aime24_chat is num_fewshot: 0, so
+# there is no next exemplar for "Question:" to delimit. The turn already ends
+# on <|im_end|>. Kept as a separate task (not an edit to aime24_chat) so every
+# existing Gemma-4 aime_30 cell keeps its exact basis -- Gemma-4 CoT does not
+# emit the delimiter, so it was never affected.
+task: aime24_chat_qwen
+dataset_path: Maxwell-Jia/AIME_2024
+output_type: generate_until
+training_split: train
+fewshot_split: train
+test_split: train
+doc_to_text: "Question: {{Problem}}\nAnswer:"
+doc_to_target: "{{Answer}}"
+process_results: !function utils_chat.process_results
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+generation_kwargs:
+  until:
+    - "</s>"
+    - "<|im_end|>"
+    - "<|eot_id|>"
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 32768
+repeats: 1
+num_fewshot: 0
+metadata:
+  version: 0.0

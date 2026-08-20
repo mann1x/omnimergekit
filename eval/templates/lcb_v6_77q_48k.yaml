@@ -1,0 +1,90 @@
+# LiveCodeBench all-HARD 77 @ RAISED CAPS (24k thinking / 48k total) --- a CAP-VALIDATION
+# variant of lcb_v6_77q. Same 77 problems, same frozen task-id list, same greedy sampler,
+# same scorer. The ONLY differences are the generation ceilings and the server geometry
+# needed to serve them.
+#
+# WHY THIS EXISTS
+# ---------------
+# On the 2026-08-19 REAM-arm decider at 12k/32k, the truncation rate was NOT uniform across
+# arms -- it tracked the arm:
+#     armE  6/77 length-terminated   p50   1,967 tok
+#     armD  6/77                     p50   2,157 tok
+#     base  7/77                     p50   2,739 tok
+#     armF  9/77                     p50   6,181 tok
+#     armG 17/77                     p50   4,554 tok
+#     armB 55/77 (71.4%)             p50  32,166 tok   <-- MEDIAN completion at the wall
+# A bench whose cap binds on one arm 9x harder than another is measuring the cap as much as
+# the model. armB's 0.4675 is a truncation-taxed number and is NOT comparable to armE's
+# 0.6494 at the same ceiling. This variant re-runs the identical problem set with the wall
+# moved far enough out that the question "is armB slow-but-correct, or genuinely broken?"
+# becomes answerable instead of confounded.
+#
+# It does NOT replace the canonical template. 12k/32k stays the frozen basis for the shipped
+# comparison tables; this is a second, explicitly-tagged basis. Do not merge rows from the
+# two into one table -- the ceiling is part of the basis (see feedback_batch_composition_is_
+# an_eval_basis.md, and the OMK_CAP_CHECK caveat below).
+#
+# THE CAPS
+#   max_gen_toks         32768 -> 49152   (1.5x; the answer allowance grows 20480 -> 24576)
+#   thinking_token_budget 12288 -> 24576  (2x)
+#   --reasoning-budget    12288 -> 24576  (must track thinking_token_budget or the server and
+#                                          the harness disagree about the reasoning ceiling)
+#
+# SERVER GEOMETRY -- the T172.4 trap. Per-slot ctx MUST exceed max_gen_toks, or slots
+# saturate and generations collapse silently. llama_ctx / parallel is the per-slot budget:
+#     262144 / 8 = 32768  -- FINE at the old 32k cap, FATAL at 48k
+#     524288 / 8 = 65536  -- 16384 of headroom over the 49152 cap. This is what we use.
+# Doubling total ctx doubles the KV allocation; that is affordable here (bs2 GPU1 is a
+# 96 GB RTX PRO 6000 Blackwell, model is ~29 GB at Q6_K) and is preferred over halving
+# --parallel, which would roughly double every column's wall time. ALWAYS run this template
+# at --parallel 8, and VERIFY `new slot, n_ctx = 65536` in server.log before trusting a
+# column -- a sentinel, not an assumption.
+#
+# CACHE ISOLATION -- mandatory. The LCB sqlite resume store keys on task_id ONLY; max_tokens
+# is NOT part of the key. Sharing `sqlite_prefix` with the 32k template would silently
+# re-serve the OLD truncated generations and produce a fake "no change at higher caps"
+# result. Hence a distinct prefix AND a distinct template name (the name also routes the
+# results dir, so the 32k cells are never overwritten).
+#
+# READING THE RESULT. OMK_CAP_CHECK cannot be trusted as the truncation gate on this backend
+# (bug-592): it compares the RE-TOKENIZED completion length against max_gen_toks, which
+# systematically undershoots the server's own count, so it never fires and reported
+# `verdict=CLEAN capped=0/77` on the 71%-truncated armB column. Read
+# token_stats.finish_reasons.length instead -- that is the server's own report.
+name: lcb_v6_77q_48k
+backend: lcb_custom
+task: livecodebench
+n: 77
+selection:
+  type: filter           # filter + task_ids_file (the loader bypasses difficulty/date in task_ids mode)
+  task_ids_file: eval/lcb/lcb_v6_77q_taskids.json   # SAME 77 problems as lcb_v6_77q, deliberately
+  difficulty: hard          # inert in task_ids mode; documents the build = all hard
+  min_date: "2024-01-01"    # inert in task_ids mode; documents the build window
+  testtype: functional
+generation:
+  max_gen_toks: 49152            # RAISED from 32768. Requires llama_ctx/parallel >= this.
+  thinking_token_budget: 24576   # RAISED from 12288. Must match --reasoning-budget below.
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 2400             # RAISED from 1200: a 48k greedy completion can outlast 20 min
+scoring:
+  scorer: lcb_helpers
+  validated_against: lcb_runner.evaluation.testing_util.grade_call_based
+backend_args:
+  apply_chat_template: true
+  llama_ctx: 524288        # -c 524288 (512k) / parallel 8 = 65536 per slot > 49152 gen cap
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: lcb_v6_77q_48k   # MUST differ from lcb_v6_77q -- see CACHE ISOLATION above
+reports:
+  token_stats: true
+dependencies:
+  python_modules: [datasets]
+backend_overrides:
+  llama:
+    backend_args:
+      llama_extra_replace: true
+      llama_extra: ["--reasoning-format", "deepseek", "--reasoning-budget", "24576"]
