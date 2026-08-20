@@ -200,7 +200,10 @@ def main():
     # injection
     ap.add_argument("--saliency-map", default=None, help="our competence map JSON")
     ap.add_argument("--drop-map", default=None, help="our shipped drop map JSON")
-    ap.add_argument("--score", default="tc", choices=["tc", "wnorm", "wnorm_tc"])
+    # keep in step with make_drop_map's --score; build_injected_saliency delegates the scoring
+    # to it, so a choice missing here is a score we cannot name even though the scorer has it.
+    ap.add_argument("--score", default="tc",
+                    choices=["tc", "wnorm", "wnorm_tc", "rnorm", "rnorm_tc"])
     ap.add_argument("--agg", default="wmax", choices=["sum", "max", "mean", "wmax", "wsum"])
     ap.add_argument("--cat-weight", action="append", default=[], metavar="CAT=W")
     ap.add_argument("--no-keep-offset", action="store_true",
@@ -294,14 +297,69 @@ def main():
     model.config.merge_args["omk_injected_saliency"] = injected is not None
     os.makedirs(args.save_path, exist_ok=True)
     tok.save_pretrained(args.save_path)
-    if merger.mtp_state_dict is not None:
-        from safetensors.torch import save_file
-        save_file(merger.mtp_state_dict, os.path.join(args.save_path, "mtp.safetensors"))
-        print("saved mtp.safetensors (needs manual index rename, see ream/qwen3_5.py)",
-              flush=True)
     model.save_pretrained(args.save_path, safe_serialization=True, max_shard_size="4GB")
+    # MTP must be folded AFTER save_pretrained -- save_pretrained rewrites
+    # model.safetensors.index.json from scratch, so anything written before it is
+    # dropped from the weight_map even though the file is still on disk.
+    fold_mtp(merger.mtp_state_dict, args)
     print(f">>> OMK_REAM_SAVED {args.save_path}", flush=True)
     print(">>> OMK_REAM_DONE", flush=True)
+
+
+def fold_mtp(mtp_state, args):
+    """Write the merged MTP block into the saved model and register it in the index.
+
+    Qwen3.6-35B-A3B carries a next-token-prediction (MTP) block that is a full 41st MoE
+    layer, and our published cut prunes its experts with the same drop map. The GGUF
+    converter reads mtp_num_hidden_layers and emits block_count = n_layers + 1, so a model
+    saved WITHOUT the mtp.* tensors produces a GGUF that quantizes fine but cannot be
+    loaded -- llama.cpp fails on 'missing tensor blk.40.attn_norm.weight'. llama-quantize
+    never builds a graph so it does not notice; llama-imatrix and llama-server do.
+    That is the failure this function exists to prevent, so it GATES rather than warns.
+
+    Two details copied from REAM's own qwen3_5.py post-step:
+      * the merger's state dict is the built module's own naming ('layer.…'), which must be
+        rewritten to the checkpoint naming ('mtp.layers.0.…');
+      * the shared expert is restored from the ORIGINAL block -- it is always-on, not
+        routed, so it is not part of what the merge is entitled to change.
+    We deviate on one point: rather than renumbering all N shards to N+1 (REAM renames
+    every file), the tensors go in a plainly-named extra shard and the index points at it.
+    weight_map values are just filenames; the '-of-N' suffix is convention, not contract.
+    """
+    import json
+    if mtp_state is None:
+        if args.mtp_safetensors:
+            raise SystemExit("FAIL: --mtp-safetensors given but merger produced no MTP state")
+        print("no MTP block requested (--mtp-safetensors unset)", flush=True)
+        return
+    from safetensors.torch import load_file, save_file
+
+    renamed = {}
+    for k, v in mtp_state.items():
+        renamed[k if k.startswith("mtp.") else "mtp." + k.replace("layer.", "layers.0.")] = v
+    orig_shared = 0
+    for f in args.mtp_safetensors.split(","):
+        for k, v in load_file(f).items():
+            if k.startswith("mtp.layers.0.mlp.shared_expert"):
+                renamed[k] = v
+                orig_shared += 1
+
+    shard = "mtp.safetensors"
+    save_file(renamed, os.path.join(args.save_path, shard), metadata={"format": "pt"})
+    ipath = os.path.join(args.save_path, "model.safetensors.index.json")
+    idx = json.load(open(ipath))
+    for k in renamed:
+        idx["weight_map"][k] = shard
+    json.dump(idx, open(ipath, "w"), indent=2)
+
+    # ARTIFACT gate: re-read the index from disk. Writing the file proves intent; only
+    # reading it back proves the loader will find the block.
+    back = json.load(open(ipath))["weight_map"]
+    missing = [k for k in renamed if back.get(k) != shard]
+    if missing:
+        raise SystemExit(f"FAIL: {len(missing)} mtp keys not in the index, e.g. {missing[:3]}")
+    print(f">>> OMK_MTP_FOLDED {len(renamed)} tensors ({orig_shared} shared-expert "
+          f"restored from original) -> {shard}", flush=True)
 
 
 if __name__ == "__main__":

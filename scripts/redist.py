@@ -283,18 +283,127 @@ def _routing_freq(top_idx, num_experts):
     return torch.bincount(top_idx.reshape(-1), minlength=num_experts).float()
 
 
-def _assign_dropped(mean_out, keep_ids, drop_ids):
-    """Assign each dropped expert -> nearest survivor by output cosine.
-    Returns {survivor_id: [dropped ids]}."""
+def _expert_distance(mean_out, gate_prob=None):
+    """Pairwise expert distance in [0,1], REAM's metric (arXiv:2604.04356 §pseudo_group).
+
+    REAM: sim = (cos(out_i, out_j)+1)/2, optionally averaged with the same quantity on
+    the router's per-expert probability column, then d = 1 - sim. We deviate in ONE
+    documented way: REAM compares the full per-token output trace, we compare the mean
+    output vector already computed for the fold. Cheaper by T, and the fold itself is a
+    mean-weighted average, so the coarser statistic matches what the merge actually does.
+    """
     import torch
     mo = torch.nn.functional.normalize(mean_out.float(), dim=-1)
-    surv = torch.tensor(keep_ids)
+    sim = (mo @ mo.T).clamp(-1, 1).add(1).div(2)                  # [E,E] in [0,1]
+    if gate_prob is not None:
+        gp = torch.nn.functional.normalize(gate_prob.float().T, dim=-1)   # [E,T]
+        sim = (sim + (gp @ gp.T).clamp(-1, 1).add(1).div(2)) / 2
+    return (1.0 - sim).fill_diagonal_(0.0)
+
+
+def _assign_dropped(mean_out, keep_ids, drop_ids, group_size=0, gate_prob=None,
+                    saliency=None):
+    """Assign each dropped expert -> a survivor. Returns {survivor_id: [dropped ids]}.
+
+    group_size=0  : MC-SMoE / our original behaviour — every dropped expert goes to its
+                    nearest survivor, groups unbounded. One survivor can absorb 60
+                    experts while its neighbour absorbs none.
+    group_size=C  : REAM's bounded grouping. Survivors claim members in DESCENDING
+                    SALIENCY ORDER (order is load-bearing — the most salient centroid
+                    picks first), each taking its nearest still-unassigned experts up to
+                    C members total. Bounds how much any one survivor is diluted.
+
+    NOTE on faithfulness: REAM's pseudo_group also *chooses* the k centroids as the k
+    most-salient experts. We deliberately do NOT port that half — our centroids are the
+    keep set, which is the drop map's decision and the variable under test. Porting the
+    selection too would silently overwrite the cut being evaluated.
+    """
+    import torch
+    if group_size and group_size * len(keep_ids) < len(keep_ids) + len(drop_ids):
+        raise SystemExit(
+            f"FAIL: group_size={group_size} cannot cover {len(keep_ids)+len(drop_ids)} "
+            f"experts with {len(keep_ids)} survivors (need >= "
+            f"{-(-(len(keep_ids)+len(drop_ids)) // len(keep_ids))})")
+    d = _expert_distance(mean_out, gate_prob)
     assign: dict = {i: [] for i in keep_ids}
-    for j in drop_ids:
-        sims = mo[surv] @ mo[j]
-        i = keep_ids[int(sims.argmax())]
+    if not group_size:
+        for j in drop_ids:
+            i = keep_ids[int(d[j, torch.tensor(keep_ids)].argmin())]
+            assign[i].append(j)
+        return assign
+
+    # REAM order: most salient centroid claims first. Without a saliency the keep-set
+    # order is arbitrary, and an arbitrary order silently decides who gets diluted.
+    if saliency is None:
+        raise SystemExit("FAIL: group_size>0 needs --score saliency to order centroids")
+    order = sorted(keep_ids, key=lambda i: -float(saliency[i]))
+    free = set(drop_ids)
+    for i in order:
+        if not free:
+            break
+        near = sorted(free, key=lambda j: float(d[i, j]))
+        take = near[: max(0, group_size - 1)]
+        for j in take:
+            assign[i].append(j)
+            free.discard(j)
+    for j in sorted(free):   # leftovers when C*k barely covers E: nearest survivor
+        i = keep_ids[int(d[j, torch.tensor(keep_ids)].argmin())]
         assign[i].append(j)
     return assign
+
+
+def _neuron_features(gu_e, dn_e):
+    """Per-hidden-neuron feature rows for one expert: [M, 3H] = [gate | up | down^T].
+    gu_e:[2M,H], dn_e:[H,M]. This is REAM's experts_weight_matrix for one expert."""
+    import torch
+    M = dn_e.shape[-1]
+    return torch.cat([gu_e[:M].float(), gu_e[M:].float(), dn_e.T.float()], dim=1)
+
+
+def _neuron_perm(gu, dn, i, j, mode, acts=None):
+    """Permutation aligning expert j's hidden neurons onto expert i's ordering.
+
+    Two experts trained independently have NO shared neuron ordering, so averaging
+    row m of j into row m of i averages two unrelated features -- this is the single
+    biggest reason naive expert weight-averaging destroys quality. REAM solves a
+    linear assignment on the neuron-to-neuron cost and permutes j first.
+
+    mode: which cost terms to sum -- "weights" (neuron weight rows), "logits" (neuron
+    activation traces over calib tokens), or both (REAM's default "logits+weights").
+    acts: optional {e: [M,T]} per-neuron activation traces for the "logits" term.
+    """
+    import torch
+    from scipy.optimize import linear_sum_assignment
+    nrm = lambda t: torch.nn.functional.normalize(t, dim=-1)   # noqa: E731
+    cost = 0.0
+    if "weights" in mode:
+        cost = cost + torch.cdist(nrm(_neuron_features(gu[i], dn[i])),
+                                  nrm(_neuron_features(gu[j], dn[j]))).cpu().numpy()
+    if "logits" in mode:
+        if acts is None or i not in acts or j not in acts:
+            raise SystemExit("FAIL: align mode requests 'logits' but no activation traces")
+        cost = cost + torch.cdist(nrm(acts[i].float()), nrm(acts[j].float())).cpu().numpy()
+    _, col = linear_sum_assignment(cost)
+    return torch.as_tensor(col.copy(), dtype=torch.long, device=gu.device)
+
+
+def _apply_perm(gu_e, dn_e, perm):
+    """Reorder one expert's hidden neurons. gate and up rows and down COLUMNS all
+    index the same neuron axis, so all three move together or the expert is corrupted."""
+    import torch
+    M = dn_e.shape[-1]
+    return torch.cat([gu_e[:M][perm], gu_e[M:][perm]], dim=0), dn_e[:, perm]
+
+
+def _neuron_acts(x, gu, dn, ids):
+    """Per-neuron activation traces {e: [M,T]} for the experts in ids (the 'logits'
+    alignment term). SwiGLU intermediate, transposed so rows are neurons."""
+    M = dn.shape[-1]
+    out = {}
+    for e in ids:
+        h = x @ gu[e].T.float()
+        out[e] = (_act(h[:, :M]) * h[:, M:]).T.contiguous()
+    return out
 
 
 def _emit_merge(art: "Artifacts", src_dir: str, out_dir: str) -> None:
@@ -368,14 +477,30 @@ class HCSMoE(_MergeMethod):
             mean_out = _per_expert_mean_output(x, gu, dn)
             freq = _routing_freq(data["top_idx"][li], E)
             sal = self._saliency(data, li, freq, mean_out, E)   # [E] merge importance
-            assign = _assign_dropped(mean_out, keep[li], drop[li])
+            gsize = int(getattr(args, "group_size", 0))
+            gprob = (data.get("router_prob", {}) or {}).get(li) \
+                if getattr(args, "group_gate_sim", False) else None
+            assign = _assign_dropped(mean_out, keep[li], drop[li], group_size=gsize,
+                                     gate_prob=gprob, saliency=sal)
+            align = getattr(args, "align", "none")
+            acts = _neuron_acts(x, gu, dn, sorted(set(keep[li]) | set(drop[li]))) \
+                if "logits" in align else None
             new_gu, new_dn = [], []
             for i in keep[li]:                      # keep[li] already sorted -> A2 slot order
                 members = [i] + assign[i]
                 w = sal[members].clamp(min=1e-6)
                 w = (w / w.sum()).to(args.device)
-                mg = (w[:, None, None] * gu[members].float()).sum(0)
-                md = (w[:, None, None] * dn[members].float()).sum(0)
+                # Align each member's hidden neurons onto the centroid's ordering BEFORE
+                # averaging. Row m of expert i and row m of expert j are unrelated features;
+                # averaging them un-aligned is the classic destructive expert merge.
+                mg = w[0] * gu[i].float()
+                md = w[0] * dn[i].float()
+                for k, j in enumerate(members[1:], start=1):
+                    gj, dj = gu[j].float(), dn[j].float()
+                    if align != "none":
+                        gj, dj = _apply_perm(gj, dj, _neuron_perm(gu, dn, i, j, align, acts))
+                    mg = mg + w[k] * gj
+                    md = md + w[k] * dj
                 new_gu.append(mg.to(torch.bfloat16).cpu())
                 new_dn.append(md.to(torch.bfloat16).cpu())
             survivor_w[li] = {"gate_up_proj": torch.stack(new_gu),
@@ -830,6 +955,18 @@ def build_parser() -> argparse.ArgumentParser:
                                 "(merge methods; avoids a ~22 GB artifacts .pt)")
             p.add_argument("--ridge", type=float, default=1e-2,
                            help="mergemoe T1 lstsq ridge")
+            # --- REAM ingredients (arXiv:2604.04356). Defaults reproduce our previous
+            # behaviour exactly, so turning none of them on is a strict no-op.
+            p.add_argument("--group-size", type=int, default=0,
+                           help="REAM bounded grouping: cap members per survivor (C). "
+                                "0 = unbounded nearest-survivor (previous behaviour)")
+            p.add_argument("--group-gate-sim", action="store_true",
+                           help="average router-probability similarity into the grouping "
+                                "distance (REAM's gate_logits term; needs the router tap)")
+            p.add_argument("--align", default="none",
+                           choices=["none", "weights", "logits", "logits+weights"],
+                           help="permutation-align member neurons onto the centroid before "
+                                "averaging (REAM default: logits+weights)")
         p.set_defaults(func=fn)
 
     pg = sub.add_parser("gate")
