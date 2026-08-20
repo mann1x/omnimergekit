@@ -1,28 +1,69 @@
-# MBPP — full 500-problem test split. Matches the published Gemma 4 31B he1
-# model card baseline (Q6_K llama.cpp 85.00%).
+# MBPP — full 500-problem test split.
+#
+# bug-605 (2026-08-20) — EXTRACTOR REWIRE + DELIBERATE BASIS CHANGE.
+# This template used to run `task: mbpp`, the UPSTREAM lm-eval task, whose
+# `build_predictions` slices the reply at a first-fence heuristic. On a
+# reasoning/instruct model that emits prose before the code block it does not
+# return the code — it returns the PROSE. Measured directly:
+#
+#   reply    "Let me think about this. We need a helper.\n\n```python\ndef …"
+#   upstream " me think about this. We need a helper.\n"      -> SyntaxError
+#   chat     "def min_cost(cost, m, n):\n    return 0"        -> parses
+#
+# Blast radius on the banked Qwen3.6 cells: 422/1000 items failing, of which
+# 208 had a raw reply containing a parseable, function-defining block. Those
+# were guaranteed zeros manufactured by our own extraction step and banked as
+# model failures — the exact defect class as bug-604 (MultiPL-E chat_to_body).
+#
+# The chat-aware task `mbpp_chat` (eval/tasks/mbpp_chat.yaml, extractor
+# `_mbpp_utils.build_predictions_chat`: longest fenced block, else from the
+# first `def`) already existed and was CORRECT, but no template referenced it
+# and eval/tasks/ was on no include_path — declared, never wired. It is wired
+# here, and this file is overwritten rather than forked so the wrong extractor
+# cannot be selected again by picking the older template name.
+#
+# BASIS CHANGE: mbpp_full cells produced BEFORE 2026-08-20 ran the upstream
+# extractor and are NOT comparable to cells produced after. Do not put both in
+# one table. Retire the old cells or re-run them; never mix.
+#
+# Legacy anchor recorded under the OLD basis (upstream extractor, Q6_K
+# llama.cpp, Gemma 4 31B he1): 85.00%. That number is not comparable either.
 name: mbpp_full
 backend: lm-eval
-task: mbpp
+task: mbpp_chat            # bug-605: was `mbpp` (upstream, prose-slicing extractor)
 n: 500
 selection:
   type: filter   # full split — no per-row filtering
   all: true
 generation:
   max_gen_toks: 16384       # bumped 2026-05-12: reasoning models (Gemma 4) need headroom; cap is upper bound, not target
+                            # NB: --gen_kwargs MERGES over the task yaml, so this
+                            # overrides mbpp_chat.yaml's 512 while KEEPING its
+                            # `until` control-token stops.
   temperature: 0.0
   top_p: 1.0
   top_k: 0
   do_sample: false
 scoring:
   metric: pass_at_1
+  # mbpp_chat names its filter `extract_code`, so the results key is
+  # `pass_at_1,extract_code`. Pin it: without this the extractor falls through
+  # to "first key that starts with pass_at_1," — correct today by accident, and
+  # silently wrong the moment a second filter is added to the task.
+  filter: extract_code
+  extractor: _mbpp_utils.build_predictions_chat   # bug-605
   validated_against: google-research/mbpp
   validation_date: "2026-05-12"
+  extractor_rewired: "2026-08-20"
 backend_args:
   apply_chat_template: true
   num_fewshot: 3                  # MBPP convention is 3-shot
   batch_size: 1
   confirm_run_unsafe_code: true
+  lm_eval_include_path: tasks     # bug-605: eval/tasks/ holds mbpp_chat.yaml + _mbpp_utils.py
 cache:
-  sqlite_prefix: mbpp_full
+  sqlite_prefix: mbpp_full_chat   # bug-605: NEW prefix — the old cache holds
+                                  # responses scored under the old extractor;
+                                  # reusing it would silently mix two bases.
 reports:
   token_stats: true
