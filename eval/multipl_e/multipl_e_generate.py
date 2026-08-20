@@ -128,6 +128,13 @@ def make_request(base_url: str, prompt: str, stop: list[str], max_tokens: int,
 _CODE_FENCE_RE = re.compile(r"```[a-zA-Z0-9_+-]*\n(.*?)```", re.DOTALL)
 
 
+# bug-604 taxonomy gate: problems whose extracted body lost an opening line
+# (brace balance < 0 on a language where the tests supply the closing braces).
+# Appended by chat_to_body(), reported as a count by main(). Never silently empty
+# a cell — surface it so a guaranteed-zero problem is not read as a model failure.
+UNBALANCED_BODIES: list[str] = []
+
+
 def extract_code_block(text: str) -> str:
     """Return the largest fenced code block; fall back to the whole text."""
     blocks = _CODE_FENCE_RE.findall(text or "")
@@ -136,7 +143,8 @@ def extract_code_block(text: str) -> str:
     return (text or "").strip()
 
 
-def chat_to_body(prompt: str, code: str, stop_tokens: list[str]) -> str:
+def chat_to_body(prompt: str, code: str, stop_tokens: list[str],
+                 name: str = "") -> str:
     """Convert a chat model's full-function reply into a body-only completion
     that drops into MultiPL-E's `prompt + completion + tests` assembly.
 
@@ -147,6 +155,12 @@ def chat_to_body(prompt: str, code: str, stop_tokens: list[str]) -> str:
     single-level (rust: 1 brace) and nested (java: method + class: 2 braces).
     For js (stop tokens are `\\nfunction `/comment markers, not a bare brace)
     the completion self-closes, so the trailing brace is kept.
+
+    bug-604 (2026-08-20): when the reply does NOT restate the signature the old
+    fallback did `code[code.find("{") + 1:]`, which for a BODY-ONLY reply eats
+    the first loop/if opening line and orphans its '}'. Measured across all 9
+    arms of multipl_e_100: 176/900 humaneval-java completions, 176 of 176 FATAL.
+    A body-only reply is already the body — return it untouched.
     """
     plines = [ln for ln in prompt.splitlines() if ln.strip()]
     anchor = plines[-1] if plines else ""
@@ -163,13 +177,90 @@ def chat_to_body(prompt: str, code: str, stop_tokens: list[str]) -> str:
         body = after if anchor.rstrip().endswith("{") else (
             after[after.find("{") + 1:] if "{" in after else after)
     else:
-        # fallback: drop whatever the model wrote up to the first '{'
-        body = code[code.find("{") + 1:] if "{" in code else code
+        # bug-604: neither the exact nor the whitespace-tolerant anchor matched, so
+        # the reply never restated the signature => `code` IS ALREADY the body.
+        # Do NOT strip to the first '{': in a body-only reply that brace belongs to
+        # the first loop/if, and eating its line orphans the matching '}'. The class
+        # then closes early, MultiPL-E's appended main() lands outside it, and javac
+        # reports "illegal start of type". Was: code[code.find("{") + 1:].
+        body = code
 
     tests_supply_close = any((t or "").strip() == "}" for t in (stop_tokens or []))
     if tests_supply_close:
         body = re.sub(r"\s*(?:\}\s*)+\Z", "\n", body)
+        # TAXONOMY GATE (bug-604). When the tests supply the closing braces a
+        # well-formed body is brace-BALANCED; a NEGATIVE balance means an opening
+        # line was lost and the assembled program cannot compile. Emit it (never
+        # silently drop a cell) but record it so the run reports a count instead of
+        # banking guaranteed-zero problems as if they were model failures.
+        # This check is only valid inside this branch: for js the stop tokens are
+        # not a bare '}', tests_supply_close is False, and a negative balance is the
+        # NORMAL shape (measured 895/900 completions, only 74 of them failing).
+        if body.count("{") - body.count("}") < 0:
+            UNBALANCED_BODIES.append(name or "<unnamed>")
     return body if body.endswith("\n") else body + "\n"
+
+
+JAVA_PROMPT = (
+    "import java.util.*;\nclass Problem {\n"
+    "    // Return a greatest common divisor of two integers a and b\n"
+    "    public static long greatestCommonDivisor(long a, long b) {\n")
+JAVA_BODY = ("        while (b != 0) {\n            long temp = b;\n"
+             "            b = a % b;\n            a = temp;\n        }\n"
+             "        return a;\n")
+JAVA_STOP = ["\n    }\n", "<file_sep>"]
+
+
+def selftest() -> int:
+    """Golds for chat_to_body. bug-604: the body-only fallback used to eat the
+    first loop's opening line. Gold 3 is the exact historical broken output —
+    it must never be produced again."""
+    fails = []
+    total = 0
+
+    def chk(tag, got, want):
+        nonlocal total
+        total += 1
+        ok = got == want
+        print(f"  [{'PASS' if ok else 'FAIL'}] {tag}")
+        if not ok:
+            print(f"          got  {got!r}\n          want {want!r}")
+            fails.append(tag)
+
+    # 1) BODY-ONLY reply (the bug-604 shape): body survives intact, balanced.
+    got = chat_to_body(JAVA_PROMPT, JAVA_BODY, JAVA_STOP, "gold_body_only")
+    chk("java body-only keeps the `while` opening line", "while (b != 0) {" in got, True)
+    chk("java body-only is brace-balanced", got.count("{") - got.count("}"), 0)
+
+    # 2) FULL-FUNCTION reply: anchor path, same body out.
+    full = ("class Problem {\n"
+            "    public static long greatestCommonDivisor(long a, long b) {\n"
+            + JAVA_BODY + "    }\n}\n")
+    got2 = chat_to_body(JAVA_PROMPT, full, JAVA_STOP, "gold_full_fn")
+    chk("java full-function keeps the `while` opening line", "while (b != 0) {" in got2, True)
+    chk("java full-function is brace-balanced", got2.count("{") - got2.count("}"), 0)
+
+    # 3) REGRESSION GOLD: the exact string the old fallback produced.
+    broken = ("\n            long temp = b;\n            b = a % b;\n"
+              "            a = temp;\n        }\n        return a;\n")
+    chk("historical broken output is NOT reproduced", got == broken, False)
+
+    # 4) The taxonomy gate fires on a genuinely unbalanced body...
+    before = len(UNBALANCED_BODIES)
+    chat_to_body(JAVA_PROMPT, "        foo();\n        }\n        return a;\n",
+                 JAVA_STOP, "gold_unbalanced")
+    chk("gate flags a negative-balance java body", len(UNBALANCED_BODIES) > before, True)
+
+    # 5) ...and stays silent for js, where negative balance is the NORMAL shape
+    #    (stop tokens are not a bare '}', so tests_supply_close is False).
+    before = len(UNBALANCED_BODIES)
+    chat_to_body("function f(a) {\n", "  return a;\n}\n",
+                 ["\nfunction ", "\n//"], "gold_js")
+    chk("gate stays silent for js negative balance", len(UNBALANCED_BODIES), before)
+
+    print(f"\nSELFTEST {'OK' if not fails else 'FAILED: ' + ', '.join(fails)} "
+          f"({total - len(fails)}/{total})")
+    return 1 if fails else 0
 
 
 def make_chat_request(chat_url: str, prompt: str, lang: str, max_tokens: int,
@@ -267,7 +358,7 @@ def gen_one(args, doc, out_dir: Path, scache, lock) -> tuple[str, str, float, in
                                 args.max_tokens, args.model_name,
                                 temperature=args.temperature, top_p=args.top_p,
                                 top_k=args.top_k)
-        completion = chat_to_body(prompt, extract_code_block(raw), stop)
+        completion = chat_to_body(prompt, extract_code_block(raw), stop, name)
     else:
         completion = make_request(
             args.base_url, prompt, stop[:4],  # /v1/completions caps stop at 4
@@ -284,8 +375,15 @@ def gen_one(args, doc, out_dir: Path, scache, lock) -> tuple[str, str, float, in
 
 
 def main():
+    # bug-604 golds run standalone, before the required serving args are parsed:
+    # `python multipl_e_generate.py --selftest` must work with no server, no GPU.
+    if "--selftest" in sys.argv[1:]:
+        sys.exit(selftest())
+
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--selftest", action="store_true",
+                    help="Run chat_to_body golds (bug-604) and exit; no server needed")
     ap.add_argument("--lang", required=True, help="Language code: rs, java, js, …")
     ap.add_argument("--base-url", required=True, help="llama-server /v1/completions URL")
     ap.add_argument("--model-name", default="multipl-e",
@@ -368,6 +466,21 @@ def main():
     print(f"[gen] done: ok={n_done - n_err} err={n_err} "
           f"total_elapsed={(time.time() - started)/60:.1f}m  out_dir={out_dir}",
           flush=True)
+
+    # bug-604 taxonomy gate. A body whose braces close more than they open on a
+    # language where the tests supply the closing braces cannot compile — it is a
+    # GUARANTEED zero, and read as a model failure it silently deflates the score.
+    # Report it as a rate so a future regression is visible in the log, not only
+    # in a post-hoc join. (list.append from the worker threads is GIL-atomic.)
+    if UNBALANCED_BODIES:
+        n_ub = len(UNBALANCED_BODIES)
+        print(f"[gen] WARN bug-604: {n_ub}/{len(docs)} completions have negative "
+              f"brace balance and CANNOT compile — these are guaranteed zeros, not "
+              f"model failures. First 10: {sorted(UNBALANCED_BODIES)[:10]}",
+              flush=True)
+    else:
+        print(f"[gen] bug-604 gate: 0/{len(docs)} unbalanced bodies", flush=True)
+
     if n_err:
         sys.exit(1)
 
