@@ -258,6 +258,30 @@ def selftest() -> int:
                  ["\nfunction ", "\n//"], "gold_js")
     chk("gate stays silent for js negative balance", len(UNBALANCED_BODIES), before)
 
+    # 6) bug-607 raw retention. The whole point is that a FUTURE extractor fix
+    #    can be rescored offline, so the gold is: the raw reply survives the
+    #    round-trip to disk INTACT even though `completions` holds the extracted
+    #    body, and an absent raw is TAGGED rather than written as "".
+    import tempfile
+    raw_reply = "Sure!\n```java\n" + JAVA_BODY + "```\nHope that helps."
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "gold.json"
+        _write_problem_json(p, "gold", "java", JAVA_PROMPT, JAVA_BODY,
+                            "test();", JAVA_STOP, raw=raw_reply)
+        d = json.loads(p.read_text())
+        chk("raw reply round-trips to raw_completions[0]",
+            d.get("raw_completions", [None])[0], raw_reply)
+        chk("extracted body still in completions[0]", d["completions"][0], JAVA_BODY)
+        chk("raw provenance tagged captured", d.get("raw_provenance"), "captured")
+        chk("already_generated still true with raw present", already_generated(p), True)
+
+        p2 = Path(td) / "gold_noraw.json"
+        _write_problem_json(p2, "gold2", "java", JAVA_PROMPT, JAVA_BODY,
+                            "test();", JAVA_STOP, raw=None)
+        d2 = json.loads(p2.read_text())
+        chk("absent raw is TAGGED, not silently empty",
+            d2.get("raw_provenance"), "unavailable(pre-bug-607-cache)")
+
     print(f"\nSELFTEST {'OK' if not fails else 'FAILED: ' + ', '.join(fails)} "
           f"({total - len(fails)}/{total})")
     return 1 if fails else 0
@@ -312,12 +336,31 @@ def make_chat_request(chat_url: str, prompt: str, lang: str, max_tokens: int,
 
 
 def _write_problem_json(out_path: Path, name: str, lang: str, prompt: str,
-                        completion: str, tests: str, stop: list[str]) -> None:
+                        completion: str, tests: str, stop: list[str],
+                        raw: str | None = None) -> None:
+    """Write the per-problem MultiPL-E JSON.
+
+    `raw` is the model's UNTRANSFORMED reply, persisted alongside the extracted
+    `completions` (bug-607). Rationale: bug-604 was a defect in chat_to_body,
+    i.e. in the extraction step, and it could not be repaired by rescoring
+    because MPE stored ONLY the post-transform text -- unlike LCB (stores
+    `completion` raw + `cleaned`) and lm-eval HE/HE+ (stores `resps` raw +
+    `filtered_resps`). That asymmetry forced a full GPU regeneration of 17
+    cells. With `raw_completions` on disk, a future extractor fix is an offline
+    rescore. The MultiPL-E evaluator copies the input dict through into
+    `<name>.results.json`, so the raw travels with the verdict.
+
+    `raw` is None/"" only for cells resumed from a pre-bug-607 sqlite cache;
+    `raw_provenance` records which case a reader is looking at so an absent raw
+    is never mistaken for an empty model reply.
+    """
     payload = {
         "name": name,
         "language": lang,
         "prompt": prompt,
         "completions": [completion],
+        "raw_completions": [raw or ""],
+        "raw_provenance": "captured" if raw else "unavailable(pre-bug-607-cache)",
         "tests": tests,
         "stop_tokens": stop,
     }
@@ -343,8 +386,12 @@ def gen_one(args, doc, out_dir: Path, scache, lock) -> tuple[str, str, float, in
             cached = scache.get(key) if key in scache else None
         if cached and cached.get("completion"):
             if not already_generated(out_path):
+                # bug-607: `raw` is absent on rows written before this change;
+                # _write_problem_json tags those "unavailable(pre-bug-607-cache)"
+                # rather than writing an empty string that reads as a null reply.
                 _write_problem_json(out_path, name, doc["language"], prompt,
-                                    cached["completion"], tests, stop)
+                                    cached["completion"], tests, stop,
+                                    raw=cached.get("raw"))
             return name, "cached(sqlite)", 0.0, len(cached["completion"])
 
     # 2) JSON-file resume (standalone / no sqlite).
@@ -364,12 +411,17 @@ def gen_one(args, doc, out_dir: Path, scache, lock) -> tuple[str, str, float, in
             args.base_url, prompt, stop[:4],  # /v1/completions caps stop at 4
             args.max_tokens, args.model_name,
             temperature=args.temperature, top_p=args.top_p, top_k=args.top_k)
+        # completion mode applies no extraction: the server's text IS the scored
+        # artifact, so raw == completion by construction (recorded, not derived,
+        # so a reader never has to know which mode produced the cell).
+        raw = completion
     elapsed = time.time() - t0
 
-    _write_problem_json(out_path, name, doc["language"], prompt, completion, tests, stop)
+    _write_problem_json(out_path, name, doc["language"], prompt, completion, tests,
+                        stop, raw=raw)
     if scache is not None:
         with lock:
-            scache[key] = {"completion": completion, "name": name,
+            scache[key] = {"completion": completion, "raw": raw, "name": name,
                            "language": doc["language"], "gen_secs": round(elapsed, 2)}
     return name, "ok", elapsed, len(completion)
 
