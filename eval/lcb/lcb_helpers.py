@@ -137,7 +137,23 @@ def clean_lcb_completion(completion: str, starter_code: str) -> str:
     idx = [i for i, line in enumerate(lines) if "```" in line]
     if len(idx) >= 2:
         return "\n".join(lines[idx[-2] + 1 : idx[-1]])
-    # No fence pair found; strip trailing partial fence and return as-is.
+    # bug-606 (2026-08-20): exactly ONE fence line -- the OPENER of an unterminated
+    # block, which is what a runaway/cap-truncated generation looks like. The old
+    # fallback stripped only a TRAILING fence, so that opening ```python survived into
+    # the scored code and made line 1 a SyntaxError by construction: a guaranteed zero
+    # banked as a model failure. Measured on the REAM/qwen LCB cohorts: 27/224, 32/254
+    # and 10/196 of all failures had a raw block that parses and a `cleaned` that could
+    # not, purely because of the retained opener. Drop the opener too, and everything
+    # after it is the (possibly truncated) block.
+    if len(idx) == 1:
+        i = idx[0]
+        after = "\n".join(lines[i + 1:])
+        before = "\n".join(lines[:i])
+        # The opener is normally the first non-empty line; if there is real code
+        # BEFORE it, the single fence is a closer instead -- keep what precedes it.
+        body = after if not before.strip() else before
+        return TRAILING_FENCE_RE.sub("", body)
+    # No fence at all; strip a trailing partial fence and return as-is.
     return TRAILING_FENCE_RE.sub("", completion)
 
 def _parse_io(s: str):
