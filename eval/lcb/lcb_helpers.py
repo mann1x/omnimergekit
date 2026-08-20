@@ -140,11 +140,31 @@ def clean_lcb_completion(completion: str, starter_code: str) -> str:
     # bug-606 (2026-08-20): exactly ONE fence line -- the OPENER of an unterminated
     # block, which is what a runaway/cap-truncated generation looks like. The old
     # fallback stripped only a TRAILING fence, so that opening ```python survived into
-    # the scored code and made line 1 a SyntaxError by construction: a guaranteed zero
-    # banked as a model failure. Measured on the REAM/qwen LCB cohorts: 27/224, 32/254
-    # and 10/196 of all failures had a raw block that parses and a `cleaned` that could
-    # not, purely because of the retained opener. Drop the opener too, and everything
-    # after it is the (possibly truncated) block.
+    # the scored code and made line 1 a SyntaxError by construction. Drop the opener
+    # too; everything after it is the (possibly truncated) block.
+    #
+    # MEASURED OUTCOME of the offline rescore over all 24 banked LCB cells
+    # (ream_arms lcb_v6_77q + _48k, qwen_suite lcb_v6_77q; 674 failures total):
+    #   single-fence failures      48   <- the population this branch touches
+    #   recleaned by the fix       48
+    #   now ast.parse (was not)    37
+    #   flipped fail -> pass        0
+    #   cells whose score moved     0
+    # 48/48 of them carry finish_reason="length". Every single-fence case is a
+    # cap-truncated runaway, so the retained opener was masking a TRUNCATION, not
+    # hiding a working solution: fixing it turns "SyntaxError line 1" into the honest
+    # "got None expected 6" / IndentationError, and recovers nothing. NO ARM'S LCB
+    # SCORE CHANGES. Do not restate the earlier 27/224, 32/254, 10/196 figures as this
+    # fix's blast radius -- those counted the broader "cleaned does not parse but some
+    # fenced block in raw does" class, which is dominated by MULTI-fence replies
+    # (538/674 failures; 27 damaged) where the official last-two-fence slice picks a
+    # non-parsing block though an earlier one parses. That is a SEPARATE defect this
+    # branch does not address.
+    #
+    # Corollary worth keeping: an LCB failure reported as a line-1 SyntaxError was, in
+    # this cohort, usually a mislabelled truncation -- our own extractor was converting
+    # length-capped generations into syntax errors and hiding them from any truncation
+    # census (cf. bug-592).
     if len(idx) == 1:
         i = idx[0]
         after = "\n".join(lines[i + 1:])
