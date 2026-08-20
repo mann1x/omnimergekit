@@ -71,6 +71,12 @@ def score_of(expert, kind):
         return float(expert.get("wnorm", 0.0))
     if kind == "wnorm_tc":
         return float(expert.get("wnorm", 0.0)) * float(expert.get("tc", 0.0))
+    # rnorm = mean routed-activation norm. A --tc-only map still EMITS the rnorm key, it is
+    # just 0.0 everywhere -- so key-presence proves nothing and the all-zero case has to be
+    # caught per layer, where the whole row is visible (see assert_score_populated).
+    if kind in ("rnorm", "rnorm_tc"):
+        rn = float(expert.get("rnorm", 0.0))
+        return rn * float(expert.get("tc", 0.0)) if kind == "rnorm_tc" else rn
     raise ValueError(f"unknown score {kind}")
 
 
@@ -115,6 +121,19 @@ def load_map(path):
     return cm
 
 
+def assert_score_populated(cat, li, scores, score):
+    """A dead field is all-zero, not absent. Ranking an all-zero layer does not error -- it
+    silently orders the experts by the eid tie-break, i.e. picks a keep set by expert INDEX.
+    That is indistinguishable from a real result downstream, so refuse here."""
+    if any(v != 0.0 for v in scores.values()):
+        return
+    raise SystemExit(
+        f"refusing: score {score!r} is 0.0 for ALL {len(scores)} experts at {cat} L{li}. "
+        f"The competence map carries the key but never populated it (a --tc-only profile "
+        f"emits rnorm=0.0). Re-profile without --tc-only; ranking this would select experts "
+        f"by index, not by importance.")
+
+
 def raw_per_cat_layer(cm, cats, L, E, score):
     """-> {cat: {li: {eid: raw_score}}} for the requested categories."""
     out = {}
@@ -125,6 +144,7 @@ def raw_per_cat_layer(cm, cats, L, E, score):
             row = layers[str(li)]
             assert len(row) == E, f"{cat} L{li}: {len(row)} experts != {E}"
             cat_out[li] = {int(e["id"]): score_of(e, score) for e in row}
+            assert_score_populated(cat, li, cat_out[li], score)
         out[cat] = cat_out
     return out
 
@@ -133,7 +153,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--competence-map", required=True)
     ap.add_argument("--drop-count", type=int, default=72)
-    ap.add_argument("--score", choices=["tc", "wnorm", "wnorm_tc"], default="tc")
+    ap.add_argument("--score", choices=["tc", "wnorm", "wnorm_tc", "rnorm", "rnorm_tc"],
+                    default="tc")
     ap.add_argument("--agg", choices=RAW_AGGS + WEIGHTED_AGGS, default="sum")
     ap.add_argument("--cat-weight", action="append", default=[], metavar="CAT=W",
                     help="Per-category weight for wmax/wsum (repeatable). Unlisted -> 1.0.")

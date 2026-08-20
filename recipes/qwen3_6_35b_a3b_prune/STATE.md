@@ -177,9 +177,23 @@ ships with the competence map it was cut from. Published to this dir (previously
 - **Calib corpus** `results/router_calib_corpus_coder_lcbmpe_qwen.jsonl` (4.3 MB): the LCB+MultiPL-E
   coder calibration set (Qwen-templated, teacher-labelled PASS subset) that the coder / coder_lcbmpe
   maps were profiled on, alongside the base `router_calib_corpus_qwen.jsonl`.
-- **Reproduce:** `make_drop_map.py --agg wmax --cat-weight corpus_targeted_lcb=2.0
-  [--cat-weight corpus_targeted_mpe=… --cat-weight corpus_ifeval=…] --floor-count <F>` against the
-  matching `competence_qwen35b_coder*.json`. All three feed `expert_drop_qwen35b.py` → 184e coder
+- **Reproduce (coder_lcbmpe — EXACT, recovered + verified 2026-08-18):**
+  ```
+  make_drop_map.py --competence-map results/competence_qwen35b_coder_lcbmpe.json \
+      --drop-count 72 --score tc --agg wmax \
+      --cat-weight corpus_targeted_lcb=1.5 --cat-weight corpus_targeted_mpe=1.5 \
+      --floor-count 32
+  ```
+  Reproduces `drop_map_184e_coder_lcbmpe.json` **byte-exactly** (drop-set overlap 1.0000,
+  0/40 layers differing). The previous entry here said `corpus_targeted_lcb=2.0` and left the
+  MPE weight and floor as `…`/`<F>`; **2.0 is wrong** — it lands at 0.8708 drop-overlap, and
+  no floor value rescues it. Both channels are 1.5. `--floor-count 40` also reproduces exactly
+  (the clamp is not binding between 32 and 40); 48 breaks it (0.9983), which bounds F to
+  [32, 40]. Recovered by grid-searching the real producer against the shipped artifact after
+  the elided values made the published cut non-reproducible.
+  For **coder** and **coder_lcbmpeife** the exact weights are still unrecovered — assume the
+  recorded values there are equally unreliable until the same grid is run against them.
+  All three feed `expert_drop_qwen35b.py` → 184e coder
   safetensors → router_shared_upweight α1.2. Per-variant eval deltas (LCB / HE+ / MultiPL-E / IFEval
   vs the balanced 184e) live in the training-run release notes; the `.checkpoint.json` producer
   intermediates are intentionally NOT published (regenerable, large).
