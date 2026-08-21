@@ -11,7 +11,21 @@ REPO=mannix/gemma4-98e-v7-coder
 GG=/mnt/sdc/ml/std16_cohort/gemma-4-A4B-98e-v7-coder-it-GGUF
 STEM=gemma-4-A4B-98e-v7-coder-it
 MMPROJ=/mnt/sdc/ml/gguf/v6coder/mmproj-gemma4.gguf
-STORE=/usr/share/ollama/.ollama/models
+# Resolve the store the DAEMON actually uses -- never a hardcoded path. `ollama` runs under its
+# own systemd User=, and OLLAMA_MODELS can relocate the store entirely (bs2 moved it to
+# /mnt/sdc on 2026-08-21, at which point this script's hardcoded /usr/share path stopped
+# existing). Order: OLLAMA_MODELS > the unit's User= home > /root.
+resolve_store(){
+  [ -n "${OLLAMA_MODELS:-}" ] && { echo "$OLLAMA_MODELS"; return; }
+  local u home
+  u=$(systemctl show ollama -p User --value 2>/dev/null)
+  if [ -n "$u" ]; then
+    home=$(getent passwd "$u" | cut -d: -f6)
+    [ -n "$home" ] && [ -d "$home/.ollama/models" ] && { echo "$home/.ollama/models"; return; }
+  fi
+  echo "/root/.ollama/models"
+}
+STORE="$(resolve_store)"
 BLOBS="$STORE/blobs"
 MANIFESTS="$STORE/manifests"
 WORK=/mnt/sdc/ml/std16_gate/ollama_republish
