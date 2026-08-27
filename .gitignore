@@ -84,3 +84,20 @@ graphify-out/
 # ARE committed and are byte-identical across hosts.
 # Materialise with: python eval/build_aime100_dataset.py --yaml-only
 eval/lm_eval_tasks/aime100_chat/aime100_chat.yaml
+
+# RL / replay PROMPT POOLS: the BUILDERS are committed, the built pools are not.
+#   scripts/build_lcb_rl_pool.py       -> eval/lcb/lcb_rl_pool.jsonl
+#   scripts/build_gepo_replay_pool.py  -> eval/replay/gepo_replay_pool.jsonl
+#
+# This repo is PUBLIC. gepo_replay_pool.jsonl embeds 250 GPQA questions together
+# with their correct answers in plaintext. GPQA is a GATED dataset that ships a
+# canary string precisely so its questions do not end up in web crawls and leak
+# into future pretraining sets — publishing them here would contaminate GPQA for
+# everyone, not just for us, and it is not ours to publish. MBPP (CC-BY-4.0) is
+# already public and carries no such constraint, but the pool is one file.
+#
+# Nothing is lost: the builders are deterministic (fixed seed, hash-pinned dataset
+# snapshots) and print their own holdout provenance, so anyone with legitimate
+# GPQA access reproduces the pool byte-for-byte from committed code.
+eval/lcb/lcb_rl_pool.jsonl
+eval/replay/gepo_replay_pool.jsonl
