@@ -55,6 +55,7 @@ their transformers pins diverge and must never be merged).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -746,7 +747,19 @@ def main() -> int:
         sys.exit("REFUSE: 0 trainable parameters — LoRA did not attach.")
     log(f"TRAINABLE {n_train / 1e6:.1f}M params")
 
+    # A FILE PATH IS NOT PROVENANCE. The mixed pool is gitignored (it embeds gated GPQA
+    # text), so "pool": "<path>" identifies nothing a reader can check -- the file can be
+    # rebuilt, re-shuffled or replaced and the record would not change. The sha256 pins
+    # the exact bytes (it is the same field the committed .MANIFEST.json carries, so the
+    # two can be matched), and the tier census says what was actually in it, which is the
+    # thing that differs between run4 and every earlier run.
+    # [[feedback_unrecorded_axis_filename_is_not_provenance]]
+    try:
+        pool_sha = hashlib.sha256(Path(args.pool).read_bytes()).hexdigest()
+    except OSError:
+        pool_sha = None
     meta = {"task": "R9 GEPO brevity", "model": args.model, "pool": args.pool,
+            "pool_sha256": pool_sha, "pool_census": dict(sorted(census.items())),
             "n_problems": len(ds), "gepo": bool(trainer.gepo),
             "length_budget": args.length_budget, "length_lambda": args.length_lambda,
             # The reward function IS a basis: a v1 row and a v2 row are not comparable
