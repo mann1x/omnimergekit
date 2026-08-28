@@ -44,6 +44,9 @@ def main() -> int:
     ap.add_argument("--max-new", type=int, default=32768)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--kinds", default="", help="comma-separated tiers; default all")
+    ap.add_argument("--no-think", action="store_true",
+                    help="render with enable_thinking=False, so the template emits an "
+                         "EMPTY <think></think> block and the model answers directly")
     ap.add_argument("--out", default="")
     a = ap.parse_args()
 
@@ -75,8 +78,10 @@ def main() -> int:
 
     results = []
     for kind, items in sel.items():
+        tkw = {"enable_thinking": False} if a.no_think else {}
         texts = [tok.apply_chat_template([{"role": "user", "content": r["prompt"]}],
-                                         add_generation_prompt=True, tokenize=False)
+                                         add_generation_prompt=True, tokenize=False,
+                                         **tkw)
                  for r in items]
         enc = tok(texts, return_tensors="pt", padding=True,
                   add_special_tokens=False).to(model.device)
@@ -101,11 +106,18 @@ def main() -> int:
             if m:
                 tok_to_marker = len(tok(text[:m.end()], add_special_tokens=False).input_ids)
             has_answer = bool(m) if kind == "mc_letter" else ("def " in text)
+            correct = None
+            if kind == "mc_letter" and m:
+                correct = m.group(1).upper() == str(r.get("gold", "")).strip().upper()
             results.append({"kind": kind, "id": r["id"], "n_tok": n_tok,
                             "hit_cap": hit_cap, "has_answer": has_answer,
+                            "correct": correct, "gold": r.get("gold"),
+                            "said": m.group(1).upper() if m else None,
                             "tok_to_marker": tok_to_marker, "secs": secs})
             print(f"  [{kind} {i+1}/{len(items)}] tok={n_tok} cap_hit={hit_cap} "
-                  f"answer={has_answer} tok_to_marker={tok_to_marker}", flush=True)
+                  f"answer={has_answer} said={results[-1]['said']} "
+                  f"gold={r.get('gold')} correct={correct} "
+                  f"tok_to_marker={tok_to_marker}", flush=True)
         print(f"  batch took {secs}s", flush=True)
 
     print("\n=== per-tier summary ===")
@@ -115,7 +127,13 @@ def main() -> int:
         caps = sum(x["hit_cap"] for x in rs)
         ans = sum(x["has_answer"] for x in rs)
         marks = [x["tok_to_marker"] for x in rs if x["tok_to_marker"]]
-        print(f"{kind}: n={len(rs)} cap_hit={caps}/{len(rs)} answered={ans}/{len(rs)}")
+        cor = sum(1 for x in rs if x.get("correct") is True)
+        print(f"{kind}: n={len(rs)} cap_hit={caps}/{len(rs)} answered={ans}/{len(rs)} "
+              f"CORRECT={cor}/{len(rs)}")
+        if kind == "mc_letter" and ans and cor in (0, ans):
+            print("  WARNING: every answered rollout scored the SAME way "
+                  f"(correct={cor}/{ans}). A tier with no correct/incorrect mix has no "
+                  "within-group spread and yields no gradient, cap or no cap.")
         print(f"  tokens  min={min(toks)} p50={int(st.median(toks))} max={max(toks)}")
         if marks:
             print(f"  tokens-to-answer-marker  min={min(marks)} "
