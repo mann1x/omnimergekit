@@ -164,6 +164,12 @@ def main() -> int:
                     help="how --replay-n is split across reward_kinds. equal = "
                          "same count per tier (default; the pool ratio is the "
                          "inverse of the loss ratio it defends)")
+    ap.add_argument("--replay-no-think", action="store_true",
+                    help="render REPLAY rows with enable_thinking=False (LCB rows "
+                         "unchanged). Requires pre-rendering every prompt to text, "
+                         "because TRL's chat_template_kwargs is global. Without this, "
+                         "GPQA replay rollouts run 16-18k tokens, mostly never reach "
+                         "an answer, and the tier scores zero for every rollout.")
     ap.add_argument("--max-completion", type=int, default=16384)
     ap.add_argument("--max-prompt", type=int, default=4096)
     ap.add_argument("--server-max-model-len", type=int, default=24576,
@@ -320,12 +326,63 @@ def main() -> int:
     # if the column is absent the reward receives gold=None, falls back to "", and
     # EVERY replay multiple-choice row scores 0.0 -- a silently dead tier. LCB and
     # MBPP rows carry "" because their verifiers execute tests instead.
-    ds = Dataset.from_list([
-        {"prompt": [{"role": "user", "content": r["prompt"]}],
-         "meta": json.dumps(r["meta"]),
-         "gold": str(r.get("gold") or "")}
-        for r in rows
-    ])
+    # --replay-no-think: PRE-RENDER every prompt to a string so thinking can be turned
+    # off PER ROW. Why it has to work this way:
+    #   * TRL's chat_template_kwargs is GLOBAL (grpo_config.py:556, applied to the whole
+    #     batch at grpo_trainer.py:1758), so it cannot express "thinking off for replay,
+    #     on for LCB" -- using it would silently change the LCB arm and break
+    #     comparability with run2/run3.
+    #   * armJ's template honours no inline /no_think marker; only the enable_thinking
+    #     kwarg (chat_template.jinja:149 emits an empty <think></think> when false).
+    #   * TRL takes a text path when the prompt is a str (grpo_trainer.py:1780,
+    #     `self.processing_class(text=prompts)`), applying NO template. So a
+    #     fully pre-rendered dataset gives exact per-row control.
+    # LCB rows are rendered with the DEFAULT kwargs, i.e. byte-identical to what TRL
+    # would have produced itself, so this changes nothing for the LCB arm.
+    #
+    # WHY replay is rendered no-think at all: measured 2026-08-28, GPQA rollouts with
+    # unbounded thinking run 16-18k tokens and 2 of 4 never answer inside 24576 -- the
+    # tier scores 0 for every rollout and cannot fit memory or wall clock. With thinking
+    # off it answers 12/12 at p50 1595 tokens, 9/12 correct. That is not a departure
+    # from what we score: the served GPQA eval already runs at thinking_est p50=0 and
+    # completion p50 ~800 on every arm. [[project_gpqa_cot_needs_16k_on_armj]]
+    if args.replay_no_think:
+        probe = [{"role": "user", "content": "probe"}]
+        d_on = tok.apply_chat_template(probe, add_generation_prompt=True, tokenize=False)
+        d_off = tok.apply_chat_template(probe, add_generation_prompt=True, tokenize=False,
+                                        enable_thinking=False)
+        # A template that ignores enable_thinking would render identically and hand the
+        # replay tier thinking-ON prompts anyway -- the exact failure this flag exists
+        # to prevent, and it would be invisible until the tier scored zero again.
+        if d_on == d_off:
+            sys.exit("REFUSE: this chat template ignores enable_thinking (rendering is "
+                     "identical with and without it). --replay-no-think cannot work "
+                     "here; it would silently produce thinking-ON replay prompts.")
+        log(f"NO_THINK_RENDER_OK template honours enable_thinking "
+            f"(delta {len(d_on)} vs {len(d_off)} chars)")
+
+        def render(r):
+            kw = {} if r["meta"].get("reward_kind", "lcb_exec") == "lcb_exec" \
+                else {"enable_thinking": False}
+            return tok.apply_chat_template([{"role": "user", "content": r["prompt"]}],
+                                           add_generation_prompt=True, tokenize=False,
+                                           **kw)
+        ds = Dataset.from_list([
+            {"prompt": render(r),
+             "meta": json.dumps(r["meta"]),
+             "gold": str(r.get("gold") or "")}
+            for r in rows
+        ])
+        n_nt = sum(1 for r in rows
+                   if r["meta"].get("reward_kind", "lcb_exec") != "lcb_exec")
+        log(f"PRERENDER text prompts: {len(ds)} rows, {n_nt} rendered no-think")
+    else:
+        ds = Dataset.from_list([
+            {"prompt": [{"role": "user", "content": r["prompt"]}],
+             "meta": json.dumps(r["meta"]),
+             "gold": str(r.get("gold") or "")}
+            for r in rows
+        ])
     n_gold = sum(1 for r in rows if str(r.get("gold") or ""))
     n_mc = sum(1 for r in rows if r.get("meta", {}).get("reward_kind") == "mc_letter")
     if n_mc and n_gold < n_mc:
@@ -339,9 +396,11 @@ def main() -> int:
     # for every prompt in the pool regardless of length, and the refusal below could
     # never fire. Measured 2026-08-23: same prompt, len()=2 as a BatchEncoding, 24 as
     # a list. A gate whose input is constant is not a gate.
-    plen = [len(tok.apply_chat_template(ex["prompt"], tokenize=True,
-                                        add_generation_prompt=True,
-                                        return_dict=False))
+    plen = [len(tok(ex["prompt"], add_special_tokens=False).input_ids)
+            if isinstance(ex["prompt"], str)
+            else len(tok.apply_chat_template(ex["prompt"], tokenize=True,
+                                             add_generation_prompt=True,
+                                             return_dict=False))
             for ex in ds]
     log(f"prompt tokens p50/p90/max: {int(st.median(plen))}/"
         f"{sorted(plen)[int(len(plen) * .9)]}/{max(plen)}  (cap {args.max_prompt})")
@@ -517,8 +576,13 @@ def main() -> int:
             # on reward, mean_length or clipped_ratio, because v2 changes what those
             # numbers mean. Recorded so the two can never be silently tabled together.
             "reward": args.reward,
+            # no_think is part of the replay tier's IDENTITY, not a tuning detail: a
+            # no-think replay row trains a different behaviour from a thinking one, and
+            # two runs that differ only here are not comparable.
             "replay": ({"pool": args.replay_pool, "n": len(rows) - n_lcb,
                         "n_lcb": n_lcb, "seed": args.replay_seed,
+                        "no_think": bool(args.replay_no_think),
+                        "prerendered": bool(args.replay_no_think),
                         "frac": round((len(rows) - n_lcb) / max(len(rows), 1), 4)}
                        if args.replay_pool else None),
             "max_completion": args.max_completion, "num_generations": args.num_generations,

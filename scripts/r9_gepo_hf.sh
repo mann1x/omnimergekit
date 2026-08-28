@@ -64,6 +64,7 @@ REWARD=${REWARD:-v1}
 REPLAY_POOL=${REPLAY_POOL:-}
 REPLAY_N=${REPLAY_N:-0}
 REPLAY_BALANCE=${REPLAY_BALANCE:-equal}
+REPLAY_NO_THINK=${REPLAY_NO_THINK:-0}
 
 ts(){ date '+%F %T %Z'; }
 say(){ echo "[$(ts)] $*"; }
@@ -85,6 +86,7 @@ if [ -n "$REPLAY_POOL" ]; then
     || { echo "FATAL: replay pool failed the artifact contamination gate"; exit 9; }
   SCOPE_ARGS+=(--replay-pool "$REPLAY_POOL" --replay-n "$REPLAY_N")
   SCOPE_ARGS+=(--replay-balance "$REPLAY_BALANCE")
+  if [ "$REPLAY_NO_THINK" = "1" ]; then SCOPE_ARGS+=(--replay-no-think); fi
 fi
 
 launch(){   # launch <name> <out> <extra args...>
