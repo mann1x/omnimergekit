@@ -1,0 +1,578 @@
+{
+  "mbpp/907": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 0,
+    "unanimous": true
+  },
+  "mbpp/859": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/536": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/967": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 7,
+    "unanimous": false
+  },
+  "mbpp/640": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 1,
+    "unanimous": false
+  },
+  "mbpp/602": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/828": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/734": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/872": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 1,
+    "unanimous": false
+  },
+  "mbpp/858": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/954": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/911": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/890": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/865": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/735": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/525": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 4,
+    "unanimous": false
+  },
+  "mbpp/608": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/686": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 7,
+    "unanimous": false
+  },
+  "mbpp/771": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/619": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/834": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/567": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/682": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/886": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/568": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/793": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 6,
+    "unanimous": false
+  },
+  "mbpp/685": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/832": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/10": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/861": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/905": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 7,
+    "unanimous": false
+  },
+  "mbpp/614": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/947": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/941": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/559": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/692": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 7,
+    "unanimous": false
+  },
+  "mbpp/891": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/740": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/539": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/827": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/582": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/723": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/764": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/921": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/815": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/950": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 6,
+    "unanimous": false
+  },
+  "mbpp/603": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 0,
+    "unanimous": true
+  },
+  "mbpp/957": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/607": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/823": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/831": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/773": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/667": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/940": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/592": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 2,
+    "unanimous": false
+  },
+  "mbpp/706": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/612": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/920": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/650": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 0,
+    "unanimous": true
+  },
+  "mbpp/540": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/867": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 2,
+    "unanimous": false
+  },
+  "mbpp/899": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 0,
+    "unanimous": true
+  },
+  "mbpp/919": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/914": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/557": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/560": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/910": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 0,
+    "unanimous": true
+  },
+  "mbpp/969": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 6,
+    "unanimous": false
+  },
+  "mbpp/513": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/836": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/534": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/727": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/562": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/821": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/868": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/736": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/549": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/930": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 7,
+    "unanimous": false
+  },
+  "mbpp/511": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/928": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/842": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/676": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/830": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/524": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/593": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 7,
+    "unanimous": false
+  },
+  "mbpp/870": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/691": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/627": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/804": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/613": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/547": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/888": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/8": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/639": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 8,
+    "unanimous": true
+  },
+  "mbpp/617": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 0,
+    "unanimous": true
+  },
+  "mbpp/971": {
+    "kind": "mbpp_exec",
+    "G": 8,
+    "pass": 7,
+    "unanimous": false
+  }
+}
