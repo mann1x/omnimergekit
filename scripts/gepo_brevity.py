@@ -164,6 +164,12 @@ def main() -> int:
                     help="how --replay-n is split across reward_kinds. equal = "
                          "same count per tier (default; the pool ratio is the "
                          "inverse of the loss ratio it defends)")
+    ap.add_argument("--replay-difficulty", default="",
+                    help="path to a DIFFICULTY.json from "
+                         "scripts/r9_gepo/profile_replay_difficulty.py. Replay rows "
+                         "that are unanimous at this run's G are dropped: they give "
+                         "zero within-group spread and so no reward-gradient (the KL "
+                         "anchor still applies). The profile's G must match --num-generations.")
     ap.add_argument("--replay-no-think", action="store_true",
                     help="render REPLAY rows with enable_thinking=False (LCB rows "
                          "unchanged). Requires pre-rendering every prompt to text, "
@@ -288,6 +294,46 @@ def main() -> int:
         if bad:
             sys.exit(f"REFUSE: {len(bad)} replay rows carry a nonzero length_lambda -- "
                      "replay must be a pure correctness gate")
+        # DIFFICULTY FILTER: drop replay problems that are UNANIMOUS at the run's own
+        # group size. GRPO normalises advantage by the within-group spread, so a
+        # problem the model gets right 8/8 (or wrong 0/8) yields identical rewards, zero
+        # advantage, and no reward-gradient. Measured in run4's attempt-4 smoke:
+        # mbpp_exec came back pass=1.000 nz=8/8 -- alive by the tier gate, silent
+        # through the reward.
+        #
+        # Such a row is not worthless: with beta != 0 the KL term still anchors the
+        # policy to the reference on that prompt (grpo_trainer.py:3121 adds
+        # beta*per_token_kl independently of the advantage), which IS capability
+        # defence. Filtering just buys the reward signal on top of that anchor.
+        #
+        # The criterion is unanimity at G, not p ~= 0.5: P(group not unanimous) =
+        # 1 - p^G - (1-p)^G, which at G=8 is still 0.57 for p=0.9. Only p pinned at 1.0
+        # or 0.0 is genuinely dead, so a p~=0.5 band would discard most of a usable pool.
+        if args.replay_difficulty:
+            prof = json.loads(Path(args.replay_difficulty).read_text())
+            miss = [r["id"] for r in rrows if r["id"] not in prof]
+            if len(miss) == len(rrows):
+                sys.exit(f"REFUSE: no row of {args.replay_pool} appears in "
+                         f"{args.replay_difficulty}. The profile does not describe this "
+                         "pool, so it cannot be used to select from it.")
+            gp = {v.get("G") for v in prof.values()}
+            if gp != {args.num_generations}:
+                sys.exit(f"REFUSE: difficulty profile was measured at G={sorted(gp)} but "
+                         f"this run uses G={args.num_generations}. Unanimity is a "
+                         "property OF the group size; the profile does not transfer.")
+            keep = [r for r in rrows
+                    if r["id"] in prof and not prof[r["id"]]["unanimous"]]
+            drop_u = sum(1 for r in rrows
+                         if r["id"] in prof and prof[r["id"]]["unanimous"])
+            log(f"REPLAY_DIFFICULTY kept {len(keep)}/{len(rrows) - len(miss)} profiled "
+                f"rows ({drop_u} unanimous at G={args.num_generations} dropped, "
+                f"{len(miss)} unprofiled dropped)")
+            if not keep:
+                sys.exit("REFUSE: every profiled replay row is unanimous at "
+                         f"G={args.num_generations}. Difficulty selection cannot help; "
+                         "re-profile a wider slice or accept the KL-anchor-only tier by "
+                         "dropping --replay-difficulty.")
+            rrows = keep
         random.Random(args.replay_seed).shuffle(rrows)
         if args.replay_n:
             # STRATIFY by reward_kind rather than taking a proportional slice. The pool
@@ -582,6 +628,7 @@ def main() -> int:
             "replay": ({"pool": args.replay_pool, "n": len(rows) - n_lcb,
                         "n_lcb": n_lcb, "seed": args.replay_seed,
                         "no_think": bool(args.replay_no_think),
+                        "difficulty_profile": args.replay_difficulty or None,
                         "prerendered": bool(args.replay_no_think),
                         "frac": round((len(rows) - n_lcb) / max(len(rows), 1), 4)}
                        if args.replay_pool else None),

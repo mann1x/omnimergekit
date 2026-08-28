@@ -87,6 +87,7 @@ exec env \
   REPLAY_N=64 \
   REPLAY_BALANCE=equal \
   REPLAY_NO_THINK=1 \
+  REPLAY_DIFFICULTY="$REPO/eval/replay/gepo_replay_pool.DIFFICULTY.json" \
   ROUTER_LORA=0 \
   POOL_LIMIT=128 \
   MAXCOMP=12288 \

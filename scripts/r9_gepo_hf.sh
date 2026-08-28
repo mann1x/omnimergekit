@@ -65,6 +65,7 @@ REPLAY_POOL=${REPLAY_POOL:-}
 REPLAY_N=${REPLAY_N:-0}
 REPLAY_BALANCE=${REPLAY_BALANCE:-equal}
 REPLAY_NO_THINK=${REPLAY_NO_THINK:-0}
+REPLAY_DIFFICULTY=${REPLAY_DIFFICULTY:-}
 
 ts(){ date '+%F %T %Z'; }
 say(){ echo "[$(ts)] $*"; }
@@ -87,6 +88,10 @@ if [ -n "$REPLAY_POOL" ]; then
   SCOPE_ARGS+=(--replay-pool "$REPLAY_POOL" --replay-n "$REPLAY_N")
   SCOPE_ARGS+=(--replay-balance "$REPLAY_BALANCE")
   if [ "$REPLAY_NO_THINK" = "1" ]; then SCOPE_ARGS+=(--replay-no-think); fi
+  if [ -n "$REPLAY_DIFFICULTY" ]; then
+    [ -s "$REPLAY_DIFFICULTY" ] || { echo "FATAL: REPLAY_DIFFICULTY=$REPLAY_DIFFICULTY missing/empty"; exit 10; }
+    SCOPE_ARGS+=(--replay-difficulty "$REPLAY_DIFFICULTY")
+  fi
 fi
 
 launch(){   # launch <name> <out> <extra args...>
