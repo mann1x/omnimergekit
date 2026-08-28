@@ -58,12 +58,34 @@ RUN=${RUN:-run1}
 # (lora.ParamWrapper constraint) -- a basis change that gepo_brevity.py logs and
 # records in run_meta.json. See the LORA_REGEX comment block there.
 ROUTER_LORA=${ROUTER_LORA:-0}
+# run4: reward version + capability replay. Defaults keep run1-run3 reproducible from
+# this file: REWARD=v1 and an empty REPLAY_POOL reproduce the old command line exactly.
+REWARD=${REWARD:-v1}
+REPLAY_POOL=${REPLAY_POOL:-}
+REPLAY_N=${REPLAY_N:-0}
+REPLAY_BALANCE=${REPLAY_BALANCE:-equal}
 
 ts(){ date '+%F %T %Z'; }
 say(){ echo "[$(ts)] $*"; }
 
 SCOPE_ARGS=()
 if [ "$ROUTER_LORA" = "1" ]; then SCOPE_ARGS+=(--router-lora); fi
+SCOPE_ARGS+=(--reward "$REWARD")
+if [ -n "$REPLAY_POOL" ]; then
+  [ -s "$REPLAY_POOL" ] || { echo "FATAL: REPLAY_POOL=$REPLAY_POOL missing/empty"; exit 7; }
+  # Contamination gate on the ARTIFACT, on THIS host, before any GPU time is spent.
+  # The build-time gate (test_gepo_replay_gate.py) runs only where the pool is BUILT
+  # -- it needs gpqa_main.csv, which the run host does not have. So the file that
+  # actually gets trained on has, until this point, been certified only by a sha256
+  # match against a note. This re-derives the three zeros from the eval sets present
+  # here, with a fire-control on each gate. A leak makes every downstream cell of
+  # GPQA / MBPP / HumanEval a lie, so it aborts rather than warns.
+  echo "== replay artifact gate =="
+  "$PY" "$(dirname "$0")/gate_replay_artifact.py" --pool "$REPLAY_POOL" \
+    || { echo "FATAL: replay pool failed the artifact contamination gate"; exit 9; }
+  SCOPE_ARGS+=(--replay-pool "$REPLAY_POOL" --replay-n "$REPLAY_N")
+  SCOPE_ARGS+=(--replay-balance "$REPLAY_BALANCE")
+fi
 
 launch(){   # launch <name> <out> <extra args...>
   local name="$1" out="$2"; shift 2
@@ -148,13 +170,57 @@ print("ROUTER_GATE_OK")
 PY
 }
 
+# REPLAY TIER gate (run4+). gate_learned reads the TOTAL grad_norm, which the LCB tier
+# alone keeps non-zero -- so it CANNOT see a replay tier that scored 0.0 for every
+# rollout because its reward_kind was unwired, its gold column was missing, or its
+# verifier never matched. Such a tier has no within-group spread, contributes no
+# gradient, and drags the policy for the whole run while every aggregate looks normal.
+# The v2 reward prints per-tier n/mean/nz; this asserts every tier produced at least
+# one non-zero reward.
+gate_replay_tiers(){
+  local log="$1"
+  "$PY" - "$log" <<'PYGATE'
+import re, sys
+line = None
+for ln in open(sys.argv[1], errors="ignore"):
+    if ">>> V2_REWARD" in ln and "| TIERS " in ln:
+        line = ln.strip()
+if line is None:
+    sys.exit("REPLAY_GATE_FAIL: no V2_REWARD tier line in the smoke log -- either the "
+             "v2 reward never ran or it never reached its log interval.")
+found = re.findall(r"(\w+):n=(\d+),mean=([-\d.]+),nz=(\d+)", line)
+if not found:
+    sys.exit("REPLAY_GATE_FAIL: could not parse tiers from: " + line)
+print("REPLAY_TIERS " + " ".join("%s(n=%s,mean=%s,nz=%s)" % t for t in found))
+dead = [k for k, n, m, z in found if int(z) == 0]
+if len(found) < 2:
+    sys.exit("REPLAY_GATE_FAIL: only %d tier(s) scored; the replay pool never reached "
+             "the reward. Check --replay-pool and the REPLAY_MIX log line." % len(found))
+if dead:
+    sys.exit("REPLAY_GATE_FAIL: tier(s) %s produced ZERO non-zero rewards -- no "
+             "within-group spread, no gradient, and they would drag the policy for the "
+             "whole run while grad_norm stays healthy from the other tier." % dead)
+print("REPLAY_TIER_ALIVE_OK")
+PYGATE
+}
+
 if [ "$SKIP_SMOKE" = "0" ]; then
+  # --replay-n 4 (argparse takes the LAST occurrence, overriding SCOPE_ARGS) keeps the
+  # smoke small while still putting BOTH replay tiers through the reward -- the whole
+  # point of the gate below. Without it the smoke would pull all $REPLAY_N replay rows
+  # and stop being a smoke.
+  SMOKE_EXTRA=()
+  if [ -n "$REPLAY_POOL" ]; then SMOKE_EXTRA+=(--replay-n 4); fi
   launch "$SMOKE_LOG" "$W/$SMOKE_LOG" \
       --max-completion 2048 --num-generations 4 --grad-accum 4 \
-      --limit 2 --epochs 1 --save-steps 1000
+      --limit 2 --epochs 1 --save-steps 1000 \
+      ${SMOKE_EXTRA[@]+"${SMOKE_EXTRA[@]}"}
   gate_learned "$W/${SMOKE_LOG}.log" || { say "FATAL: smoke did not learn"; exit 4; }
   if [ "$ROUTER_LORA" = "1" ]; then
     gate_router_moved "$W/$SMOKE_LOG" || { say "FATAL: router got no gradient"; exit 6; }
+  fi
+  if [ -n "$REPLAY_POOL" ]; then
+    gate_replay_tiers "$W/${SMOKE_LOG}.log" || { say "FATAL: a replay tier is dead"; exit 8; }
   fi
   say "SMOKE_OK"
 fi

@@ -80,12 +80,41 @@ import sys
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
-GPQA_SNAP = ("/root/.cache/huggingface/hub/datasets--Idavidrein--gpqa/snapshots/"
-             "633f5ee89ab8ad4522a9f850766b73f62147ffdd")
-MBPP_SNAP = ("/root/.cache/huggingface/hub/datasets--google-research-datasets--mbpp/"
-             "snapshots/4bb6404fdc6cacfda99d4ac4205087b89d32030c")
-HE_SNAP = ("/root/.cache/huggingface/hub/datasets--openai--openai_humaneval/snapshots/"
-           "7dce6050a7d6d172f3cc5c32aa97f52fa1a2e544/openai_humaneval")
+HUB = "/root/.cache/huggingface/hub"
+
+
+def resolve_snapshot(repo_dir: str, must_contain: list[str]) -> str:
+    """Find the snapshot that actually HAS the files, rather than hardcoding a hash.
+
+    The hashes were hardcoded here originally, which is wrong twice over: they differ
+    between hosts, and -- measured on bs2 2026-08-28 -- a host can carry the SAME hash
+    while holding only a SUBSET of the files. bs2 had gpqa_diamond.csv but not
+    gpqa_main.csv, because the eval only ever needed Diamond. A hash equality check
+    would have passed there and then failed deep inside the build, or silently produced
+    a different pool. So select on the presence of the files this build actually reads,
+    and name what is missing if nothing qualifies."""
+    root = pathlib.Path(HUB) / repo_dir / "snapshots"
+    if not root.is_dir():
+        sys.exit(f"REFUSE: no HF cache at {root}. Download the dataset first.")
+    cands = sorted(x for x in root.iterdir() if x.is_dir())
+    for snap in cands:
+        if all((snap / f).is_file() for f in must_contain):
+            return str(snap)
+    have = {x.name: sorted(f.name for f in x.rglob("*") if f.is_file())[:8]
+            for x in cands}
+    sys.exit(f"REFUSE: no snapshot of {repo_dir} has all of {must_contain}.\n"
+             f"  snapshots present: {have}\n"
+             "  This host cannot reproduce the pool. Build it where the files exist and "
+             "copy the JSONL, or download the missing file.")
+
+
+GPQA_SNAP = resolve_snapshot("datasets--Idavidrein--gpqa",
+                             ["gpqa_main.csv", "gpqa_diamond.csv"])
+MBPP_SNAP = resolve_snapshot("datasets--google-research-datasets--mbpp",
+                             ["full/test-00000-of-00001.parquet"])
+HE_SNAP = str(pathlib.Path(resolve_snapshot(
+    "datasets--openai--openai_humaneval",
+    ["openai_humaneval/test-00000-of-00001.parquet"])) / "openai_humaneval")
 
 # lm-eval pins these as the mbpp 3-shot exemplars (eval/tasks/_mbpp_utils.py ->
 # upstream list_fewshot_samples). Resolved by running it, not by reading the docs.

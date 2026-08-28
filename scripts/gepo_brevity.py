@@ -58,6 +58,7 @@ import argparse
 import json
 import os
 import re
+import random
 import statistics as st
 import sys
 import time
@@ -144,6 +145,25 @@ def main() -> int:
                     help="saturation point of the length penalty; 12288 maximises "
                          "measured within-group reward std on the R7 rollouts")
     ap.add_argument("--length-lambda", type=float, default=0.7)
+    # --- run4: reward version + capability replay ---------------------------------
+    # Default stays v1 so run1/run2/run3 reproduce from this file unchanged. v2 is
+    # opt-in; see scripts/gepo_reward_v2.py for the measured reason it exists (v1's
+    # length term owned 11.3% of within-group variance and DECAYED to 0.8% as lengths
+    # converged -- GRPO normalises by group std, so that is 11% of the gradient
+    # falling to ~1%).
+    ap.add_argument("--reward", choices=["v1", "v2"], default="v1")
+    ap.add_argument("--replay-pool", default="",
+                    help="lambda=0 capability-replay pool (build_gepo_replay_pool.py). "
+                         "Empty = no replay. Requires --reward v2: v1 has no "
+                         "reward_kind dispatch and would score every replay row 0.0.")
+    ap.add_argument("--replay-n", type=int, default=0,
+                    help="number of replay problems to mix in (0 = all of them)")
+    ap.add_argument("--replay-seed", type=int, default=0)
+    ap.add_argument("--replay-balance", choices=["equal", "proportional"],
+                    default="equal",
+                    help="how --replay-n is split across reward_kinds. equal = "
+                         "same count per tier (default; the pool ratio is the "
+                         "inverse of the loss ratio it defends)")
     ap.add_argument("--max-completion", type=int, default=16384)
     ap.add_argument("--max-prompt", type=int, default=4096)
     ap.add_argument("--server-max-model-len", type=int, default=24576,
@@ -217,21 +237,102 @@ def main() -> int:
     from scripts.gepo_trainer import GEPOTrainer
 
     tok = AutoTokenizer.from_pretrained(args.model)
-    reward = make_lcb_brevity_reward(tok, budget=args.length_budget,
-                                     lam=args.length_lambda, verifier=verifier,
-                                     log_every=64)
+    if args.reward == "v2":
+        from scripts.gepo_reward_v2 import make_gepo_reward_v2
+        # log_every=8, not 64: the smoke runs ~8-24 rollouts total, and the launcher's
+        # REPLAY_TIER_ALIVE gate READS this line. An interval longer than the smoke
+        # would make a healthy run fail the gate for lack of output.
+        reward = make_gepo_reward_v2(tok, verifier, max_completion=args.max_completion,
+                                     log_every=8)
+        log("REWARD_V2 group-relative brevity + reward_kind dispatch "
+            f"(max_completion={args.max_completion})")
+    else:
+        reward = make_lcb_brevity_reward(tok, budget=args.length_budget,
+                                         lam=args.length_lambda, verifier=verifier,
+                                         log_every=64)
+        log("REWARD_V1 fixed-budget length penalty "
+            f"(budget={args.length_budget} lam={args.length_lambda})")
 
     # ---------------------------------------------------------------- dataset
     rows = load_pool(args.pool, args.limit)
+    for r in rows:                      # LCB rows predate reward_kind; name it explicitly
+        r.setdefault("meta", {}).setdefault("reward_kind", "lcb_exec")
+
+    # --- capability replay ---------------------------------------------------------
+    # GEPO's reward has support ONLY on LCB coding problems, and the paired census
+    # measured what that costs: GPQA -7.58pp (p=0.0167) and HumanEval -3.66pp
+    # (p=0.0312), monotone with dose, and run3 ended -12.99pp vs the untrained base on
+    # LCB itself. Replay rows carry meta.length_lambda=0.0 -> pure correctness, so they
+    # defend capability WITHOUT putting length pressure on the reasoning GEPO erodes.
+    #
+    # Mixed at the ROW level, which is safe: a GRPO group is G rollouts of ONE prompt,
+    # so no group ever spans an LCB and a replay problem, and each tier gets its own
+    # advantage normalisation.
+    n_lcb = len(rows)
+    if args.replay_pool:
+        if args.reward != "v2":
+            sys.exit("REFUSE: --replay-pool requires --reward v2. v1 has no "
+                     "reward_kind dispatch and would silently score every replay row "
+                     "0.0 -- an all-zero tier has no within-group spread, contributes "
+                     "no gradient, and drags the policy while looking healthy.")
+        rrows = load_pool(args.replay_pool, 0)
+        if not rrows:
+            sys.exit(f"REFUSE: replay pool {args.replay_pool} is empty")
+        bad = [r for r in rrows if float(r.get("meta", {}).get("length_lambda", 1.0)) != 0.0]
+        if bad:
+            sys.exit(f"REFUSE: {len(bad)} replay rows carry a nonzero length_lambda -- "
+                     "replay must be a pure correctness gate")
+        random.Random(args.replay_seed).shuffle(rrows)
+        if args.replay_n:
+            # STRATIFY by reward_kind rather than taking a proportional slice. The pool
+            # is 250 mc_letter / 471 mbpp_exec (35/65), but the losses these two tiers
+            # defend run the OTHER way: GPQA -6.57pp vs HumanEval -3.05pp against the
+            # untrained base. A proportional draw would spend most of the replay budget
+            # on the smaller loss. Equal counts is the neutral choice; --replay-balance
+            # proportional restores the pool's own ratio if that is ever wanted.
+            if args.replay_balance == "equal":
+                by: dict[str, list] = {}
+                for r in rrows:
+                    by.setdefault(r["meta"].get("reward_kind", "?"), []).append(r)
+                per = args.replay_n // max(len(by), 1)
+                short = [k for k, v in by.items() if len(v) < per]
+                if short:
+                    sys.exit(f"REFUSE: replay tier(s) {short} have fewer than {per} rows; "
+                             "an equal split is impossible. Lower --replay-n or use "
+                             "--replay-balance proportional.")
+                rrows = [r for k in sorted(by) for r in by[k][:per]]
+                random.Random(args.replay_seed).shuffle(rrows)
+            else:
+                rrows = rrows[:args.replay_n]
+        kinds: dict[str, int] = {}
+        for r in rrows:
+            k = r["meta"].get("reward_kind", "?")
+            kinds[k] = kinds.get(k, 0) + 1
+        rows = rows + rrows
+        random.Random(args.replay_seed).shuffle(rows)
+        log(f"REPLAY_MIX lcb={n_lcb} replay={len(rrows)} {kinds} "
+            f"-> {len(rows)} problems ({len(rrows)/len(rows)*100:.1f}% replay)")
     # `meta` carries lists-of-dicts with heterogeneous keys, which pyarrow will either
     # reject or silently coerce. It travels as a JSON STRING; the reward already
     # json.loads a str meta, which is exactly why that branch exists.
+    # `gold` is a REQUIRED column, not an optional one. TRL forwards every dataset
+    # column to the reward as a list, and the mc_letter verifier scores against gold;
+    # if the column is absent the reward receives gold=None, falls back to "", and
+    # EVERY replay multiple-choice row scores 0.0 -- a silently dead tier. LCB and
+    # MBPP rows carry "" because their verifiers execute tests instead.
     ds = Dataset.from_list([
         {"prompt": [{"role": "user", "content": r["prompt"]}],
-         "meta": json.dumps(r["meta"])}
+         "meta": json.dumps(r["meta"]),
+         "gold": str(r.get("gold") or "")}
         for r in rows
     ])
-    log(f"pool: {len(ds)} problems from {args.pool}")
+    n_gold = sum(1 for r in rows if str(r.get("gold") or ""))
+    n_mc = sum(1 for r in rows if r.get("meta", {}).get("reward_kind") == "mc_letter")
+    if n_mc and n_gold < n_mc:
+        sys.exit(f"REFUSE: {n_mc} mc_letter rows but only {n_gold} carry a gold answer. "
+                 "Those rows would score 0.0 for every rollout regardless of the model.")
+    log(f"pool: {len(ds)} problems from {args.pool}"
+        + (f" (+replay; {n_mc} mc_letter rows, all with gold)" if n_mc else ""))
 
     # `return_dict=False` is load-bearing. transformers 5.5.0 returns a BatchEncoding
     # from apply_chat_template(tokenize=True), so len() counts its KEYS -- it reports 2
@@ -412,6 +513,14 @@ def main() -> int:
     meta = {"task": "R9 GEPO brevity", "model": args.model, "pool": args.pool,
             "n_problems": len(ds), "gepo": bool(trainer.gepo),
             "length_budget": args.length_budget, "length_lambda": args.length_lambda,
+            # The reward function IS a basis: a v1 row and a v2 row are not comparable
+            # on reward, mean_length or clipped_ratio, because v2 changes what those
+            # numbers mean. Recorded so the two can never be silently tabled together.
+            "reward": args.reward,
+            "replay": ({"pool": args.replay_pool, "n": len(rows) - n_lcb,
+                        "n_lcb": n_lcb, "seed": args.replay_seed,
+                        "frac": round((len(rows) - n_lcb) / max(len(rows), 1), 4)}
+                       if args.replay_pool else None),
             "max_completion": args.max_completion, "num_generations": args.num_generations,
             "grad_accum": args.grad_accum, "beta": args.beta, "lr": args.lr,
             "epochs": args.epochs, "seed": args.seed,
