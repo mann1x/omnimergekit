@@ -263,8 +263,17 @@ for ln in open(sys.argv[1], errors="ignore"):
     if re.search(r"lcb=([1-9]\d*)", seg):
         exp.add("lcb_exec")
     exp.update(re.findall(r"'(\w+)':\s*[1-9]", seg))
-print("REPLAY_TIERS(union over %d line(s)) " % lines
-      + " ".join("%s(n=%d,nz=%d)" % (k, d["n"], d["nz"]) for k, d in sorted(agg.items()))
+# G is needed to turn a rollout count into a PROBLEM count. nz=0 over one problem is a
+# hard problem; nz=0 over several is a dead tier, and the message must not conflate them.
+G = 0
+for ln in open(sys.argv[1], errors="ignore"):
+    m = re.search(r"GROUPS_OK.*\(G=(\d+)\)", ln)
+    if m:
+        G = int(m.group(1))
+print("REPLAY_TIERS(union over %d line(s), G=%s) " % (lines, G or "?")
+      + " ".join("%s(n=%d,nz=%d,problems=%s)"
+                 % (k, d["n"], d["nz"], (d["n"] // G) if G else "?")
+                 for k, d in sorted(agg.items()))
       + "  EXPECTED=%s" % (sorted(exp) or "<no census line>"))
 # The reward tags tiers as reward_kind/T|N; REPLAY_MIX (older, replay-pool path) knows
 # only the bare kind. Match a SUFFIXED expectation exactly and a BARE one against any
@@ -284,9 +293,21 @@ if not exp and len(agg) < 2:
              "logged, so the expected set is unknown. Refusing on an unprovable "
              "basis." % len(agg))
 if dead:
-    sys.exit("REPLAY_GATE_FAIL: tier(s) %s produced ZERO non-zero rewards -- no "
-             "within-group spread, no gradient, and they would drag the policy for the "
-             "whole run while grad_norm stays healthy from the other tier." % dead)
+    # SINGLE-PROBLEM nz=0 is not evidence of a dead tier. A GRPO group is G rollouts of
+    # ONE prompt, so nz=0 over one problem says only "the model got that problem wrong",
+    # which for a hard GPQA item is the expected outcome, not a wiring fault. Aborting a
+    # 41h run on it is a false positive. Over several problems it is a real signal.
+    # [[feedback_gate_scope_must_match_sample_size]]
+    thin = [k for k in dead if G and agg[k]["n"] // G < 2]
+    if thin:
+        sys.exit("REPLAY_GATE_FAIL: tier(s) %s scored zero, but each was backed by only "
+                 "ONE problem at G=%d -- that cannot distinguish a dead tier from a hard "
+                 "problem, so the gate refuses to rule either way. Re-run the smoke with "
+                 "--limit-per-tier >= 2." % (thin, G))
+    sys.exit("REPLAY_GATE_FAIL: tier(s) %s produced ZERO non-zero rewards across %s "
+             "problems each -- no within-group spread, no gradient, and they would drag "
+             "the policy for the whole run while grad_norm stays healthy from the other "
+             "tier." % (dead, {k: agg[k]["n"] // G for k in dead} if G else "?"))
 print("REPLAY_TIER_ALIVE_OK")
 PYGATE
 }
@@ -318,7 +339,12 @@ if [ "$SKIP_SMOKE" = "0" ]; then
   # tier gate would then certify only the tiers that happened to be drawn -- passing
   # while saying nothing about the three it never saw.
   if [ -n "$POOL" ]; then
-    SMOKE_LIMIT=(--limit-per-tier 1); SMOKE_MAXCOMP="$MAXCOMP"
+    # THREE problems per tier, not one. One problem cannot establish that a tier is
+    # alive: a GRPO group is G rollouts of a SINGLE prompt, so a hard problem yields
+    # nz=0 for reasons that have nothing to do with wiring. Measured 2026-08-28: the
+    # first smoke of the mixed pool aborted on mc_letter nz=0 from exactly one hard
+    # Biology item. Costs ~50 min instead of ~25 on a 41h run.
+    SMOKE_LIMIT=(--limit-per-tier "${SMOKE_PER_TIER:-3}"); SMOKE_MAXCOMP="$MAXCOMP"
   fi
   launch "$SMOKE_LOG" "$W/$SMOKE_LOG" \
       --max-completion "$SMOKE_MAXCOMP" --num-generations 4 --grad-accum 4 \
