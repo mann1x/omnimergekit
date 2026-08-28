@@ -252,9 +252,23 @@ if [ "$SKIP_SMOKE" = "0" ]; then
   # point of the gate below. Without it the smoke would pull all $REPLAY_N replay rows
   # and stop being a smoke.
   SMOKE_EXTRA=()
-  if [ -n "$REPLAY_POOL" ]; then SMOKE_EXTRA+=(--replay-n 4); fi
+  # The smoke's completion cap must be one the REPLAY tiers can actually finish under,
+  # or the tier gate below measures the cap instead of the tier. 2026-08-28: run4's
+  # second smoke ran at 2048 and both replay tiers came back clipped=1.000, pass=0.000,
+  # nz=0 -- every GPQA chain-of-thought and every MBPP solution truncated before it
+  # could emit an answer, so the verifier saw nothing and scored 0. lcb_exec survived
+  # the same cap (nz=3) only because a truncated LCB passer is censored to 0.1 rather
+  # than failed, which is exactly the asymmetry that makes a shared small cap
+  # unreadable. [[feedback_cap_asymmetry_turns_a_bench_into_a_length_meter]]
+  #
+  # So when a replay pool is in play the smoke runs at the FULL budget. It costs real
+  # minutes, and it buys the one thing the 25-30h run rests on: evidence that replay
+  # rows CAN score at the budget the run will actually use. A cheaper smoke that
+  # cannot answer that question is not cheaper, it is uninformative.
+  SMOKE_MAXCOMP=2048
+  if [ -n "$REPLAY_POOL" ]; then SMOKE_EXTRA+=(--replay-n 4); SMOKE_MAXCOMP="$MAXCOMP"; fi
   launch "$SMOKE_LOG" "$W/$SMOKE_LOG" \
-      --max-completion 2048 --num-generations 4 --grad-accum 4 \
+      --max-completion "$SMOKE_MAXCOMP" --num-generations 4 --grad-accum 4 \
       --limit 2 --epochs 1 --save-steps 1000 \
       ${SMOKE_EXTRA[@]+"${SMOKE_EXTRA[@]}"}
   gate_learned "$W/${SMOKE_LOG}.log" || { say "FATAL: smoke did not learn"; exit 4; }
