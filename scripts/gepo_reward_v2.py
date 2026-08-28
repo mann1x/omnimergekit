@@ -66,11 +66,15 @@ in the loss curve, which is why it is a hard error here.
 from __future__ import annotations
 
 import json
+import os
 import re
 import statistics as st
 import subprocess
 import sys
 from typing import Any
+
+# DDP rank, so a per-rank tier view is never mistaken for the population.
+RANK = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
 
 BASE = 0.6            # reward of a median-length passing rollout
 ALPHA = 0.4           # half-range of the length term among passers
@@ -281,7 +285,10 @@ def make_gepo_reward_v2(tokenizer, lcb_verifier, max_completion: int,
         # policy -- and the total grad_norm stays non-zero from the LCB tier alone, so
         # no aggregate gate can see it. `nz` (rollouts with reward > 0) is the number
         # the launcher's REPLAY_TIER_ALIVE gate reads back.
+        new_kind = False
         for k, r_i in zip(kind_f, rewards):
+            if k not in state["byk"]:
+                new_kind = True
             d = state["byk"].setdefault(k, {"n": 0, "sum": 0.0, "nz": 0})
             d["n"] += 1
             d["sum"] += r_i
@@ -302,12 +309,26 @@ def make_gepo_reward_v2(tokenizer, lcb_verifier, max_completion: int,
             except Exception:
                 pass
 
-        if log_every and state["n"] // max(log_every, 1) != \
-                (state["n"] - n) // max(log_every, 1):
+        # ALWAYS emit on the first sighting of a new reward_kind, not only on the
+        # interval. 2026-08-28 (bug-641): run4's smoke aborted claiming "only 1 tier
+        # scored" when two had scored and a third was never logged at all. Two
+        # compounding reasons, both of which this line fixes:
+        #   * `state` is PER-RANK and DDP world=2, so one rank's cumulative view is
+        #     not the population -- rank0 had seen mbpp_exec, rank1 lcb_exec.
+        #   * `log_every` SAMPLES. mc_letter scored but never crossed the boundary,
+        #     so no line ever mentioned it.
+        # The launcher's gate reads these lines as its evidence, so a tier that never
+        # prints is indistinguishable from a tier that is dead. Emitting on first
+        # sighting makes every tier that ever scored appear at least once, per rank.
+        # [[feedback_one_log_line_is_not_a_cross_arm_reading]]
+        interval = log_every and state["n"] // max(log_every, 1) != \
+            (state["n"] - n) // max(log_every, 1)
+        if interval or new_kind:
             tiers = " ".join(
                 f"{k}:n={d['n']},mean={d['sum']/max(d['n'],1):.3f},nz={d['nz']}"
                 for k, d in sorted(state["byk"].items()))
-            print(f">>> V2_REWARD n={state['n']} pass={state['pass']/state['n']:.3f} "
+            print(f">>> V2_REWARD rank={RANK} n={state['n']} "
+                  f"pass={state['pass']/state['n']:.3f} "
                   f"mean_tok={state['tok']/state['n']:.0f} "
                   f"clipped={state['clip']/state['n']:.3f} | TIERS {tiers}",
                   flush=True)

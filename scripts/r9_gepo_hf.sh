@@ -180,22 +180,64 @@ PY
 gate_replay_tiers(){
   local log="$1"
   "$PY" - "$log" <<'PYGATE'
+# Aggregate the UNION of every V2_REWARD tier line, across every rank.
+#
+# bug-641 (2026-08-28): this gate used to read only the LAST such line, and aborted
+# run4's smoke claiming "only 1 tier scored" when two had scored and a third had
+# scored but was never logged. The last line is not the population, for two
+# compounding reasons:
+#   * the reward's per-tier state is PER-RANK and DDP runs world=2, so any one line
+#     is one rank's partial view -- rank0 had seen mbpp_exec, rank1 lcb_exec;
+#   * the emitter SAMPLES on log_every, so a tier can score and never print.
+# The emitter now also fires on the first sighting of a new reward_kind, so every
+# tier that ever scored appears at least once; this side takes the union so a tier
+# seen on either rank counts. [[feedback_one_log_line_is_not_a_cross_arm_reading]]
 import re, sys
-line = None
+agg, lines = {}, 0
 for ln in open(sys.argv[1], errors="ignore"):
-    if ">>> V2_REWARD" in ln and "| TIERS " in ln:
-        line = ln.strip()
-if line is None:
+    if ">>> V2_REWARD" not in ln or "| TIERS " not in ln:
+        continue
+    found = re.findall(r"(\w+):n=(\d+),mean=([-\d.]+),nz=(\d+)", ln.split("| TIERS ", 1)[1])
+    if not found:
+        continue
+    lines += 1
+    for k, n, m, z in found:
+        # Per-rank counters are cumulative, so keep the MAX per rank-line rather than
+        # summing across lines of the same rank (which would double-count).
+        d = agg.setdefault(k, {"n": 0, "nz": 0})
+        d["n"] = max(d["n"], int(n))
+        d["nz"] = max(d["nz"], int(z))
+if not agg:
     sys.exit("REPLAY_GATE_FAIL: no V2_REWARD tier line in the smoke log -- either the "
              "v2 reward never ran or it never reached its log interval.")
-found = re.findall(r"(\w+):n=(\d+),mean=([-\d.]+),nz=(\d+)", line)
-if not found:
-    sys.exit("REPLAY_GATE_FAIL: could not parse tiers from: " + line)
-print("REPLAY_TIERS " + " ".join("%s(n=%s,mean=%s,nz=%s)" % t for t in found))
-dead = [k for k, n, m, z in found if int(z) == 0]
-if len(found) < 2:
-    sys.exit("REPLAY_GATE_FAIL: only %d tier(s) scored; the replay pool never reached "
-             "the reward. Check --replay-pool and the REPLAY_MIX log line." % len(found))
+
+# EXPECTED tiers come from the mixer's own census, not from a hardcoded count. The
+# dataset builder logs e.g.
+#   REPLAY_MIX lcb=2 replay=4 {'mc_letter': 2, 'mbpp_exec': 2} -> 6 problems (...)
+# so the gate can check OBSERVED against EXPECTED instead of against ">= 2". A bare
+# count would have passed a log in which mc_letter was mixed in and never scored --
+# asserting a tier alive that was never measured.
+exp = set()
+for ln in open(sys.argv[1], errors="ignore"):
+    if "REPLAY_MIX" not in ln:
+        continue
+    seg = ln.split("REPLAY_MIX", 1)[1]
+    if re.search(r"lcb=([1-9]\d*)", seg):
+        exp.add("lcb_exec")
+    exp.update(re.findall(r"'(\w+)':\s*[1-9]", seg))
+print("REPLAY_TIERS(union over %d line(s)) " % lines
+      + " ".join("%s(n=%d,nz=%d)" % (k, d["n"], d["nz"]) for k, d in sorted(agg.items()))
+      + "  EXPECTED=%s" % (sorted(exp) or "<no REPLAY_MIX line>"))
+dead = [k for k, d in agg.items() if d["nz"] == 0]
+missing = sorted(exp - set(agg))
+if missing:
+    sys.exit("REPLAY_GATE_FAIL: tier(s) %s were MIXED INTO the pool but never scored a "
+             "single rollout. A tier that never reaches the reward is indistinguishable "
+             "from a dead one, and it would burn the run producing no gradient." % missing)
+if not exp and len(agg) < 2:
+    sys.exit("REPLAY_GATE_FAIL: only %d tier(s) scored and no REPLAY_MIX census was "
+             "logged, so the expected set is unknown. Refusing on an unprovable "
+             "basis." % len(agg))
 if dead:
     sys.exit("REPLAY_GATE_FAIL: tier(s) %s produced ZERO non-zero rewards -- no "
              "within-group spread, no gradient, and they would drag the policy for the "
