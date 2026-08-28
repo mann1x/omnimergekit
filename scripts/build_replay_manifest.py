@@ -35,8 +35,10 @@ import sys
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 POOL = REPO / "eval" / "replay" / "gepo_replay_pool.jsonl"
-MANIFEST = REPO / "eval" / "replay" / "gepo_replay_pool.MANIFEST.json"
-MBPP_OUT = REPO / "eval" / "replay" / "gepo_replay_pool.mbpp.jsonl"
+# Output paths are DERIVED from --pool (see --out-prefix). They used to be constants
+# pinned to the replay pool, which meant running this on a second pool would have
+# overwritten the first pool's published record with the second pool's contents --
+# leaving a committed manifest whose sha256 belonged to a file nobody could identify.
 
 # Fields that may never reach a public file for the gated tier.
 GATED_FIELDS = ("prompt", "choices")
@@ -45,6 +47,15 @@ GATED_FIELDS = ("prompt", "choices")
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--pool", default=str(POOL))
+    ap.add_argument("--builder", default="scripts/build_gepo_replay_pool.py",
+                    help="The deterministic builder that reproduces this pool. Recorded "
+                         "in the manifest: it is the ONLY way a reader with legitimate "
+                         "GPQA access can rebuild the withheld rows and check the "
+                         "sha256, so naming the wrong one makes the manifest unusable.")
+    ap.add_argument("--out-prefix", default="",
+                    help="Base path for the outputs. Default: derived from --pool, so "
+                         "each pool gets its own manifest instead of overwriting "
+                         "another pool's.")
     a = ap.parse_args()
 
     p = pathlib.Path(a.pool)
@@ -53,8 +64,21 @@ def main() -> int:
                  f"(python scripts/build_gepo_replay_pool.py)")
     rows = [json.loads(x) for x in p.open() if x.strip()]
     sha = hashlib.sha256(p.read_bytes()).hexdigest()
+    p = p.resolve()
+    prefix = pathlib.Path(a.out_prefix).resolve() if a.out_prefix else \
+        p.with_suffix("")            # eval/replay/gepo_mixed_pool
+    manifest_path = prefix.with_name(prefix.name + ".MANIFEST.json")
+    open_path = prefix.with_name(prefix.name + ".open.jsonl")
 
-    gpqa, mbpp = [], []
+    # PUBLISHABLE vs GATED, decided by tier and nothing else:
+    #   mc_letter  -> GPQA, gated, identity only
+    #   mbpp_exec  -> MBPP, CC-BY-4.0, published in full
+    #   lcb_exec   -> LiveCodeBench, public contest problems, published in full
+    # The mixed pool carries all three, so the older mbpp-only split would have
+    # silently dropped the 128 LCB rows out of the published record -- leaving the
+    # committed artifact describing a pool nobody trained on.
+    PUBLISHABLE = {"mbpp_exec", "lcb_exec"}
+    gpqa, openrows = [], []
     for r in rows:
         kind = (r.get("meta") or {}).get("reward_kind")
         if kind == "mc_letter":
@@ -63,9 +87,10 @@ def main() -> int:
                 "gold": r["gold"],
                 "question_sha256": r["meta"]["question_sha256"],
                 "domain": r["meta"].get("domain", ""),
+                "think": r["meta"].get("think"),
             })
-        elif kind == "mbpp_exec":
-            mbpp.append(r)
+        elif kind in PUBLISHABLE:
+            openrows.append(r)
         else:
             sys.exit(f"REFUSE: unknown reward_kind {kind!r} on {r.get('id')}")
 
@@ -76,12 +101,17 @@ def main() -> int:
                 sys.exit(f"REFUSE: gated field {f!r} leaked into the manifest entry "
                          f"{e['id']} -- this file is published.")
 
+    tiers = {}
+    for r in rows:
+        k = (r.get("meta") or {}).get("reward_kind", "?")
+        k += "/T" if (r.get("meta") or {}).get("think", k == "lcb_exec") else "/N"
+        tiers[k] = tiers.get(k, 0) + 1
     manifest = {
         "pool": p.name,
         "pool_sha256": sha,
         "rows": len(rows),
-        "tiers": {"mc_letter": len(gpqa), "mbpp_exec": len(mbpp)},
-        "builder": "scripts/build_gepo_replay_pool.py",
+        "tiers": dict(sorted(tiers.items())),
+        "builder": a.builder,
         "gate": "scripts/gate_replay_artifact.py",
         "note": ("GPQA tier is listed by identity only (Record ID + gold letter + "
                  "question sha256). GPQA is gated; its question and answer text is "
@@ -89,12 +119,13 @@ def main() -> int:
                  "legitimate GPQA copy to obtain the full pool byte-for-byte."),
         "mc_letter_index": sorted(gpqa, key=lambda e: e["id"]),
     }
-    MANIFEST.write_text(json.dumps(manifest, indent=2) + "\n")
-    MBPP_OUT.write_text("".join(json.dumps(r) + "\n" for r in mbpp))
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    open_path.write_text("".join(json.dumps(r) + "\n" for r in openrows))
     print(f"pool sha256      : {sha[:32]}  rows={len(rows)}")
-    print(f"manifest         : {MANIFEST.relative_to(REPO)}  "
+    print(f"tiers            : {manifest['tiers']}")
+    print(f"manifest         : {manifest_path.relative_to(REPO)}  "
           f"({len(gpqa)} gpqa identities, no gated text)")
-    print(f"mbpp tier (full) : {MBPP_OUT.relative_to(REPO)}  ({len(mbpp)} rows)")
+    print(f"open tiers (full): {open_path.relative_to(REPO)}  ({len(openrows)} rows)")
     return 0
 
 

@@ -111,4 +111,17 @@ eval/lm_eval_tasks/aime100_chat/aime100_chat.yaml
 #     plus the full pool's sha256 and per-tier counts.
 # Anyone with legitimate GPQA access rebuilds the full pool byte-for-byte from the
 # committed deterministic builder and checks it against that sha256.
+#
+# The REBALANCED MIXED POOL (run4 onward) is one file carrying all four tiers, so the
+# same rule applies to it, with one difference: its LCB tier is publishable too, so the
+# open file holds 599 rows (128 lcb_exec + 471 mbpp_exec) rather than mbpp alone.
+#   scripts/build_gepo_mixed_pool.py   -> eval/replay/gepo_mixed_pool.jsonl   WITHHELD
+#   scripts/build_replay_manifest.py   -> .MANIFEST.json + .open.jsonl        COMMITTED
+# Reproduce:
+#   python scripts/build_gepo_mixed_pool.py --lcb 128 --gpqa-nothink 250 \
+#       --mbpp-nothink 371 --mbpp-think 100 -G 8 --hours-budget 45
+#   python scripts/build_replay_manifest.py --pool eval/replay/gepo_mixed_pool.jsonl \
+#       --builder scripts/build_gepo_mixed_pool.py
+# then check the result against pool_sha256 in the committed manifest.
 eval/replay/gepo_replay_pool.jsonl
+eval/replay/gepo_mixed_pool.jsonl

@@ -1,81 +1,89 @@
 #!/usr/bin/env bash
-# R9 run4 -- new reward (v2) + capability replay. The two changes run1-run3 could not make.
+# R9 run4 -- rebalanced mixed pool + reward v2. The run that answers the actual
+# question, after run1-run3 all failed and the control that WORKED was found.
 #
-# WHY run4 EXISTS: run1-3 ALL FAILED, AND THE REASON IS NOW MEASURED
-# ------------------------------------------------------------------
-# The v1 reward was  r = (1 - 0.7*min(ntok/12288,1))  if tests pass  else 0. GRPO
-# normalises advantage by the WITHIN-GROUP std, so what matters is not the reward
-# scale but the share of group variance each term owns. On a realistic group of 8
-# with 5 passers:
-#     total group std     0.3160
-#     std among passers   0.0356   <- the ENTIRE length signal
-#     length share        11.3%
-# ~89% of the gradient said "be correct", ~11% said "be short" -- and that 11% fell
-# to 0.8% when the same group's lengths were 10x smaller, i.e. the signal DIED as the
-# model converged. Measured consequences across three runs:
-#   run2  mean length moved 4% over a full epoch; reward rose mostly because fewer
-#         rollouts were being zeroed by truncation (cliff-avoidance, not concision)
-#   run3  adding the 40 MoE routers to LoRA scope changed nothing for the better:
-#         suite MEAN 0.8882 (LOWEST of armJ/gepo1/gepo2/gepo3), and armJ->gepo3 on
-#         lcb_v6_77q = -12.99pp, 13/3 discordant, McNemar p=0.0213 -- the ONLY one of
-#         six pairwise deltas in the cohort to clear the measured 5.81pp paired SE.
-#         Widening scope is not the lever. [[project_r9_gepo_router_arm_refuted]]
+# THE CONTROL: WHY AN/GEMMA-4-E2B SUCCEEDED AND R9 DID NOT
+# --------------------------------------------------------
+# GEPO is not broken. an-finetune/simpo/train_gepo_v16.sh ran the same algorithm on
+# Gemma-4-E2B and got exactly what was wanted: mean_length 779.8 -> 683.9 (-12.3%)
+# with no score damage. R9 produced COMPARABLE brevity -- run2 moved in-run mean
+# length 6593 -> 6031 (-8.5%), and the served LCB eval showed -12.7% tokens/answer --
+# and still LOST capability. So brevity pressure is not what broke it. Four
+# differences, and the pool and the LR are the ones that can explain a capability
+# loss at constant length:
 #
-# WHAT CHANGES (two things, because you asked for both)
-# -----------------------------------------------------
-# 1. REWARD v2 -- length scored GROUP-RELATIVELY among passing rollouts, on a robust
-#    scale-free statistic: s = clip((median-len)/max(MAD, 2%*median), -1, +1),
-#    r = 0.6 + 0.4*s. Gate-measured length share of within-group variance: 86.5%,
-#    and it STAYS 86.5% at 10x shorter lengths where v1 collapsed to 0.8%.
-#    Invariants preserved and asserted: worst passer (0.2) still beats best failure
-#    (0.0); a truncated rollout is CENSORED -- excluded from the median/MAD and scored
-#    strictly below the uncapped band (0.1) so "hit the cap" can never again be
-#    confused with "was merely longest".
-# 2a. REPLAY IS RENDERED NO-THINK (REPLAY_NO_THINK=1). Measured 2026-08-28: with
-#    thinking ON, GPQA replay rollouts run 16-18k tokens, 2 of 4 never reach an answer
-#    inside 24576, and the tier scores ZERO for every rollout -- attempt 3's smoke had
-#    mc_letter 8/8 clipped at the 12288 budget. Raising the cap is not available: ~18k
-#    is needed, half never answer at any budget, the trainer already sat at 83/92 GB of
-#    ~96 GB at G=8, and a G=8 GPQA group costs ~45 min (32 of them = ~24 h of a 25-30 h
-#    run). With thinking OFF the same prompts answer 12/12 at p50 1595 tokens, 9/12
-#    correct -- fits the existing budget, ~10x cheaper, and gives the correct/incorrect
-#    mix GRPO needs.
-#    This is NOT a departure from what we score: the served GPQA eval already runs at
-#    thinking_est p50=0 with completion p50 ~800 on EVERY arm (armJ 83.33 / gepo1 79.80
-#    / gepo2 75.76 / gepo3 76.77), and completion length is FLAT across that dose series
-#    (804 -> 785) while the score falls 7.6pp -- so the GPQA loss is not a length effect
-#    and the tier is defending accuracy, which is exactly what a lambda=0 correctness
-#    gate trains. [[project_gpqa_cot_needs_16k_on_armj]]
-#    LCB rows are unchanged: they render byte-identical to before.
+#   axis            AN (worked)                 R9 run1-3 (failed)
+#   pool            894 rows, 3 sources         128 rows, LCB ONLY
+#   LR              1e-6                        5e-6            (5x)
+#   temperature     0.9                         0.6
+#   len/budget      779/512 = 1.52 (steep)      6031/12288 = 0.49 (shallow)
 #
-# 2. REPLAY -- 64 lambda=0 problems mixed in, EQUAL split across the two tiers
-#    (32 mc_letter from GPQA-main-minus-Diamond, 32 mbpp_exec from MBPP-minus-test).
-#    Pure correctness, no length term: replay defends capability, and putting length
-#    pressure on the reasoning GEPO already erodes is exactly backwards. The pool ratio
-#    (35/65) is the INVERSE of the loss ratio it defends (GPQA -6.57pp vs HE -3.05pp),
-#    hence --replay-balance equal rather than a proportional slice.
+# A 5x learning rate on a 7x smaller SINGLE-DOMAIN pool is a drift story, not a
+# brevity story, and the measured evidence agrees: the benches that lost the most had
+# FLAT completion lengths across the whole dose series.
+#   bench        armJ -> gepo2     completion p50    thinking_est
+#   GPQA         83.33 -> 75.76    804 -> 792        p50 = 0
+#   HumanEval    98.17 -> 94.51    220 -> 223        max = 0
+#   HumanEval+   89.63 -> 87.80    226 -> 220        max = 0
+# Scores fell while lengths did not move. Whatever cost 7.58pp of GPQA, it was not
+# the model being shorter. [[project_r9_gepo_router_arm_refuted]]
 #
-# SCOPE GOES BACK TO run2's. --router-lora is OFF: run3 tested it and it lost. That
-# also restores lora_dropout 0.05, so run4 vs run2 differs in reward and replay only.
+# WHAT CHANGES, AND WHY EACH ONE
+# ------------------------------
+# 1. POOL: one mixed 849-row pool (build_gepo_mixed_pool.py), matched to AN's 894.
+#      lcb_exec  /think    128  lambda=0.7   <- unchanged from run2/3, so the brevity
+#                                               signal is not diluted and the run2
+#                                               comparison still holds
+#      mbpp_exec /no-think 371  lambda=0
+#      mbpp_exec /think    100  lambda=0     <- DISJOINT problems from the no-think
+#                                               slice; the same problem in both is one
+#                                               problem at double weight, not two
+#      mc_letter /no-think 250  lambda=0
+#    27% of rows carry thinking. BOTH modes are trained because neither uniform choice
+#    is defensible: an all-thinking pool leaves mc_letter scoring ZERO for every
+#    rollout (measured 2026-08-28: GPQA rollouts run 16-18k tokens and 2 of 4 never
+#    answer inside 24576, and attempt 3's smoke had mc_letter 8/8 clipped), and an
+#    all-no-think pool trains the model out of thinking altogether.
+#    mc_letter is no-think ONLY -- 16-18k at G=8 does not fit 96 GB or the wall clock
+#    at any budget, and half never answer regardless. That is not a departure from
+#    what we score: the served GPQA eval already runs at thinking_est p50=0 with
+#    completion p50 ~800 on EVERY arm.
 #
-# TWO VARIABLES, BUT THEY ARE SEPARABLE BY WHICH METRIC MOVES:
-#   brevity (LCB tok/answer, clipped_ratio) is what the REWARD is supposed to fix
-#   capability (GPQA, HumanEval vs armJ)   is what REPLAY is supposed to hold
-# A result where brevity improves and capability holds needs no ablation to read. A
-# result where only one moves points at which change did it. Only a result where both
-# move the WRONG way is ambiguous, and that outcome would end this line of attack
-# anyway.
+# 2. REWARD v2: length scored GROUP-RELATIVELY among passing rollouts on a robust
+#    scale-free statistic, s = clip((median-len)/max(MAD, 2%*median), -1, +1),
+#    r = 0.6 + 0.4*s. v1 put ~11% of within-group variance on length, falling to 0.8%
+#    as lengths shrank -- the signal DIED as the model converged. v2 measures 86.5%,
+#    and still 86.5% at 10x shorter lengths. Truncated rollouts are CENSORED: excluded
+#    from the median/MAD and scored strictly below the uncapped band, so "hit the cap"
+#    can never be confused with "was merely longest".
+#    [[feedback_cap_asymmetry_turns_a_bench_into_a_length_meter]]
 #
-# GATES BEFORE THE LONG LEG
-#   1. gate_learned      -- non-zero grad_norm AND reward_std (as run1-3)
-#   2. REPLAY_TIER_ALIVE -- the smoke must show BOTH tiers producing reward, not just
-#      LCB. An unwired tier scores 0.0 for every rollout: no within-group spread, no
-#      gradient, and it drags the policy while the loss curve looks perfectly normal.
-#      gate_learned cannot see this -- the LCB tier alone keeps grad_norm non-zero.
+# 3. LR 5e-6 -> 1e-6 and TEMPERATURE 0.6 -> 0.9, both taken from the AN control.
 #
-# WALL CLOCK: 128 LCB + 64 replay = 192 problems vs run2/3's 128, so ~48 generation
-# steps instead of 32. LCB groups dominate cost (~1900s each); MBPP groups are much
-# cheaper and GPQA sits between. Estimate 25-30h, i.e. LONGER than run3's 20h23m.
+# WHAT IS DELIBERATELY UNCHANGED: lambda 0.7, budget 12288, beta 0.02, G=8, r/alpha
+# 32/64, dropout 0.05, and ROUTER_LORA=0 -- run3 tested widening LoRA scope to the 40
+# MoE routers and it LOST (suite mean 0.8882, lowest of all four arms; armJ->gepo3 on
+# lcb_v6_77q -12.99pp, McNemar p=0.0213, the only one of six pairwise deltas in the
+# cohort to clear the measured 5.81pp paired SE). Scope is not the lever.
+#
+# THIS RUN CHANGES THREE THINGS AT ONCE (pool, reward, LR+temp). That is deliberate
+# and it is not an ablation: run1-3 already established that changing ONE thing at a
+# time on a 128-row LCB-only pool loses. The question now is whether the configuration
+# the AN control says should work, works. If it does, the ablation is worth 60h. If it
+# does not, this line of attack is finished and no ablation would rescue it.
+#
+# GATES BEFORE THE 41h LEG
+#   1. artifact contamination gate on the mixed pool, on THIS host
+#   2. gate_learned      -- non-zero grad_norm AND reward_std
+#   3. REPLAY_TIER_ALIVE -- all FOUR tiers must produce a non-zero reward. The smoke
+#      draws one problem per tier (--limit-per-tier 1) at the FULL 12288 budget,
+#      because a 2048-capped smoke starved the replay tiers into clipped=1.000/nz=0
+#      and proved nothing (bug-643).
+#
+# WALL CLOCK: priced at 12.66M generated tokens / 307k tok/h (run2's realised rate)
+# = ~41h. Steps = 849 / (per_device 1 * accum 16 * world 2) = ~26, so SAVE_STEPS=2
+# gives ~13 checkpoints. SAVE_STEPS=8 would have given 3 across 41h -- and on run2/3's
+# 4-step epochs it produced NO intermediate checkpoint at all.
 set -uo pipefail
 
 REPO=/srv/ml/repos/omnimergekit
@@ -83,20 +91,18 @@ REPO=/srv/ml/repos/omnimergekit
 exec env \
   RUN=run4 \
   REWARD=v2 \
-  REPLAY_POOL="$REPO/eval/replay/gepo_replay_pool.jsonl" \
-  REPLAY_N=64 \
-  REPLAY_BALANCE=equal \
-  REPLAY_NO_THINK=1 \
-  REPLAY_DIFFICULTY="$REPO/eval/replay/gepo_replay_pool.DIFFICULTY.json" \
+  POOL="$REPO/eval/replay/gepo_mixed_pool.jsonl" \
+  POOL_LIMIT=0 \
+  REPLAY_DIFFICULTY="${REPLAY_DIFFICULTY:-}" \
   ROUTER_LORA=0 \
-  POOL_LIMIT=128 \
   MAXCOMP=12288 \
   BUDGET=12288 \
   LAMBDA=0.7 \
   G=8 \
   ACCUM=16 \
-  LR=5e-6 \
+  LR=1e-6 \
+  TEMPERATURE=0.9 \
   BETA=0.02 \
   EPOCHS=1 \
-  SAVE_STEPS=8 \
+  SAVE_STEPS=2 \
   bash "$(dirname "$0")/r9_gepo_hf.sh" "$@"

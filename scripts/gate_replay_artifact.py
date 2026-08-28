@@ -41,7 +41,11 @@ import re
 import sys
 
 HUB = "/root/.cache/huggingface/hub"
-KNOWN_KINDS = {"mc_letter", "mbpp_exec"}
+# lcb_exec is legitimate here: the rebalanced run4 pool is ONE file carrying the
+# LCB tier alongside the replay tiers, so a gate that rejected lcb_exec would
+# reject the artifact it exists to certify. The invariant that actually matters is
+# not "no LCB rows" but "length pressure on LCB and ONLY on LCB", checked below.
+KNOWN_KINDS = {"mc_letter", "mbpp_exec", "lcb_exec"}
 MBPP_FEWSHOT_IDS = {2, 3, 4}          # lm-eval's pinned 3-shot exemplars
 EXPECT = {"diamond": 198, "mbpp_test": 500, "humaneval": 164}
 
@@ -174,8 +178,14 @@ def main() -> int:
         kinds[(r.get("meta") or {}).get("reward_kind", "MISSING")] = \
             kinds.get((r.get("meta") or {}).get("reward_kind", "MISSING"), 0) + 1
     check("all reward_kinds known", set(kinds) <= KNOWN_KINDS, str(kinds))
-    check("all length_lambda == 0.0",
-          all((r.get("meta") or {}).get("length_lambda") == 0.0 for r in rows))
+    # A replay row with length pressure is not defending capability -- it is adding to
+    # the brevity signal that already cost -12.99pp on LCB in run3. An LCB row WITHOUT
+    # it is inert for the thing the run is trying to measure. Both directions fail.
+    bad_lam = [r["id"] for r in rows
+               if (float((r.get("meta") or {}).get("length_lambda", 0.0)) != 0.0)
+               != ((r.get("meta") or {}).get("reward_kind") == "lcb_exec")]
+    check("length pressure is on lcb_exec and ONLY on lcb_exec", not bad_lam,
+          f"{len(bad_lam)} offending rows{(' e.g. ' + str(bad_lam[:3])) if bad_lam else ''}")
     mc = [r for r in rows if (r.get("meta") or {}).get("reward_kind") == "mc_letter"]
     mb = [r for r in rows if (r.get("meta") or {}).get("reward_kind") == "mbpp_exec"]
     check("mc_letter rows carry a gold letter",

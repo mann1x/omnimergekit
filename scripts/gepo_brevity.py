@@ -132,6 +132,66 @@ def load_pool(path: str, limit: int = 0) -> list[dict]:
     return rows
 
 
+
+def apply_difficulty(rows, prof_path, G, pool_desc):
+    """Drop rows MEASURED unanimous at G. Applies to the WHOLE assembled pool.
+
+    This used to live inside the --replay-pool branch, which was wrong the moment a
+    single mixed pool (LCB + replay in one file, passed as --pool) became the shape we
+    train on: --replay-difficulty would have been accepted, recorded in run_meta, and
+    silently done NOTHING. Filtering the assembled pool instead is also strictly more
+    correct -- an LCB problem the model passes 8/8 is exactly as gradient-free as an
+    MBPP one, and unprofiled rows are kept, so LCB is untouched until someone profiles
+    it."""
+    prof = json.loads(Path(prof_path).read_text())
+    miss = [r["id"] for r in rows if r["id"] not in prof]
+    if len(miss) == len(rows):
+        sys.exit(f"REFUSE: no row of {pool_desc} appears in "
+                 f"{prof_path}. The profile does not describe this "
+                 "pool, so it cannot be used to select from it.")
+    gp = {v.get("G") for v in prof.values()}
+    if gp != {G}:
+        sys.exit(f"REFUSE: difficulty profile was measured at G={sorted(gp)} but "
+                 f"this run uses G={G}. Unanimity is a "
+                 "property OF the group size; the profile does not transfer.")
+    # An UNPROFILED row is KEPT. Absence of evidence is not evidence of
+    # unanimity, and dropping on absence would silently delete an entire tier
+    # whenever profiling was partial -- e.g. profiling only the saturated tier,
+    # which is the sensible way to spend the measurement budget. Only rows
+    # MEASURED unanimous are dropped.
+    keep = [r for r in rows
+            if r["id"] not in prof or not prof[r["id"]]["unanimous"]]
+    drop_u = len(rows) - len(keep)
+    kept_unprofiled = sum(1 for r in keep if r["id"] not in prof)
+    # Key the wipeout check on the /T|/N TIER, not the bare reward_kind: the mixed
+    # pool carries mbpp_exec in both thinking modes, and the filter erasing all 100
+    # thinking rows while the 371 no-think rows survive would leave the bare-kind
+    # count healthy and the thinking slice gone.
+    by_t: dict[str, list[int]] = {}
+    for r in rows:
+        k = r["meta"].get("reward_kind", "?")
+        k += "/T" if r["meta"].get("think", k == "lcb_exec") else "/N"
+        by_t.setdefault(k, [0, 0])
+        by_t[k][0] += 1
+        if r["id"] in prof and prof[r["id"]]["unanimous"]:
+            by_t[k][1] += 1
+    log(f"REPLAY_DIFFICULTY kept {len(keep)}/{len(rows)} "
+        f"({drop_u} measured-unanimous at G={G} dropped, "
+        f"{kept_unprofiled} kept unprofiled) | per tier: "
+        + " ".join(f"{k}:{v[0]-v[1]}/{v[0]}" for k, v in sorted(by_t.items())))
+    # A tier wiped out by the filter is worse than no filter: it removes the
+    # capability being defended. Refuse rather than train a missing tier.
+    gone = [k for k, v in by_t.items() if v[0] and v[0] == v[1]]
+    if gone:
+        sys.exit(f"REFUSE: difficulty filter removes EVERY row of tier(s) "
+                 f"{gone}. That deletes the capability the tier defends. Profile "
+                 "a wider slice, or drop --replay-difficulty and accept the "
+                 "KL-anchor-only tier.")
+    if not keep:
+        sys.exit("REFUSE: every replay row is unanimous at "
+                 f"G={G}.")
+    return keep
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -140,6 +200,16 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--vllm-base-url", default="http://127.0.0.1:8477")
     ap.add_argument("--limit", type=int, default=0, help="0 = whole pool")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Build the pool, render it, run every startup gate, then exit "
+                         "before loading the model. CPU-only preflight.")
+    ap.add_argument("--limit-per-tier", type=int, default=0,
+                    help="0 = off. Keep N problems of EACH reward_kind/think tier. "
+                         "The smoke needs this: --limit takes the first N rows of a "
+                         "shuffled mixed pool, which on a 4-tier pool is very likely "
+                         "2 rows of the same tier -- and the tier gate then certifies "
+                         "only the tiers that happened to be drawn, which is the "
+                         "opposite of what it exists for.")
     # --- the two measured knobs -------------------------------------------------
     ap.add_argument("--length-budget", type=int, default=12288,
                     help="saturation point of the length penalty; 12288 maximises "
@@ -309,50 +379,9 @@ def main() -> int:
         # The criterion is unanimity at G, not p ~= 0.5: P(group not unanimous) =
         # 1 - p^G - (1-p)^G, which at G=8 is still 0.57 for p=0.9. Only p pinned at 1.0
         # or 0.0 is genuinely dead, so a p~=0.5 band would discard most of a usable pool.
-        if args.replay_difficulty:
-            prof = json.loads(Path(args.replay_difficulty).read_text())
-            miss = [r["id"] for r in rrows if r["id"] not in prof]
-            if len(miss) == len(rrows):
-                sys.exit(f"REFUSE: no row of {args.replay_pool} appears in "
-                         f"{args.replay_difficulty}. The profile does not describe this "
-                         "pool, so it cannot be used to select from it.")
-            gp = {v.get("G") for v in prof.values()}
-            if gp != {args.num_generations}:
-                sys.exit(f"REFUSE: difficulty profile was measured at G={sorted(gp)} but "
-                         f"this run uses G={args.num_generations}. Unanimity is a "
-                         "property OF the group size; the profile does not transfer.")
-            # An UNPROFILED row is KEPT. Absence of evidence is not evidence of
-            # unanimity, and dropping on absence would silently delete an entire tier
-            # whenever profiling was partial -- e.g. profiling only the saturated tier,
-            # which is the sensible way to spend the measurement budget. Only rows
-            # MEASURED unanimous are dropped.
-            keep = [r for r in rrows
-                    if r["id"] not in prof or not prof[r["id"]]["unanimous"]]
-            drop_u = len(rrows) - len(keep)
-            kept_unprofiled = sum(1 for r in keep if r["id"] not in prof)
-            by_t: dict[str, list[int]] = {}
-            for r in rrows:
-                k = r["meta"].get("reward_kind", "?")
-                by_t.setdefault(k, [0, 0])
-                by_t[k][0] += 1
-                if r["id"] in prof and prof[r["id"]]["unanimous"]:
-                    by_t[k][1] += 1
-            log(f"REPLAY_DIFFICULTY kept {len(keep)}/{len(rrows)} "
-                f"({drop_u} measured-unanimous at G={args.num_generations} dropped, "
-                f"{kept_unprofiled} kept unprofiled) | per tier: "
-                + " ".join(f"{k}:{v[0]-v[1]}/{v[0]}" for k, v in sorted(by_t.items())))
-            # A tier wiped out by the filter is worse than no filter: it removes the
-            # capability being defended. Refuse rather than train a missing tier.
-            gone = [k for k, v in by_t.items() if v[0] and v[0] == v[1]]
-            if gone:
-                sys.exit(f"REFUSE: difficulty filter removes EVERY row of tier(s) "
-                         f"{gone}. That deletes the capability the tier defends. Profile "
-                         "a wider slice, or drop --replay-difficulty and accept the "
-                         "KL-anchor-only tier.")
-            if not keep:
-                sys.exit("REFUSE: every replay row is unanimous at "
-                         f"G={args.num_generations}.")
-            rrows = keep
+        rrows = apply_difficulty(rrows, args.replay_difficulty,
+                                 args.num_generations, args.replay_pool) \
+            if args.replay_difficulty else rrows
         random.Random(args.replay_seed).shuffle(rrows)
         if args.replay_n:
             # STRATIFY by reward_kind rather than taking a proportional slice. The pool
@@ -411,7 +440,63 @@ def main() -> int:
     # off it answers 12/12 at p50 1595 tokens, 9/12 correct. That is not a departure
     # from what we score: the served GPQA eval already runs at thinking_est p50=0 and
     # completion p50 ~800 on every arm. [[project_gpqa_cot_needs_16k_on_armj]]
-    if args.replay_no_think:
+    # Per-row thinking. The mixed pool (build_gepo_mixed_pool.py) declares meta.think
+    # on EVERY row, because neither uniform choice works: an all-thinking pool leaves
+    # mc_letter scoring zero for every rollout (GPQA needs 16-18k tokens and half never
+    # answer inside 24576), and an all-no-think pool would train the model out of
+    # thinking altogether. Pre-rendering is therefore switched on by the DATA, not only
+    # by the flag -- a pool carrying think=False rows that was rendered conversationally
+    # would silently give those rows thinking anyway.
+    # CENSUS of what is actually about to be trained, emitted on EVERY path. The tier
+    # gate derives its expected-tier set from this line; the older REPLAY_MIX line only
+    # exists when --replay-pool is used, so a single mixed pool (LCB + replay in one
+    # file, passed as --pool) would leave the gate with no expectation and silently
+    # weaken it to "at least two tiers scored" -- which a pool of four tiers can pass
+    # while two of them are dead.
+    # STRATIFIED limit, applied after assembly so it sees every tier in play.
+    if args.limit_per_tier:
+        by_t: dict[str, list] = {}
+        for r in rows:
+            k = r["meta"].get("reward_kind", "?")
+            k += "/T" if r["meta"].get("think", k == "lcb_exec") else "/N"
+            by_t.setdefault(k, []).append(r)
+        short = {k: len(v) for k, v in by_t.items() if len(v) < args.limit_per_tier}
+        if short:
+            sys.exit(f"REFUSE: --limit-per-tier {args.limit_per_tier} but tier(s) "
+                     f"{short} have fewer rows. A smoke that silently under-fills a "
+                     "tier proves nothing about it.")
+        rows = [r for k in sorted(by_t) for r in by_t[k][:args.limit_per_tier]]
+        random.Random(args.replay_seed).shuffle(rows)
+        log(f"LIMIT_PER_TIER {args.limit_per_tier} -> {len(rows)} problems "
+            f"across {len(by_t)} tiers: {sorted(by_t)}")
+
+    # Single mixed pool: filter here, because there is no replay branch to do it in.
+    # The two-pool path filters BEFORE its stratified --replay-n draw (selecting from
+    # an unfiltered list and filtering after would silently return fewer rows than
+    # asked for), so it must not run again here.
+    if args.replay_difficulty and not args.replay_pool:
+        rows = apply_difficulty(rows, args.replay_difficulty,
+                                args.num_generations, args.pool)
+
+    census: dict[str, int] = {}
+    for r in rows:
+        k = r["meta"].get("reward_kind", "?")
+        k += "/T" if r["meta"].get("think", k == "lcb_exec") else "/N"
+        census[k] = census.get(k, 0) + 1
+    log("POOL_CENSUS " + json.dumps(dict(sorted(census.items())))
+        + f" -> {len(rows)} problems")
+
+    # SAME default as the census and the renderer. Defaulting to True here instead
+    # would leave a legacy replay pool (no think field, reward_kind=mbpp_exec) counted
+    # as /N by the census while nothing forced pre-rendering -- and the cross-check
+    # that would catch it lives inside the branch that never runs.
+    row_think = [bool(r["meta"].get("think",
+                                    r["meta"].get("reward_kind", "lcb_exec") == "lcb_exec"))
+                 for r in rows]
+    if not all(row_think) and not args.replay_no_think:
+        log(f"PRERENDER forced by pool: {row_think.count(False)}/{len(rows)} rows "
+            "declare meta.think=false")
+    if args.replay_no_think or not all(row_think):
         probe = [{"role": "user", "content": "probe"}]
         d_on = tok.apply_chat_template(probe, add_generation_prompt=True, tokenize=False)
         d_off = tok.apply_chat_template(probe, add_generation_prompt=True, tokenize=False,
@@ -427,8 +512,11 @@ def main() -> int:
             f"(delta {len(d_on)} vs {len(d_off)} chars)")
 
         def render(r):
-            kw = {} if r["meta"].get("reward_kind", "lcb_exec") == "lcb_exec" \
-                else {"enable_thinking": False}
+            # meta.think wins when present; otherwise fall back to the old rule
+            # (lcb thinks, replay does not) so pools predating the field still work.
+            think = r["meta"].get("think",
+                                  r["meta"].get("reward_kind", "lcb_exec") == "lcb_exec")
+            kw = {} if think else {"enable_thinking": False}
             return tok.apply_chat_template([{"role": "user", "content": r["prompt"]}],
                                            add_generation_prompt=True, tokenize=False,
                                            **kw)
@@ -439,8 +527,21 @@ def main() -> int:
             for r in rows
         ])
         n_nt = sum(1 for r in rows
-                   if r["meta"].get("reward_kind", "lcb_exec") != "lcb_exec")
-        log(f"PRERENDER text prompts: {len(ds)} rows, {n_nt} rendered no-think")
+                   if not r["meta"].get(
+                       "think",
+                       r["meta"].get("reward_kind", "lcb_exec") == "lcb_exec"))
+        # The census and the renderer must agree. They are computed from the same field
+        # but by different code, and the failure they disagree on is silent: a row that
+        # SHOULD render no-think but renders with thinking is not an error, it is just
+        # a longer rollout that blows its budget and scores zero -- which reads exactly
+        # like a hard problem. Cross-checking them makes that divergence loud.
+        n_nt_census = sum(v for k, v in census.items() if k.endswith("/N"))
+        if n_nt != n_nt_census:
+            sys.exit(f"REFUSE: {n_nt} rows rendered no-think but the census counts "
+                     f"{n_nt_census}. The renderer and the census disagree about "
+                     "meta.think, so the pool being trained is not the pool declared.")
+        log(f"PRERENDER text prompts: {len(ds)} rows, {n_nt} rendered no-think "
+            f"(census agrees)")
     else:
         ds = Dataset.from_list([
             {"prompt": [{"role": "user", "content": r["prompt"]}],
@@ -486,6 +587,17 @@ def main() -> int:
                  f"the run.")
     log(f"CTX_BUDGET_OK {max(plen)} prompt + {args.max_completion} completion "
         f"<= {args.server_max_model_len}")
+
+    # Everything above this line is pool construction, rendering and the startup
+    # refusals. Everything below loads a 27B model onto two GPUs. --dry-run stops here
+    # so the whole preflight can be exercised on CPU, while the GPUs are busy, before
+    # a 41h run commits to them. A REFUSE found here costs seconds; the same REFUSE
+    # found after the model load costs a GPU slot and several minutes, and after the
+    # smoke it costs the smoke.
+    if args.dry_run:
+        log("DRY_RUN_OK dataset built and every startup gate passed; "
+            "stopping before the model load")
+        return 0
 
     # ---------------------------------------------------------------- model
     log(f"loading {args.model}")

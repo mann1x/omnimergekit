@@ -66,6 +66,12 @@ REPLAY_N=${REPLAY_N:-0}
 REPLAY_BALANCE=${REPLAY_BALANCE:-equal}
 REPLAY_NO_THINK=${REPLAY_NO_THINK:-0}
 REPLAY_DIFFICULTY=${REPLAY_DIFFICULTY:-}
+# run4 (rebalanced): ONE mixed pool carrying all four tiers, replacing the two-file
+# --pool + --replay-pool shape. Empty keeps gepo_brevity's own default (the LCB pool),
+# so run1-run3 still reproduce from this file unchanged.
+POOL=${POOL:-}
+# Sampling temperature. AN/Gemma-4-E2B's working GEPO ran 0.9; r9 run1-3 ran 0.6.
+TEMPERATURE=${TEMPERATURE:-}
 
 ts(){ date '+%F %T %Z'; }
 say(){ echo "[$(ts)] $*"; }
@@ -73,8 +79,17 @@ say(){ echo "[$(ts)] $*"; }
 SCOPE_ARGS=()
 if [ "$ROUTER_LORA" = "1" ]; then SCOPE_ARGS+=(--router-lora); fi
 SCOPE_ARGS+=(--reward "$REWARD")
-if [ -n "$REPLAY_POOL" ]; then
-  [ -s "$REPLAY_POOL" ] || { echo "FATAL: REPLAY_POOL=$REPLAY_POOL missing/empty"; exit 7; }
+if [ -n "$POOL" ]; then
+  [ -s "$POOL" ] || { echo "FATAL: POOL=$POOL missing/empty"; exit 7; }
+  SCOPE_ARGS+=(--pool "$POOL")
+fi
+if [ -n "$TEMPERATURE" ]; then SCOPE_ARGS+=(--temperature "$TEMPERATURE"); fi
+# The contamination gate belongs on whichever file carries the GPQA/MBPP rows. In the
+# two-file shape that is REPLAY_POOL; in the mixed shape the replay tiers live INSIDE
+# POOL and gating REPLAY_POOL alone would gate nothing at all.
+GATE_POOL="${REPLAY_POOL:-}"
+if [ -z "$GATE_POOL" ] && [ -n "$POOL" ]; then GATE_POOL="$POOL"; fi
+if [ -n "$GATE_POOL" ]; then
   # Contamination gate on the ARTIFACT, on THIS host, before any GPU time is spent.
   # The build-time gate (test_gepo_replay_gate.py) runs only where the pool is BUILT
   # -- it needs gpqa_main.csv, which the run host does not have. So the file that
@@ -83,15 +98,20 @@ if [ -n "$REPLAY_POOL" ]; then
   # here, with a fire-control on each gate. A leak makes every downstream cell of
   # GPQA / MBPP / HumanEval a lie, so it aborts rather than warns.
   echo "== replay artifact gate =="
-  "$PY" "$(dirname "$0")/gate_replay_artifact.py" --pool "$REPLAY_POOL" \
-    || { echo "FATAL: replay pool failed the artifact contamination gate"; exit 9; }
+  "$PY" "$(dirname "$0")/gate_replay_artifact.py" --pool "$GATE_POOL" \
+    || { echo "FATAL: $GATE_POOL failed the artifact contamination gate"; exit 9; }
+fi
+if [ -n "$REPLAY_POOL" ]; then
   SCOPE_ARGS+=(--replay-pool "$REPLAY_POOL" --replay-n "$REPLAY_N")
   SCOPE_ARGS+=(--replay-balance "$REPLAY_BALANCE")
   if [ "$REPLAY_NO_THINK" = "1" ]; then SCOPE_ARGS+=(--replay-no-think); fi
-  if [ -n "$REPLAY_DIFFICULTY" ]; then
-    [ -s "$REPLAY_DIFFICULTY" ] || { echo "FATAL: REPLAY_DIFFICULTY=$REPLAY_DIFFICULTY missing/empty"; exit 10; }
-    SCOPE_ARGS+=(--replay-difficulty "$REPLAY_DIFFICULTY")
-  fi
+fi
+# OUTSIDE the REPLAY_POOL branch: the mixed pool has no separate replay file, and
+# leaving this inside would have accepted REPLAY_DIFFICULTY, recorded it in
+# run_meta.json, and filtered nothing. [[feedback_a_declared_gate_is_not_a_wired_gate]]
+if [ -n "$REPLAY_DIFFICULTY" ]; then
+  [ -s "$REPLAY_DIFFICULTY" ] || { echo "FATAL: REPLAY_DIFFICULTY=$REPLAY_DIFFICULTY missing/empty"; exit 10; }
+  SCOPE_ARGS+=(--replay-difficulty "$REPLAY_DIFFICULTY")
 fi
 
 launch(){   # launch <name> <out> <extra args...>
@@ -204,7 +224,10 @@ agg, lines = {}, 0
 for ln in open(sys.argv[1], errors="ignore"):
     if ">>> V2_REWARD" not in ln or "| TIERS " not in ln:
         continue
-    found = re.findall(r"(\w+):n=(\d+),mean=([-\d.]+),nz=(\d+)", ln.split("| TIERS ", 1)[1])
+    # [\w/]+ not \w+ : tier keys carry a /T|/N thinking suffix, and \w stops at the
+    # slash -- it would capture the bare letter "T" as the whole tier name.
+    found = re.findall(r"([\w/]+):n=(\d+),mean=([-\d.]+),nz=(\d+)",
+                       ln.split("| TIERS ", 1)[1])
     if not found:
         continue
     lines += 1
@@ -224,8 +247,16 @@ if not agg:
 # so the gate can check OBSERVED against EXPECTED instead of against ">= 2". A bare
 # count would have passed a log in which mc_letter was mixed in and never scored --
 # asserting a tier alive that was never measured.
+#
+# POOL_CENSUS is the newer, universal form: the trainer logs it on EVERY path,
+# including the single mixed pool (LCB + replay in one file) where no REPLAY_MIX
+# line exists at all. Its keys carry a /T or /N thinking suffix that the reward's
+# tier keys do not, so strip it. Both forms are read; the union is the expectation.
 exp = set()
 for ln in open(sys.argv[1], errors="ignore"):
+    if "POOL_CENSUS" in ln:
+        seg = ln.split("POOL_CENSUS", 1)[1]
+        exp.update(re.findall(r'"(\w+(?:/[TN])?)":\s*[1-9]', seg))
     if "REPLAY_MIX" not in ln:
         continue
     seg = ln.split("REPLAY_MIX", 1)[1]
@@ -234,9 +265,16 @@ for ln in open(sys.argv[1], errors="ignore"):
     exp.update(re.findall(r"'(\w+)':\s*[1-9]", seg))
 print("REPLAY_TIERS(union over %d line(s)) " % lines
       + " ".join("%s(n=%d,nz=%d)" % (k, d["n"], d["nz"]) for k, d in sorted(agg.items()))
-      + "  EXPECTED=%s" % (sorted(exp) or "<no REPLAY_MIX line>"))
+      + "  EXPECTED=%s" % (sorted(exp) or "<no census line>"))
+# The reward tags tiers as reward_kind/T|N; REPLAY_MIX (older, replay-pool path) knows
+# only the bare kind. Match a SUFFIXED expectation exactly and a BARE one against any
+# thinking mode, so the two census forms can be compared against one observed set
+# without either producing a phantom miss.
+base = lambda k: k.split("/")[0]
+obs_full, obs_base = set(agg), {base(k) for k in agg}
 dead = [k for k, d in agg.items() if d["nz"] == 0]
-missing = sorted(exp - set(agg))
+missing = sorted(e for e in exp
+                 if not ((e in obs_full) if "/" in e else (base(e) in obs_base)))
 if missing:
     sys.exit("REPLAY_GATE_FAIL: tier(s) %s were MIXED INTO the pool but never scored a "
              "single rollout. A tier that never reaches the reward is indistinguishable "
@@ -273,16 +311,24 @@ if [ "$SKIP_SMOKE" = "0" ]; then
   # rows CAN score at the budget the run will actually use. A cheaper smoke that
   # cannot answer that question is not cheaper, it is uninformative.
   SMOKE_MAXCOMP=2048
+  SMOKE_LIMIT=(--limit 2)
   if [ -n "$REPLAY_POOL" ]; then SMOKE_EXTRA+=(--replay-n 4); SMOKE_MAXCOMP="$MAXCOMP"; fi
+  # Mixed pool: draw one problem of EVERY tier instead of the first 2 rows. --limit 2
+  # on a shuffled 4-tier pool most likely yields two rows of the same tier, and the
+  # tier gate would then certify only the tiers that happened to be drawn -- passing
+  # while saying nothing about the three it never saw.
+  if [ -n "$POOL" ]; then
+    SMOKE_LIMIT=(--limit-per-tier 1); SMOKE_MAXCOMP="$MAXCOMP"
+  fi
   launch "$SMOKE_LOG" "$W/$SMOKE_LOG" \
       --max-completion "$SMOKE_MAXCOMP" --num-generations 4 --grad-accum 4 \
-      --limit 2 --epochs 1 --save-steps 1000 \
+      "${SMOKE_LIMIT[@]}" --epochs 1 --save-steps 1000 \
       ${SMOKE_EXTRA[@]+"${SMOKE_EXTRA[@]}"}
   gate_learned "$W/${SMOKE_LOG}.log" || { say "FATAL: smoke did not learn"; exit 4; }
   if [ "$ROUTER_LORA" = "1" ]; then
     gate_router_moved "$W/$SMOKE_LOG" || { say "FATAL: router got no gradient"; exit 6; }
   fi
-  if [ -n "$REPLAY_POOL" ]; then
+  if [ -n "$REPLAY_POOL" ] || [ -n "$POOL" ]; then
     gate_replay_tiers "$W/${SMOKE_LOG}.log" || { say "FATAL: a replay tier is dead"; exit 8; }
   fi
   say "SMOKE_OK"

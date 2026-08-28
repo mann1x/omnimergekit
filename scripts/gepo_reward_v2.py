@@ -219,6 +219,7 @@ def make_gepo_reward_v2(tokenizer, lcb_verifier, max_completion: int,
         clip_f = [False] * n
         lam_f = [1.0] * n
         kind_f = ["lcb_exec"] * n
+        tier_f = ["lcb_exec/T"] * n
 
         for i, comp in enumerate(completions):
             m = metas[i]
@@ -229,6 +230,15 @@ def make_gepo_reward_v2(tokenizer, lcb_verifier, max_completion: int,
                     m = None
             m = m or {}
             kind_f[i] = m.get("reward_kind", "lcb_exec")
+            # TIER label for bookkeeping only -- the DISPATCH still keys on the bare
+            # reward_kind. The mixed pool carries the same reward_kind in both thinking
+            # modes (mbpp_exec appears as 371 no-think and 100 thinking rows), and those
+            # are different failure surfaces: the thinking slice has to fit its chain of
+            # thought AND its code inside the same completion cap, so it can die on its
+            # own while the no-think slice scores healthily. Aggregated under one key
+            # that death is invisible to the launcher's tier gate.
+            tier_f[i] = kind_f[i] + (
+                "/T" if m.get("think", kind_f[i] == "lcb_exec") else "/N")
             lam_f[i] = float(m.get("length_lambda", 1.0))
             text = completion_text(comp)
             len_f[i] = ntoks(text, cids[i])
@@ -286,7 +296,7 @@ def make_gepo_reward_v2(tokenizer, lcb_verifier, max_completion: int,
         # no aggregate gate can see it. `nz` (rollouts with reward > 0) is the number
         # the launcher's REPLAY_TIER_ALIVE gate reads back.
         new_kind = False
-        for k, r_i in zip(kind_f, rewards):
+        for k, r_i in zip(tier_f, rewards):
             if k not in state["byk"]:
                 new_kind = True
             d = state["byk"].setdefault(k, {"n": 0, "sum": 0.0, "nz": 0})
