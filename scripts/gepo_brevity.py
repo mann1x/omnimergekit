@@ -321,18 +321,37 @@ def main() -> int:
                 sys.exit(f"REFUSE: difficulty profile was measured at G={sorted(gp)} but "
                          f"this run uses G={args.num_generations}. Unanimity is a "
                          "property OF the group size; the profile does not transfer.")
+            # An UNPROFILED row is KEPT. Absence of evidence is not evidence of
+            # unanimity, and dropping on absence would silently delete an entire tier
+            # whenever profiling was partial -- e.g. profiling only the saturated tier,
+            # which is the sensible way to spend the measurement budget. Only rows
+            # MEASURED unanimous are dropped.
             keep = [r for r in rrows
-                    if r["id"] in prof and not prof[r["id"]]["unanimous"]]
-            drop_u = sum(1 for r in rrows
-                         if r["id"] in prof and prof[r["id"]]["unanimous"])
-            log(f"REPLAY_DIFFICULTY kept {len(keep)}/{len(rrows) - len(miss)} profiled "
-                f"rows ({drop_u} unanimous at G={args.num_generations} dropped, "
-                f"{len(miss)} unprofiled dropped)")
+                    if r["id"] not in prof or not prof[r["id"]]["unanimous"]]
+            drop_u = len(rrows) - len(keep)
+            kept_unprofiled = sum(1 for r in keep if r["id"] not in prof)
+            by_t: dict[str, list[int]] = {}
+            for r in rrows:
+                k = r["meta"].get("reward_kind", "?")
+                by_t.setdefault(k, [0, 0])
+                by_t[k][0] += 1
+                if r["id"] in prof and prof[r["id"]]["unanimous"]:
+                    by_t[k][1] += 1
+            log(f"REPLAY_DIFFICULTY kept {len(keep)}/{len(rrows)} "
+                f"({drop_u} measured-unanimous at G={args.num_generations} dropped, "
+                f"{kept_unprofiled} kept unprofiled) | per tier: "
+                + " ".join(f"{k}:{v[0]-v[1]}/{v[0]}" for k, v in sorted(by_t.items())))
+            # A tier wiped out by the filter is worse than no filter: it removes the
+            # capability being defended. Refuse rather than train a missing tier.
+            gone = [k for k, v in by_t.items() if v[0] and v[0] == v[1]]
+            if gone:
+                sys.exit(f"REFUSE: difficulty filter removes EVERY row of tier(s) "
+                         f"{gone}. That deletes the capability the tier defends. Profile "
+                         "a wider slice, or drop --replay-difficulty and accept the "
+                         "KL-anchor-only tier.")
             if not keep:
-                sys.exit("REFUSE: every profiled replay row is unanimous at "
-                         f"G={args.num_generations}. Difficulty selection cannot help; "
-                         "re-profile a wider slice or accept the KL-anchor-only tier by "
-                         "dropping --replay-difficulty.")
+                sys.exit("REFUSE: every replay row is unanimous at "
+                         f"G={args.num_generations}.")
             rrows = keep
         random.Random(args.replay_seed).shuffle(rrows)
         if args.replay_n:
