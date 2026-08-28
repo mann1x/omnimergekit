@@ -716,6 +716,18 @@ def main() -> int:
     )
     if not args.no_gepo:
         trainer.gepo = True
+        # POSITIVE assertion. This script previously logged only the GSPO control arm, so
+        # "was GEPO actually on?" could be answered only by reconstructing it from
+        # run_meta.json -- and the surrounding code says "grpo" everywhere (loss_type,
+        # GRPOConfig, grpo_trainer.py), which reads like vanilla GRPO to anyone scanning
+        # a log. It is not: loss_type="grpo" with the clip disabled collapses to -coeff*A,
+        # and the method lives entirely in coeff. State it where it can be read back.
+        log(f"GEPO ACTIVE — seq-level IS, group-expectation denominator "
+            f"(G={args.num_generations}), clip disabled "
+            f"(eps_low={args.epsilon_low} eps_high={args.epsilon_high}), "
+            f"loss_type=grpo, beta={args.beta}. NOT vanilla GRPO (that would need "
+            f"importance_sampling_level='token'); NOT GSPO (that is the "
+            f"--no-gepo control arm, per-sample denominator).")
     else:
         trainer.gepo = False
         log("GSPO CONTROL ARM -- per-sample denominator, NOT GEPO")
