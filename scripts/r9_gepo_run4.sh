@@ -80,10 +80,21 @@
 #      because a 2048-capped smoke starved the replay tiers into clipped=1.000/nz=0
 #      and proved nothing (bug-643).
 #
-# WALL CLOCK: priced at 12.66M generated tokens / 307k tok/h (run2's realised rate)
-# = ~41h. Steps = 849 / (per_device 1 * accum 16 * world 2) = ~26, so SAVE_STEPS=2
-# gives ~13 checkpoints. SAVE_STEPS=8 would have given 3 across 41h -- and on run2/3's
-# 4-step epochs it produced NO intermediate checkpoint at all.
+# WALL CLOCK: priced at 12.66M generated tokens / ~296k tok/h -- run2's MEASURED rate
+# (1024 rollouts x mean_tok 5780 in 19h59m) -- = ~43h.
+#
+# STEP COUNT, corrected 2026-08-28. I first wrote "849/(1*16*2) = ~26 steps". That is
+# wrong: TRL expands the dataset to ROLLOUTS, not problems, and num_iterations=2 runs
+# two optimizer passes over each generation batch. The real count is
+#     849 problems x G=8 = 6792 rollouts / (pdb 1 * accum 16 * world 2 = 32) x 2 = 424
+# and the progress bar confirms 424. The wall clock is unaffected (it was priced from
+# tokens, not steps) but the CHECKPOINT count is not: SAVE_STEPS=2 gives ~212 saves,
+# and at a measured 537 MB each (run3/checkpoint-16) that is ~114 GB with
+# save_total_limit=None. It fits /mnt/sdc (743 G free) and costs ~1.4% in save
+# overhead, so run4 was left running rather than restarted -- but SAVE_STEPS should be
+# ~20 (21 saves, ~11 GB) on the next run. Do NOT "fix" it to 8: on run2/3, whose epochs
+# really were ~64 steps, 8 was already coarse, and the original reason for lowering it
+# stands.
 set -uo pipefail
 
 REPO=/srv/ml/repos/omnimergekit
