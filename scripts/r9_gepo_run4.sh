@@ -80,8 +80,22 @@
 #      because a 2048-capped smoke starved the replay tiers into clipped=1.000/nz=0
 #      and proved nothing (bug-643).
 #
-# WALL CLOCK: priced at 12.66M generated tokens / ~296k tok/h -- run2's MEASURED rate
-# (1024 rollouts x mean_tok 5780 in 19h59m) -- = ~43h.
+# WALL CLOCK: ~96h MEASURED, not the ~43h this comment first claimed.
+#
+# The 43h came from 12.66M generated tokens / 296k tok/h, run2's measured rate. That
+# pricing is WRONG because a tok/h rate does not transfer between pools with different
+# rollout-length distributions. Generation is not token-proportional: every rollout pays
+# prefill and sampling setup, every step pays DDP sync, and run4 has 6.6x run2's rollouts
+# at ~1/3 the length, so it pays that fixed cost far more often per generated token.
+#     run2  1024 rollouts, mean_tok 5780, LCB-only  -> 296k tok/h
+#     run4  6792 rollouts, mean_tok ~1860, 4 tiers  -> 187k tok/h   (measured at step 77)
+# Same host, same backend (use_vllm=False on both, checked). Realised: 819 s/it average
+# over the first 77 steps -> 424 x 819 s = ~96h.
+#
+# PRICE THE NEXT RUN BY ROLLOUT COUNT PER TIER, or better, take elapsed/steps from the
+# run's own first ~20 steps. And read elapsed/steps, NEVER tqdm's displayed s/it: at step
+# 30 tqdm showed 375.95 s/it while the true average was already 677 s/it. Per-step cost
+# oscillates 633-1241 s/it purely on which problems land in the step.
 #
 # STEP COUNT, corrected 2026-08-28. I first wrote "849/(1*16*2) = ~26 steps". That is
 # wrong: TRL expands the dataset to ROLLOUTS, not problems, and num_iterations=2 runs
