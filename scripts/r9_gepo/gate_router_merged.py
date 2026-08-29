@@ -28,7 +28,11 @@ the base, so "POSITIVE missing" could only mean the gate was looking in the wron
 place.
 
 FOUR POLARITIES -- a gate that can only pass is not a gate:
-  ROUTER    layers.*.mlp.gate.weight   MUST differ    (run3 scope; the thing under test)
+  ROUTER    layers.*.mlp.gate.weight   MUST differ    with --expect-router changed
+                                        MUST be EQUAL  with --expect-router unchanged
+                                        (run3 scope; run4 reverted to run2 scope, and
+                                         asserting the routers did NOT move proves that
+                                         rather than assuming it)
   POSITIVE  shared_expert / linear_attn MUST differ   (run2 scope; if identical, the
                                                        merge did nothing at all and a
                                                        "router differs" result would be
@@ -44,6 +48,18 @@ import sys
 from safetensors import safe_open
 
 BASE, MERGED = sys.argv[1], sys.argv[2]
+# --expect-router changed|unchanged. run3 put LoRA on the 40 MoE routers, so they MUST
+# move. run4 went back to run2 scope (ROUTER_LORA=0), so they must NOT -- and that is a
+# real assertion, not a formality: it proves run4 is genuinely run2-scope and did not
+# quietly inherit run3's scope. Default is "changed" so run3's build is unaffected.
+EXPECT = "changed"
+for i, a in enumerate(sys.argv):
+    if a == "--expect-router" and i + 1 < len(sys.argv):
+        EXPECT = sys.argv[i + 1]
+if EXPECT not in ("changed", "unchanged"):
+    print(f"REFUSE: --expect-router must be 'changed' or 'unchanged', got {EXPECT!r}")
+    sys.exit(2)
+ROUTER_MUST_MOVE = EXPECT == "changed"
 N_LAYERS = 40
 
 
@@ -87,10 +103,11 @@ if len(routers) != N_LAYERS:
     print(f"REFUSE: found {len(routers)} non-MTP router keys, expected {N_LAYERS}")
     sys.exit(2)
 
-print(f"=== ROUTER (run3 scope) — all {len(routers)} must have moved ===")
+print(f"=== ROUTER — all {len(routers)} must have "
+      f"{'MOVED (run3 scope)' if ROUTER_MUST_MOVE else 'STAYED EQUAL (run2/run4 scope)'} ===")
 deltas = []
 for k in routers:
-    d = compare(k, True, "ROUTER")
+    d = compare(k, ROUTER_MUST_MOVE, "ROUTER")
     if d is not None:
         deltas.append(d)
 if deltas:
