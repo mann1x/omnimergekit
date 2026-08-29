@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Four-arm qwen_suite table: armJ vs gepo1 vs gepo2 vs gepo3, one cohort.
+"""qwen_suite arm table: armJ vs gepo1/2/3 by default, plus any arms given on argv.
 
 Extracted from suite_gepo2.sh's inline heredoc so a fourth arm could be added without
 editing embedded Python inside a running shell script.
@@ -16,6 +16,19 @@ import sys
 R = "/srv/ml/eval_results/qwen_suite"
 ARMS = [("armJ", "qwenhybridp24_q6k"), ("gepo1", "qwena3bgepo1_q6k"),
         ("gepo2", "qwena3bgepo2_q6k"), ("gepo3", "qwena3bgepo3_q6k")]
+# EXTRA ARMS FROM ARGV: `table_gepo_arms.py gepo4=qwena3bgepo4_q6k [...]`. run4 is a
+# 424-step epoch checkpointed every 2 steps, so the arm under test may well be
+# `gepo4ck218` rather than a single final `gepo4` -- and adding each one by editing this
+# file is exactly the "editing embedded Python" hazard the file was extracted to avoid.
+# Defaults are unchanged when no argument is given.
+for _a in sys.argv[1:]:
+    if "=" not in _a:
+        sys.exit(f"REFUSE: extra arm {_a!r} must be label=served_name")
+    _lab, _nm = _a.split("=", 1)
+    if _lab in [x for x, _ in ARMS]:
+        sys.exit(f"REFUSE: arm label {_lab!r} already present; pick a distinct label so "
+                 "two different models cannot collide in one column")
+    ARMS.append((_lab, _nm))
 BENCH = ["gpqa_diamond_full", "gsm8k_100_boxed", "arc_challenge_100",
          "humaneval_full_think", "humanevalplus_full_think", "multipl_e_100",
          "ifeval_100", "math500_100_qwen", "aime_30_qwen", "lcb_v6_77q"]
