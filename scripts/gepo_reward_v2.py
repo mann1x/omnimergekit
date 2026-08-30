@@ -296,13 +296,21 @@ def make_gepo_reward_v2(tokenizer, lcb_verifier, max_completion: int,
         # no aggregate gate can see it. `nz` (rollouts with reward > 0) is the number
         # the launcher's REPLAY_TIER_ALIVE gate reads back.
         new_kind = False
-        for k, r_i in zip(tier_f, rewards):
+        for k, r_i, l_i in zip(tier_f, rewards, len_f):
             if k not in state["byk"]:
                 new_kind = True
-            d = state["byk"].setdefault(k, {"n": 0, "sum": 0.0, "nz": 0})
+            d = state["byk"].setdefault(k, {"n": 0, "sum": 0.0, "nz": 0, "tok": 0})
             d["n"] += 1
             d["sum"] += r_i
             d["nz"] += int(r_i > 0)
+            # PER-TIER LENGTH. The rank-wide mean_tok cannot answer the question this
+            # objective exists to move: in run4 only 128 of 849 rows carry length_lambda
+            # > 0, so a pool-wide mean is 85% diluted by rows under no length pressure at
+            # all. Measured 2026-08-30 on run4: pool-wide mean_length moved +1.3% over 93
+            # generation rounds, which says nothing either way about the LCB tier -- and I
+            # had no way to check, because this number was not being kept.
+            # [[feedback_a_computed_field_that_never_reaches_a_table_is_unmeasured]]
+            d["tok"] += l_i
 
         # Live per-component diagnostics. run2's failure was only diagnosable in
         # hindsight because nothing separated "fewer truncations" from "shorter".
@@ -336,6 +344,7 @@ def make_gepo_reward_v2(tokenizer, lcb_verifier, max_completion: int,
         if interval or new_kind:
             tiers = " ".join(
                 f"{k}:n={d['n']},mean={d['sum']/max(d['n'],1):.3f},nz={d['nz']}"
+                f",tok={d['tok']/max(d['n'],1):.0f}"
                 for k, d in sorted(state["byk"].items()))
             print(f">>> V2_REWARD rank={RANK} n={state['n']} "
                   f"pass={state['pass']/state['n']:.3f} "
