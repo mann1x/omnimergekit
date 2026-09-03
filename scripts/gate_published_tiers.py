@@ -188,5 +188,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
     sys.exit(main())
