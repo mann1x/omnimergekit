@@ -40,6 +40,16 @@ ACCUM=${ACCUM:-16}          # must be a multiple of G -- groups cannot span rank
 LR=${LR:-5e-6}
 BETA=${BETA:-0.02}
 EPOCHS=${EPOCHS:-1}
+# --- GEPO-ENTROPY (arXiv 2607.16850) -- a DIFFERENT method from the group-expectation
+# importance weight that run1-run4 used. Off by default so those runs stay reproducible.
+GEPO_ENTROPY=${GEPO_ENTROPY:-0}
+ENT_ALPHA_LOW=${ENT_ALPHA_LOW:-0.5}
+ENT_ALPHA_HIGH=${ENT_ALPHA_HIGH:-0.2}   # MUST stay < ENT_ALPHA_LOW (length collapse)
+ENT_BETA_LOW=${ENT_BETA_LOW:-0.2}
+ENT_BETA_HIGH=${ENT_BETA_HIGH:-0.3}
+ENT_GAMMA=${ENT_GAMMA:-0.01}
+ENT_WARMUP=${ENT_WARMUP:-25}
+ENT_SILENT_LIMIT=${ENT_SILENT_LIMIT:-25}
 SKIP_SMOKE=${SKIP_SMOKE:-0}
 # 0 = whole pool. load_pool() takes rows[:limit], i.e. the FIRST n rows -- which is
 # only an unbiased sample because lcb_rl_pool.jsonl is already shuffled (verified
@@ -112,6 +122,14 @@ fi
 if [ -n "$REPLAY_DIFFICULTY" ]; then
   [ -s "$REPLAY_DIFFICULTY" ] || { echo "FATAL: REPLAY_DIFFICULTY=$REPLAY_DIFFICULTY missing/empty"; exit 10; }
   SCOPE_ARGS+=(--replay-difficulty "$REPLAY_DIFFICULTY")
+fi
+
+if [ "$GEPO_ENTROPY" = "1" ]; then
+  SCOPE_ARGS+=(--gepo-entropy
+               --gepo-alpha-low "$ENT_ALPHA_LOW" --gepo-alpha-high "$ENT_ALPHA_HIGH"
+               --gepo-beta-low "$ENT_BETA_LOW" --gepo-beta-high "$ENT_BETA_HIGH"
+               --gepo-gamma "$ENT_GAMMA" --gepo-entropy-warmup "$ENT_WARMUP"
+               --gepo-entropy-silent-limit "$ENT_SILENT_LIMIT")
 fi
 
 launch(){   # launch <name> <out> <extra args...>
@@ -204,6 +222,37 @@ PY
 # gradient, and drags the policy for the whole run while every aggregate looks normal.
 # The v2 reward prints per-tier n/mean/nz; this asserts every tier produced at least
 # one non-zero reward.
+# Did the shaping rule ACTUALLY ENGAGE? Seeded thresholds with any=0.000 on every step
+# is a run that trains for its full wall clock doing nothing the method describes --
+# indistinguishable from run4 in the loss curve, which is why this gate exists.
+# [[feedback_gate_needs_a_sentinel_not_an_exit_code]]
+gate_entropy_fires(){
+  local log="$1"
+  "$PY" - "$log" <<'PY'
+import re, sys
+txt = open(sys.argv[1], errors="ignore").read()
+if ">>> GEPO_ENTROPY_SEEDED" not in txt:
+    print("ENTROPY_GATE FAIL: thresholds never seeded -- the shaping hook was never "
+          "reached. Check that --gepo-entropy survived to the trainer and that "
+          "trainer.gepo is True (the hook sits inside that branch).")
+    sys.exit(1)
+anys = [float(m) for m in re.findall(r">>> GEPO_ENTROPY .*? any=([0-9.]+)", txt)]
+if not anys:
+    print("ENTROPY_GATE FAIL: seeded but not one per-step GEPO_ENTROPY line.")
+    sys.exit(1)
+fired = [a for a in anys if a > 0.0]
+tiers = sorted(set(re.findall(r"([a-z_]+/[TN]):\d+/\d+@H", txt)))
+print("ENTROPY_GATE steps=%d fired=%d max_any=%.3f tiers_seen=%s"
+      % (len(anys), len(fired), max(anys), ",".join(tiers) or "NONE"))
+if not fired:
+    print("ENTROPY_GATE FAIL: shaped ZERO rollouts across every smoke step. The "
+          "thresholds sit outside the observed entropy range (or every advantage is "
+          "zero). Training would burn the full wall clock changing nothing.")
+    sys.exit(1)
+print("ENTROPY_GATE OK")
+PY
+}
+
 gate_replay_tiers(){
   local log="$1"
   "$PY" - "$log" <<'PYGATE'
@@ -346,6 +395,15 @@ if [ "$SKIP_SMOKE" = "0" ]; then
     # Biology item. Costs ~50 min instead of ~25 on a 41h run.
     SMOKE_LIMIT=(--limit-per-tier "${SMOKE_PER_TIER:-3}"); SMOKE_MAXCOMP="$MAXCOMP"
   fi
+  # THE SMOKE MUST FIRE THE ENTROPY RULE. At the full run's warmup (25 steps) a ~6-step
+  # smoke would seed nothing, shape nothing and print no GEPO_ENTROPY line -- so it
+  # would gate green on a mechanism it never once invoked, which is exactly how run4
+  # cost 96h. Seed on step 1 here, and disable the silent-abort so a legitimately quiet
+  # short smoke cannot kill the launch. These land AFTER SCOPE_ARGS on the command
+  # line, so argparse takes them. [[feedback_a_selftest_can_be_real_but_partial]]
+  if [ "$GEPO_ENTROPY" = "1" ]; then
+    SMOKE_EXTRA+=(--gepo-entropy-warmup 1 --gepo-entropy-silent-limit 0)
+  fi
   launch "$SMOKE_LOG" "$W/$SMOKE_LOG" \
       --max-completion "$SMOKE_MAXCOMP" --num-generations 4 --grad-accum 4 \
       "${SMOKE_LIMIT[@]}" --epochs 1 --save-steps 1000 \
@@ -356,6 +414,10 @@ if [ "$SKIP_SMOKE" = "0" ]; then
   fi
   if [ -n "$REPLAY_POOL" ] || [ -n "$POOL" ]; then
     gate_replay_tiers "$W/${SMOKE_LOG}.log" || { say "FATAL: a replay tier is dead"; exit 8; }
+  fi
+  if [ "$GEPO_ENTROPY" = "1" ]; then
+    gate_entropy_fires "$W/${SMOKE_LOG}.log" \
+      || { say "FATAL: GEPO-entropy shaping never fired in the smoke"; exit 11; }
   fi
   say "SMOKE_OK"
 fi

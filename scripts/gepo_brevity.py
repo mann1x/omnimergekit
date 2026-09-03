@@ -193,6 +193,88 @@ def apply_difficulty(rows, prof_path, G, pool_desc):
                  f"G={G}.")
     return keep
 
+class ResumeRefused(Exception):
+    """A resume that cannot be proven to continue the SAME run."""
+
+
+def resolve_resume(out, resume_from, pool_sha, log=print):
+    """Resolve --resume-from to a checkpoint dir, refusing anything that would make the
+    resumed half a different experiment from the first half.
+
+    A checkpoint carries optimizer/scheduler/RNG/trainer_state, so stopping a run is a
+    PAUSE rather than a discard -- but only if the resume continues the same basis.
+    run_meta.json records pool_sha256; if the pool moved underneath, the two halves would
+    be different experiments sharing one output dir and nothing downstream could tell
+    them apart. [[feedback_verify_eval_basis_by_hash_before_tabulating]]
+
+    Returns (checkpoint_path, meta_updates). Raises ResumeRefused.
+    """
+    outp = Path(out)
+    if resume_from == "auto":
+        cks = [q for q in outp.glob("checkpoint-*") if q.name.split("-")[-1].isdigit()]
+        if not cks:
+            raise ResumeRefused(f"--resume-from auto but no checkpoint-* under {outp}")
+        ck = str(sorted(cks, key=lambda q: int(q.name.split("-")[-1]))[-1])
+    else:
+        ck = resume_from
+    rp = Path(ck)
+    need = ["adapter_model.safetensors", "optimizer.pt", "scheduler.pt",
+            "trainer_state.json"]
+    missing = [f for f in need if not (rp / f).exists()]
+    if missing:
+        raise ResumeRefused(f"resume checkpoint {rp} missing {missing}")
+
+    prev_p = outp / "run_meta.json"
+    if prev_p.exists():
+        try:
+            prev = json.loads(prev_p.read_text())
+        except Exception:
+            prev = {}
+        ps = prev.get("pool_sha256")
+        if ps and pool_sha and ps != pool_sha:
+            raise ResumeRefused(
+                f"pool basis CHANGED across resume -- run_meta has {ps}, current pool "
+                f"is {pool_sha}; the two halves would be different experiments")
+        # Never overwrite the original launch record; keep it beside the new one.
+        keep = outp / f"run_meta.before-resume-{int(time.time())}.json"
+        keep.write_text(json.dumps(prev, indent=2))
+        log(f"preserved prior run_meta -> {keep.name}")
+
+    st = json.loads((rp / "trainer_state.json").read_text())
+    log(f"RESUME from {ck} at global_step={st.get('global_step')} "
+        f"/ max_steps={st.get('max_steps')} (pool basis matches)")
+    return ck, {"resumed_from": ck, "resumed_at_global_step": st.get("global_step")}
+
+
+class EntropyRefused(Exception):
+    """Refusal from validate_entropy_args -- raised so the check is testable."""
+
+
+def validate_entropy_args(args):
+    """Both GEPO-entropy refusals, as a pure function fired BEFORE any GPU work.
+
+    Inline `sys.exit` after trainer construction would put these two checks behind a
+    model load, a LoRA build and a dataset render -- and behind an import of trl, so
+    nothing could exercise their polarity. A gate whose polarity is never tested is a
+    gate nobody knows the direction of. [[feedback_a_declared_gate_is_not_a_wired_gate]]
+    """
+    if not getattr(args, "gepo_entropy", False):
+        return
+    if args.no_gepo:
+        raise EntropyRefused(
+            "--gepo-entropy with --no-gepo. The shaping hook sits past the "
+            "`if not self.gepo: return out` early-return in "
+            "_generate_and_score_completions, so it would never fire and the run would "
+            "still be labelled GEPO-entropy in every log line and in run_meta.json.")
+    if args.gepo_alpha_high >= args.gepo_alpha_low:
+        raise EntropyRefused(
+            f"--gepo-alpha-high {args.gepo_alpha_high} >= --gepo-alpha-low "
+            f"{args.gepo_alpha_low}. arXiv 2607.16850 Sec 3.3: attenuating negative "
+            "advantages LESS than positive ones is the LENGTH-COLLAPSE configuration -- "
+            "the model shortens responses to cut per-token uncertainty. alpha_high must "
+            "be strictly below alpha_low.")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -268,6 +350,32 @@ def main() -> int:
     ap.add_argument("--no-gepo", action="store_true",
                     help="GSPO control arm: per-sample q_i instead of the group "
                          "expectation. Same code path, one denominator changed.")
+    # --- GEPO-ENTROPY (arXiv 2607.16850) ---------------------------------------
+    # A DIFFERENT METHOD sharing the acronym with the importance weight above. --no-gepo
+    # toggles Group EXPECTATION PO (2508.17850); these flags toggle Group ENTROPY-
+    # CONTROLLED PO, which reshapes the advantage. They are independent switches.
+    ap.add_argument("--gepo-entropy", action="store_true",
+                    help="entropy-conditioned asymmetric advantage shaping (Eq. 7-9). "
+                         "Attenuates POSITIVE advantages in low-entropy groups and "
+                         "NEGATIVE advantages in high-entropy groups.")
+    ap.add_argument("--gepo-alpha-low", type=float, default=0.5,
+                    help="paper default 0.5; scales POSITIVE adv when H_g < H_low")
+    ap.add_argument("--gepo-alpha-high", type=float, default=0.2,
+                    help="paper default 0.2; scales NEGATIVE adv when H_g > H_high. "
+                         "MUST be < alpha-low: the paper attributes LENGTH COLLAPSE to "
+                         "penalising negative advantages hard in the low-entropy regime.")
+    ap.add_argument("--gepo-beta-low", type=float, default=0.2)
+    ap.add_argument("--gepo-beta-high", type=float, default=0.3)
+    ap.add_argument("--gepo-gamma", type=float, default=0.01,
+                    help="EMA rate for the adaptive thresholds (Eq. 9)")
+    ap.add_argument("--gepo-entropy-warmup", type=int, default=10,
+                    help="steps to POOL group entropy before seeding the thresholds, "
+                         "shaping nothing meanwhile. NOT a paper parameter: the paper "
+                         "estimates mu/sigma over 16 groups per batch, we get "
+                         "grad_accum/G per rank, so a single-batch sigma would be noise.")
+    ap.add_argument("--gepo-entropy-silent-limit", type=int, default=25,
+                    help="abort if the shaping rule fires on ZERO rollouts for this many "
+                         "consecutive post-warmup steps. 0 disables.")
     # --- LoRA -------------------------------------------------------------------
     ap.add_argument("--r", type=int, default=32)
     ap.add_argument("--alpha", type=int, default=64)
@@ -281,6 +389,13 @@ def main() -> int:
     ap.add_argument("--save-steps", type=int, default=20)
     ap.add_argument("--preflight", action="store_true",
                     help="build everything, gate everything, then stop before train()")
+    ap.add_argument("--resume-from", default="",
+                    help="resume training from a checkpoint dir, or 'auto' for the "
+                         "highest-numbered checkpoint-N under --out. The checkpoint "
+                         "carries optimizer/scheduler/RNG/trainer_state, so a stop is a "
+                         "PAUSE, not a discard -- but trainer.train() was previously "
+                         "called with no argument, so that state could not be consumed "
+                         "and a stop stranded the run.")
     args = ap.parse_args()
 
     # The divisibility that matters is PER RANK, not global. Each DDP rank
@@ -299,6 +414,10 @@ def main() -> int:
         sys.exit(f"REFUSE: --grad-accum {args.grad_accum} is not divisible by "
                  f"--num-generations {args.num_generations}. Each rank must hold "
                  f"whole generation groups; groups cannot span ranks.")
+    try:
+        validate_entropy_args(args)
+    except EntropyRefused as e:
+        sys.exit(f"REFUSE: {e}")
     log(f"GROUPS_OK {args.grad_accum // args.num_generations} group(s)/rank x "
         f"world={_world} = {args.grad_accum * _world // args.num_generations} "
         f"group(s)/step (G={args.num_generations})")
@@ -714,6 +833,26 @@ def main() -> int:
         reward_funcs=[reward], peft_config=peft_cfg,
         processing_class=tok,
     )
+    # Both refusals already fired in validate_entropy_args() above, before the model
+    # was loaded. What is left here is the wiring itself.
+    trainer.gepo_entropy = bool(args.gepo_entropy)
+    if args.gepo_entropy:
+        trainer.gepo_alpha_low = args.gepo_alpha_low
+        trainer.gepo_alpha_high = args.gepo_alpha_high
+        trainer.gepo_beta_low = args.gepo_beta_low
+        trainer.gepo_beta_high = args.gepo_beta_high
+        trainer.gepo_gamma = args.gepo_gamma
+        trainer.gepo_entropy_warmup = args.gepo_entropy_warmup
+        trainer.gepo_entropy_silent_limit = args.gepo_entropy_silent_limit
+        log(f"GEPO-ENTROPY ACTIVE (arXiv 2607.16850) — alpha_low={args.gepo_alpha_low} "
+            f"alpha_high={args.gepo_alpha_high} beta_low={args.gepo_beta_low} "
+            f"beta_high={args.gepo_beta_high} gamma={args.gepo_gamma} "
+            f"warmup={args.gepo_entropy_warmup} silent_limit="
+            f"{args.gepo_entropy_silent_limit}. This is advantage SHAPING and is "
+            f"INDEPENDENT of the group-expectation importance weight below.")
+    else:
+        log("GEPO-ENTROPY OFF — advantages used as TRL normalises them (run1-run4 behaviour)")
+
     if not args.no_gepo:
         trainer.gepo = True
         # POSITIVE assertion. This script previously logged only the GSPO control arm, so
@@ -791,6 +930,18 @@ def main() -> int:
             "max_completion": args.max_completion, "num_generations": args.num_generations,
             "grad_accum": args.grad_accum, "beta": args.beta, "lr": args.lr,
             "epochs": args.epochs, "seed": args.seed,
+            # BASIS FACT. A run5 row must never be tabled against run1-4 without this
+            # being read first -- the advantage is a different quantity.
+            "gepo_entropy": ({"paper": "arXiv 2607.16850",
+                              "alpha_low": args.gepo_alpha_low,
+                              "alpha_high": args.gepo_alpha_high,
+                              "beta_low": args.gepo_beta_low,
+                              "beta_high": args.gepo_beta_high,
+                              "gamma": args.gepo_gamma,
+                              "warmup": args.gepo_entropy_warmup,
+                              "silent_limit": args.gepo_entropy_silent_limit}
+                             if args.gepo_entropy else False),
+            "gepo_expectation_is": (not args.no_gepo),
             "sampler": {"temperature": args.temperature, "top_p": args.top_p,
                         "top_k": args.top_k},
             "lora": {"r": args.r, "alpha": args.alpha, "regex": LORA_REGEX,
@@ -803,6 +954,21 @@ def main() -> int:
                      "dropout": dropout_used},
             "trainable_params": n_train, "started": time.strftime("%F %T %Z")}
     Path(args.out).mkdir(parents=True, exist_ok=True)
+
+    # ---- RESUME RESOLUTION + BASIS GATE ----------------------------------------
+    # A resume must continue the SAME run. run_meta.json records pool_sha256, so if the
+    # pool moved under a resumed run the two halves would be different experiments
+    # sharing one output dir and nothing downstream could tell them apart.
+    # [[feedback_verify_eval_basis_by_hash_before_tabulating]]
+    resume_ckpt = ""
+    if args.resume_from:
+        try:
+            resume_ckpt, upd = resolve_resume(args.out, args.resume_from, pool_sha, log)
+        except ResumeRefused as e:
+            log(f"FATAL: {e}")
+            return 12
+        meta.update(upd)
+
     (Path(args.out) / "run_meta.json").write_text(json.dumps(meta, indent=2))
     log("run_meta.json written")
 
@@ -812,7 +978,8 @@ def main() -> int:
         return 0
 
     log("=== train ===")
-    trainer.train()
+    print(f">>> GEPO_RESUME resume_from={resume_ckpt or 'NONE (fresh run)'}", flush=True)
+    trainer.train(resume_from_checkpoint=resume_ckpt or None)
     trainer.save_model(args.out)
     meta["finished"] = time.strftime("%F %T %Z")
     (Path(args.out) / "run_meta.json").write_text(json.dumps(meta, indent=2))

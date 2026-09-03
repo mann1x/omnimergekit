@@ -57,13 +57,23 @@ def sampler(d):
 
 
 labels = [a for a, _ in ARMS]
-hdr = ("%-26s" + " %8s" * 4 + "   " + " %8s" * 3 + "   %10s %10s %8s") % (
-    "bench", *labels, "g1-armJ", "g2-armJ", "g3-armJ", "armJ tok", "gepo3 tok", "tok %")
+# ARM COUNT IS DYNAMIC. The header/row formats used to hardcode 4 arms and 3 delta
+# columns, so passing TWO extra arms (the run4 dose series needs ck60 AND ck218 in one
+# table) died with "not all arguments converted during string formatting". Widths are 10,
+# not 8, because a label like "gepo4ck218" is 10 chars and would otherwise push the
+# header out of step with the %8.4f data rows -- a silently misread table.
+nA = len(labels)
+# Token columns compare armJ against the NEWEST arm; with no argv that is gepo3, which is
+# exactly what this script did before.
+TOKREF = labels[-1]
+hdr = ("%-26s" + " %10s" * nA + "   " + " %10s" * (nA - 1) + "   %10s %12s %8s") % (
+    "bench", *labels, *labels[1:], "armJ tok", "%s tok" % TOKREF, "tok %")
 print(hdr)
 print("-" * len(hdr))
+print("(the %d columns after the gap are DELTAS vs armJ, in percentage points)" % (nA - 1))
 
 acc = {a: 0.0 for a in labels}
-tot = {"armJ": 0, "gepo3": 0}
+tot = {"armJ": 0, TOKREF: 0}
 n = 0
 bad_sampler = []
 
@@ -77,34 +87,39 @@ for b in BENCH:
         s = sampler(ds[a])
         if s != WANT_SAMPLER:
             bad_sampler.append("%s/%s sampler=%s" % (b, a, s))
-    ta, t3 = toks(ds["armJ"]), toks(ds["gepo3"])
+    ta, t3 = toks(ds["armJ"]), toks(ds[TOKREF])
     tp = ("%+.1f%%" % ((t3 - ta) / ta * 100)) if ta else "-"
     base = ds["armJ"]["score"]
-    print(("%-26s" + " %8.4f" * 4 + "   " + " %+8.2f" * 3 + "   %10d %10d %8s") % (
+    print(("%-26s" + " %10.4f" * nA + "   " + " %+10.2f" * (nA - 1) + "   %10d %12d %8s") % (
         b, *[ds[a]["score"] for a in labels],
         *[(ds[a]["score"] - base) * 100 for a in labels[1:]], ta, t3, tp))
     for a in labels:
         acc[a] += ds[a]["score"]
     tot["armJ"] += ta
-    tot["gepo3"] += t3
+    tot[TOKREF] += t3
     n += 1
 
 if n:
     print("-" * len(hdr))
     base = acc["armJ"] / n
-    print(("%-26s" + " %8.4f" * 4 + "   " + " %+8.2f" * 3 + "   %10d %10d %8s") % (
+    print(("%-26s" + " %10.4f" * nA + "   " + " %+10.2f" * (nA - 1) + "   %10d %12d %8s") % (
         "MEAN over %d" % n, *[acc[a] / n for a in labels],
         *[(acc[a] - acc["armJ"]) / n * 100 for a in labels[1:]],
-        tot["armJ"], tot["gepo3"],
-        ("%+.1f%%" % ((tot["gepo3"] - tot["armJ"]) / tot["armJ"] * 100)) if tot["armJ"] else "-"))
+        tot["armJ"], tot[TOKREF],
+        ("%+.1f%%" % ((tot[TOKREF] - tot["armJ"]) / tot["armJ"] * 100)) if tot["armJ"] else "-"))
 
 print()
 if bad_sampler:
     print("!!! SAMPLER MISMATCH -- these cells are NOT in this cohort and the row above is void:")
     for x in bad_sampler:
         print("      " + x)
+elif n == 0:
+    # A vacuous pass. The sampler check inspects only COMPLETE rows, so with none read it
+    # has verified nothing -- printing the reassuring line here would certify absence.
+    print("sampler: NOT CHECKED -- 0 complete rows; every bench above is INCOMPLETE.")
 else:
-    print("sampler: all cells recorded '%s' -- one cohort, differences are tableable." % WANT_SAMPLER)
+    print("sampler: all %d complete rows recorded '%s' -- one cohort, differences are "
+          "tableable." % (n, WANT_SAMPLER))
 
 print()
 print("READING THIS TABLE")

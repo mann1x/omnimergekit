@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import difflib
 import inspect
+import json
 import re
 import textwrap
 
@@ -145,7 +146,204 @@ class GEPOTrainer(GRPOTrainer):
         lq_g = lq.detach().reshape(B // G, G)
         log_Eq = torch.logsumexp(2.0 * lq_g, dim=1) - torch.logsumexp(lq_g, dim=1)   # (P,)
         out["gepo_log_Eq"] = log_Eq.repeat_interleave(G)                              # (B,)
+        self._maybe_shape_advantages_by_group_entropy(out, self._tiers_of(inputs, B, G))
         return out
+
+    @staticmethod
+    def _tiers_of(inputs, B, G):
+        """Per-GROUP tier labels, or None when the dataset has no `meta` column.
+
+        run4's lesson is that a pool-wide number cannot see a minority tier: only
+        128/849 rows carry lambda>0, so a shaping rate averaged over the whole batch
+        would read ~identical whether or not the tier we care about was ever touched.
+        [[feedback_a_pool_wide_metric_cannot_see_a_minority_tier_objective]]
+        Never raises -- diagnostics must not be able to kill a run.
+        """
+        try:
+            rows = list(inputs)
+            if len(rows) == B:
+                rows = rows[::G]                     # already expanded to rollouts
+            if len(rows) != B // G:
+                return None
+            out = []
+            for r in rows:
+                m = r.get("meta") if isinstance(r, dict) else None
+                if isinstance(m, str):
+                    m = json.loads(m)
+                if not isinstance(m, dict):
+                    return None
+                k = m.get("reward_kind", "lcb_exec")
+                out.append(k + ("/T" if m.get("think", k == "lcb_exec") else "/N"))
+            return out
+        except Exception:
+            return None
+
+    # ------------------------------------------------- GEPO-ENTROPY (arXiv 2607.16850)
+    # A DIFFERENT METHOD THAT SHARES THE ACRONYM. This class's importance weight is
+    # Group EXPECTATION Policy Optimization (arXiv 2508.17850). What follows is Group
+    # ENTROPY-CONTROLLED Policy Optimization (Cheng et al., Shanghai AI Lab, 2026-07-21),
+    # a lightweight extension to GRPO that reshapes the NORMALIZED advantage. The two are
+    # orthogonal and independently gated: `gepo` selects the IS denominator,
+    # `gepo_entropy` selects the advantage shaping. Neither implies the other.
+    #
+    #   group entropy (Eq. 4, per-token normalized):
+    #       H_g = -( sum_i sum_t log pi(y_it) ) / ( sum_i T_i )
+    #   asymmetric shaping (Eq. 7):
+    #       A_i <- alpha_low  * A_i   if A_i > 0 and H_g < H_low
+    #       A_i <- alpha_high * A_i   if A_i < 0 and H_g > H_high
+    #   adaptive thresholds (Eq. 8-9), EMA-smoothed:
+    #       H_low_hat = mu_H - beta_low * sigma_H ; H_high_hat = mu_H + beta_high * sigma_H
+    #       H_* <- (1-gamma) * H_* + gamma * H_*_hat
+    #
+    # alpha_high < alpha_low is a PAPER CONSTRAINT, not a preference: the paper reports
+    # that aggressively penalising negative advantages in the low-entropy regime causes
+    # LENGTH COLLAPSE ("the model dramatically shortens its responses to reduce per-token
+    # uncertainty"). We are optimising for brevity, so that failure mode would look like
+    # success on our headline metric while destroying the model -- the length/score
+    # cross-tab is what distinguishes them, and it is gated in the launcher.
+    gepo_entropy = False
+    gepo_alpha_low = 0.5      # paper default; attenuates POSITIVE adv in LOW-entropy groups
+    gepo_alpha_high = 0.2     # paper default; attenuates NEGATIVE adv in HIGH-entropy groups
+    gepo_beta_low = 0.2       # paper default
+    gepo_beta_high = 0.3      # paper default
+    gepo_gamma = 0.01         # paper default EMA rate
+    # NOT A PAPER PARAMETER -- forced by our batch geometry. The paper estimates mu_H and
+    # sigma_H from 16 groups per batch (bsz 256 / K 16). At ACCUM=16 with G=16 each rank
+    # generates exactly ONE group, so a per-step sigma would come from n=2 -- noise, and
+    # the EMA would be SEEDED from it. During warmup we therefore shape NOTHING and only
+    # pool H_g; the thresholds are seeded from the pooled sample, then the EMA takes over.
+    gepo_entropy_warmup = 10
+    # SILENT-NO-OP DETECTOR. run4's whole cost was a mechanism that ran for 96h while
+    # being ineffective, and nothing in the loss curve said so. If the shaping rule fires
+    # on ZERO rollouts for this many consecutive post-warmup steps, the thresholds are
+    # unreachable (or the advantages are degenerate) and the run is not doing what its
+    # name says. Fail rather than burn the GPU.
+    gepo_entropy_silent_limit = 25
+
+    def _maybe_shape_advantages_by_group_entropy(self, out, tiers=None):
+        if not getattr(self, "gepo_entropy", False):
+            return
+        if self.gepo_alpha_high >= self.gepo_alpha_low:
+            raise ValueError(
+                f"GEPO-entropy requires alpha_high < alpha_low (paper 2.3); got "
+                f"{self.gepo_alpha_high} >= {self.gepo_alpha_low}. Violating it is the "
+                "length-collapse configuration."
+            )
+        adv = out.get("advantages")
+        old = self._require_old_logps(out)
+        if adv is None:
+            raise ValueError("GEPO-entropy needs 'advantages'; TRL did not provide them.")
+        mask = out["completion_mask"]
+        if "tool_mask" in out:
+            mask = mask * out["tool_mask"]
+        G = int(self.num_generations)
+        B = adv.shape[0]
+
+        # H_g per GROUP: -(sum of all token logps in the group) / (total tokens in group).
+        tok_lp = (old.detach() * mask).sum(-1).reshape(B // G, G).sum(-1)   # (P,)
+        tok_n = mask.sum(-1).reshape(B // G, G).sum(-1).clamp(min=1.0)      # (P,)
+        H_g = -(tok_lp / tok_n)                                             # (P,)
+
+        # Thresholds come from the GLOBAL batch. Under DDP each rank sees a slice, and
+        # per-rank mu/sigma would make the two ranks shape DIFFERENT groups from the same
+        # step -- a silent divergence that no per-rank log would reveal.
+        Hs = H_g.detach()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            world = torch.distributed.get_world_size()
+            buf = [torch.zeros_like(Hs) for _ in range(world)]
+            torch.distributed.all_gather(buf, Hs)
+            Hs = torch.cat(buf)
+        mu, sigma = Hs.mean(), Hs.std(unbiased=False)
+        lo_hat = mu - self.gepo_beta_low * sigma
+        hi_hat = mu + self.gepo_beta_high * sigma
+
+        # EMA INITIALISATION IS NOT OPTIONAL. gamma=0.01 moves the threshold 1% per step,
+        # so starting from 0 would leave H_high far below every real H_g for the first
+        # ~100 steps -> every negative advantage attenuated, i.e. the opposite of the
+        # method, invisibly. Seed from POOLED warmup statistics (see gepo_entropy_warmup).
+        if getattr(self, "_gepo_H_low", None) is None:
+            pool = getattr(self, "_gepo_warm", None)
+            if pool is None:
+                pool = self._gepo_warm = []
+            pool.append(Hs.detach().float().cpu())
+            if len(pool) < max(1, int(self.gepo_entropy_warmup)):
+                # SHAPE NOTHING while the thresholds are still unknown. Returning here
+                # leaves `advantages` untouched, so warmup steps are plain GRPO/GEPO.
+                out["gepo_entropy_stats"] = {
+                    "warmup": True, "warmup_step": len(pool),
+                    "warmup_target": int(self.gepo_entropy_warmup),
+                    "n_groups": int(H_g.numel()),
+                    "frac_pos_attenuated": 0.0, "frac_neg_attenuated": 0.0,
+                    "frac_any_shaped": 0.0,
+                }
+                return
+            allH = torch.cat(pool)
+            mu, sigma = allH.mean(), allH.std(unbiased=False)
+            self._gepo_H_low = (mu - self.gepo_beta_low * sigma).to(H_g.device)
+            self._gepo_H_high = (mu + self.gepo_beta_high * sigma).to(H_g.device)
+            self._gepo_warm = None
+            print(f">>> GEPO_ENTROPY_SEEDED n_groups={allH.numel()} mu={float(mu):.4f} "
+                  f"sigma={float(sigma):.4f} H_low={float(self._gepo_H_low):.4f} "
+                  f"H_high={float(self._gepo_H_high):.4f}", flush=True)
+        else:
+            g = self.gepo_gamma
+            self._gepo_H_low = (1 - g) * self._gepo_H_low + g * lo_hat
+            self._gepo_H_high = (1 - g) * self._gepo_H_high + g * hi_hat
+
+        H_rep = H_g.repeat_interleave(G)                                    # (B,)
+        lo_mask = (adv > 0) & (H_rep < self._gepo_H_low)
+        hi_mask = (adv < 0) & (H_rep > self._gepo_H_high)
+        shaped = torch.where(lo_mask, adv * self.gepo_alpha_low, adv)
+        shaped = torch.where(hi_mask, shaped * self.gepo_alpha_high, shaped)
+        out["advantages"] = shaped
+
+        # DIAGNOSTICS ARE THE POINT, NOT DECORATION. run4 failed because a minority-tier
+        # objective was invisible in a pool-wide mean until the run was over. If the
+        # shaping never fires we must see it at step 5, not step 219, so the FIRING RATE
+        # is emitted every step and the launcher gates on it.
+        out["gepo_entropy_stats"] = {
+            "H_mean": float(mu), "H_std": float(sigma),
+            "H_low": float(self._gepo_H_low), "H_high": float(self._gepo_H_high),
+            "n_groups": int(H_g.numel()),
+            "frac_pos_attenuated": float(lo_mask.float().mean()),
+            "frac_neg_attenuated": float(hi_mask.float().mean()),
+            "frac_any_shaped": float((lo_mask | hi_mask).float().mean()),
+        }
+        if tiers:
+            per = {}
+            anym = (lo_mask | hi_mask).reshape(len(tiers), G).any(dim=1)
+            for i, t in enumerate(tiers):
+                d = per.setdefault(t, {"n": 0, "shaped": 0, "H_sum": 0.0})
+                d["n"] += 1
+                d["shaped"] += int(bool(anym[i]))
+                d["H_sum"] += float(H_g[i])
+            for t, d in per.items():
+                d["H_mean"] = d.pop("H_sum") / max(d["n"], 1)
+                d["frac_groups_shaped"] = d["shaped"] / max(d["n"], 1)
+            out["gepo_entropy_stats"]["per_tier"] = per
+        if float((lo_mask | hi_mask).float().mean()) > 0.0:
+            self._gepo_silent = 0
+        else:
+            self._gepo_silent = getattr(self, "_gepo_silent", 0) + 1
+            lim = int(self.gepo_entropy_silent_limit)
+            if lim and self._gepo_silent >= lim:
+                raise RuntimeError(
+                    f"GEPO-entropy shaped NOTHING for {self._gepo_silent} consecutive "
+                    f"post-warmup steps (H_mean={float(mu):.4f} H_std={float(sigma):.4f} "
+                    f"H_low={float(self._gepo_H_low):.4f} "
+                    f"H_high={float(self._gepo_H_high):.4f}). The rule is inert: either "
+                    "sigma_H has collapsed so the thresholds sit outside the observed "
+                    "entropy range, or every advantage is zero. Training on would be "
+                    "run4 again -- a method that costs the full wall clock and changes "
+                    "nothing. Fix beta_low/beta_high or the pool, then restart."
+                )
+        st = out["gepo_entropy_stats"]
+        tail = " ".join(f"{t}:{d['shaped']}/{d['n']}@H{d['H_mean']:.3f}"
+                        for t, d in sorted(st.get("per_tier", {}).items()))
+        print(f">>> GEPO_ENTROPY H_mean={st['H_mean']:.4f} H_std={st['H_std']:.4f} "
+              f"lo={st['H_low']:.4f} hi={st['H_high']:.4f} groups={st['n_groups']} "
+              f"pos_att={st['frac_pos_attenuated']:.3f} neg_att={st['frac_neg_attenuated']:.3f} "
+              f"any={st['frac_any_shaped']:.3f} {tail}", flush=True)
 
     # ---------------------------------------------------------------- copied loss
     def _compute_loss(self, model, inputs):

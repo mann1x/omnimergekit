@@ -53,9 +53,14 @@ esac
 MERGED=$WORK/a3b-$TAG
 OUT=$WORK/gguf_$TAG
 
-# GPU1 only. GPU0 is not mine outside the explicit GEPO authorization, and the merge is
+# GPU1 by DEFAULT. GPU0 is not mine outside an explicit authorization, and the merge is
 # CPU-resident anyway -- only llama-imatrix needs a device.
-export CUDA_VISIBLE_DEVICES=1
+# BUILD_GPU overrides it, so a second arm can be built on GPU0 alongside a live eval on
+# GPU1 WITHOUT contending for it: those eval cells are not resumable under sampling
+# (do_sample=true makes --use_cache a no-op), so an OOM there costs a whole bench.
+# User authorized GPU0 for this on 2026-08-30. Default stays 1 -- an unset BUILD_GPU must
+# never silently reach for a device that is not ours.
+export CUDA_VISIBLE_DEVICES=${BUILD_GPU:-1}
 
 ts(){ date -u '+%F %T UTC'; }
 say(){ echo "[$(ts)] $*"; }
