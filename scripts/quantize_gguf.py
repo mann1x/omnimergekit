@@ -458,7 +458,36 @@ def run(cmd: list[str], desc: str = "", timeout: int = None, **kwargs) -> subpro
 
 
 def find_llama_cpp() -> dict[str, str]:
-    """Find llama.cpp binaries and scripts."""
+    """Find llama.cpp binaries and scripts.
+
+    LLAMA_CPP_HOME wins when set. A pinned engine matters: on 2026-09-03 a
+    three-month-old /opt/llama.cpp emitted whitespace for qwen35 i-quants that
+    serve fine elsewhere, and a gate read that as a model failure. Being able
+    to point the pipeline at a specific build -- without clobbering /opt, which
+    other tools use -- is how a run states which engine produced its verdicts.
+    """
+    env_home = os.environ.get("LLAMA_CPP_HOME")
+    if env_home:
+        base = Path(env_home)
+        if not ((base / "build/bin/llama-quantize").exists()
+                and (base / "convert_hf_to_gguf.py").exists()):
+            # Never fall through to a DIFFERENT engine than the one asked for.
+            # Silently substituting one build for another is how a run ends up
+            # with verdicts from an engine nobody chose.
+            raise RuntimeError(
+                f"LLAMA_CPP_HOME={env_home} is not a usable llama.cpp tree "
+                f"(need build/bin/llama-quantize + convert_hf_to_gguf.py). "
+                f"Refusing to silently fall back to another build.")
+        return {
+            "base": str(base),
+            "server": str(base / "build/bin/llama-server")
+            if (base / "build/bin/llama-server").exists() else None,
+            "quantize": str(base / "build/bin/llama-quantize"),
+            "imatrix": str(base / "build/bin/llama-imatrix")
+            if (base / "build/bin/llama-imatrix").exists() else None,
+            "convert": str(base / "convert_hf_to_gguf.py"),
+        }
+
     search_paths = [
         Path("/opt/llama.cpp"),
         Path.home() / "llama.cpp",
@@ -1874,7 +1903,8 @@ def upload_worker(upload_queue: Queue, repo_id: str, stop_event: Event,
                   ollama_failed: list = None,
                   tools: dict = None,
                   sanity_enabled: bool = True,
-                  sanity_failed: list = None):
+                  sanity_failed: list = None,
+                  withdraw_on_fail: bool = False):
     """Worker thread: uploads completed quants from queue, optionally pushes
     to ollama.com, then deletes the local file.
 
@@ -1892,6 +1922,9 @@ def upload_worker(upload_queue: Queue, repo_id: str, stop_event: Event,
     sanity_failed: shared list to record (quant_name, repo_id, removed_paths,
                    ollama_tag) for every tier that failed the gate. main()
                    prints the manual ollama-removal instructions at the end.
+    withdraw_on_fail: delete a failing tier from HF. Default False — see the
+                   comment at the gate. A failed check is a REPORT, not a
+                   verdict, because the check cannot certify its own engine.
     """
     while not stop_event.is_set() or not upload_queue.empty():
         try:
@@ -1959,9 +1992,25 @@ def upload_worker(upload_queue: Queue, repo_id: str, stop_event: Event,
                     and not quant_name.upper().startswith(("F16", "F32"))):
                 sanity_ok = sanity_check(tools, gguf_path, quant_name)
                 if not sanity_ok:
-                    print(f"  {quant_name}: SANITY FAILED after push — "
-                          f"withdrawing from {repo_id}", flush=True)
-                    removed = hf_delete_quant(repo_id, gguf_path, quant_name)
+                    print(f"  {quant_name}: SANITY FAILED after push", flush=True)
+                    # Do NOT delete on a failed check by default. On 2026-09-03
+                    # this gate condemned two GOOD tiers (IQ2_M, IQ3_M) because
+                    # the llama.cpp it ran on was three months stale and could
+                    # not run qwen35 i-quants — it emitted whitespace for a file
+                    # that serves fine elsewhere. A check is evidence about the
+                    # ARTIFACT only if the engine can actually run the artifact,
+                    # and that is not something the check can verify about
+                    # itself. So a failure REPORTS and quarantines; a human
+                    # decides. Opt in with --withdraw-on-sanity-fail.
+                    removed = []
+                    if withdraw_on_fail:
+                        print(f"  {quant_name}: --withdraw-on-sanity-fail set — "
+                              f"removing from {repo_id}", flush=True)
+                        removed = hf_delete_quant(repo_id, gguf_path, quant_name)
+                    else:
+                        print(f"  {quant_name}: LEFT IN PLACE on {repo_id} "
+                              f"(pass --withdraw-on-sanity-fail to auto-remove)",
+                              flush=True)
                     tag = (f"{ollama_target}:{_gguf_tag_from_filename(gguf_path)}"
                            if ollama_target else None)
                     if sanity_failed is not None:
@@ -2006,6 +2055,13 @@ def main():
                              "A failing tier is withdrawn from HF automatically and "
                              "its ollama tag is reported for manual removal. "
                              "Disable with --no-sanity-check.")
+    parser.add_argument("--withdraw-on-sanity-fail", action="store_true",
+                        help="Delete a tier from HF when it fails the post-push "
+                             "sanity check. Default OFF: a failure is reported and "
+                             "quarantined, never auto-deleted, because the check "
+                             "cannot certify that its own engine can run the "
+                             "artifact. Only pass this when you have confirmed the "
+                             "engine is current for the model architecture.")
     parser.add_argument("--no-upload", action="store_true",
                         help="Don't upload to HF, just quantize locally")
     parser.add_argument("--no-imatrix", action="store_true",
@@ -2637,7 +2693,7 @@ def main():
                                args=(upload_queue, hf_repo, stop_upload, keep_files,
                                      args.ollama_target, args.ollama_template,
                                      ollama_failed, tools, args.sanity_check,
-                                     sanity_failed),
+                                     sanity_failed, args.withdraw_on_sanity_fail),
                                daemon=True)
         upload_thread.start()
 
@@ -2853,6 +2909,12 @@ def main():
         print(f"\n{'!'*60}", flush=True)
         print(f"  {len(sanity_failed)} TIER(S) FAILED THE POST-PUSH SANITY CHECK",
               flush=True)
+        print("  A FAILURE IS A REPORT, NOT A VERDICT. Before acting, confirm the",
+              flush=True)
+        print("  llama.cpp build can actually run this architecture and quant type —",
+              flush=True)
+        print("  a stale engine emits whitespace for files that serve fine elsewhere.",
+              flush=True)
         print(f"{'!'*60}", flush=True)
         for q, repo, removed, tag in sanity_failed:
             print(f"  {q}:", flush=True)
@@ -2860,8 +2922,8 @@ def main():
                 print(f"    HF   — REMOVED from {repo}: {', '.join(removed)}",
                       flush=True)
             else:
-                print(f"    HF   — removal FAILED, delete by hand: "
-                      f"https://huggingface.co/{repo}", flush=True)
+                print(f"    HF   — LEFT IN PLACE on {repo} (nothing was deleted)",
+                      flush=True)
             if tag:
                 print(f"    OLLAMA — REMOVE THIS TAG BY HAND: {tag}", flush=True)
         if any(t for _, _, _, t in sanity_failed):
