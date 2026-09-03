@@ -229,6 +229,48 @@ template metadata properly.
   `ollama signin` and verify the public key at `~/.ollama/id_ed25519.pub`
   matches the one in your ollama.com account settings.
 
+## Post-push sanity gate (default ON since 2026-09-03)
+
+`quantize_gguf.py` runs `sanity_check()` on **every** tier **after** it has
+been uploaded to HF and pushed to ollama.com — on the same local bytes that
+were shipped. A build-time gate cannot certify the shipped artifact; this one
+inspects exactly what the registries now serve.
+
+The gate boots `llama-server --fit on` on the GGUF and asks three capital-city
+questions expecting JSON answers; **2 of 3 correct** is a pass. `--jinja` is
+on and thinking is capped via `--reasoning-budget 256` (retried without the
+flag if the server refuses it), so a reasoning model answers rather than
+ruminating past the token cap.
+
+On **FAIL** the tier is withdrawn, loudly:
+
+1. The GGUF **and** its `.sha256` sidecar are deleted from the HF repo
+   automatically (`hf_delete_quant`).
+2. The local GGUF is **kept** — those bytes are the only remaining copy and
+   the sole evidence for the RCA.
+3. The tier is dropped from `succeeded`, added to `failed`, and can never be
+   promoted to `:latest`.
+4. An end-of-run block names the exact ollama tag to remove **by hand**.
+   ollama.com has no delete API — the operator must remove it at
+   `https://ollama.com/<namespace>/<model>` → tag → Delete. The script will
+   not silently pretend the tag is gone.
+
+```bash
+# default — gate is ON, no flag needed
+python scripts/quantize_gguf.py --model ... --ollama-target mannix/foo
+
+# opt OUT explicitly (the ONLY way to skip it)
+python scripts/quantize_gguf.py --model ... --no-sanity-check
+```
+
+With `--no-upload` there is nothing to withdraw, so the gate runs inline
+before the (skipped) upload instead and simply marks the tier failed.
+
+**The gate is verified in both directions.** On 2026-09-03 it was run against
+the published `omnimerge-v6` Q4_K_M (PASS 3/3) and against a corrupt
+zero-magic `IQ4_NL.gguf` (FAIL — server didn't start). A gate only ever shown
+to pass is not a gate; a gate only ever shown to fail is broken.
+
 ## Related
 
 - `mlx_convert.sh` / `MLX_CONVERT.md` — sibling pipeline that publishes MLX
@@ -239,6 +281,13 @@ template metadata properly.
 
 ## Version history
 
+- **2026-09-03 (post-push sanity gate)** — `quantize_gguf.py --sanity-check`
+  became **default ON** and moved from pre-upload to **post-push**, so it
+  certifies the bytes actually shipped to HF and ollama.com rather than a
+  build-time candidate. A failing tier is auto-withdrawn from HF and its
+  ollama tag is reported for manual removal (no registry delete API). Disable
+  only with the explicit `--no-sanity-check`. Verified PASS on a known-good
+  tier and FAIL on a corrupt one before being allowed to gate anything.
 - **2026-05-11 (first cut)** — initial public version. Pulled out of
   `pod2_chain_no_destroy.sh` into reusable single-purpose scripts. Added
   double-`ollama rm` after the v3 199 GB blob-leak incident. Verified on

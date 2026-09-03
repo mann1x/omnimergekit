@@ -341,6 +341,89 @@ IMATRIX_EXCLUDE = {
 # even when only excluded tiers are requested.
 _FORCE_IMATRIX = False
 
+# ── Ollama manifest identity: RENDERER / PARSER / PARAMETER ───────────────────
+# A bare `FROM <gguf>` Modelfile publishes a tag whose manifest CONFIG blob has
+# no renderer and no parser. ollama honours them ONLY when the config names them
+# (server/images.go: `if m.Config.Renderer != "" || m.Config.Parser != ""`), so
+# such a tag silently falls back to the GGUF-derived chat template — which
+# degrades to `{{ .Prompt }}` on complex Jinja (any Qwen3.x/Gemma template using
+# `{%- set … namespace(…) %}` + macros). The tag then loads, looks healthy in
+# `ollama ps`, and has no chat structure and no thinking channel.
+# Shipped bare on mannix/omnimerge-v6:IQ2_M/IQ2_S (2026-09-03) before this gate.
+_OLLAMA_RENDERER = ""
+_OLLAMA_PARSER = ""
+_OLLAMA_PARAMS: dict = {}
+_OLLAMA_REQUIRES = ""
+_OLLAMA_LICENSE = ""
+
+_OLLAMA_REGISTRY = "https://registry.ollama.ai/v2"
+_OLLAMA_MANIFEST_ACCEPT = "application/vnd.docker.distribution.manifest.v2+json"
+
+
+def _registry_blob(repo: str, digest: str, timeout: int = 30):
+    req = urllib.request.Request(f"{_OLLAMA_REGISTRY}/{repo}/blobs/{digest}")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def fetch_official_ollama_spec(ref: str, timeout: int = 30) -> dict:
+    """Read renderer / parser / params off a published ollama model, verbatim.
+
+    `ref` is "library/qwen3.8:27b", "qwen3.8:27b", or any "owner/model:tag".
+    Returns {"renderer": str, "parser": str, "params": dict}.
+
+    This exists so a derivative never has to GUESS its serving identity. Two
+    traps it removes: (a) the parser name is NOT derivable from the renderer
+    name — ollama has `RENDERER qwen3.8` but no `qwen3.8` parser, the correct
+    pairing is renderer qwen3.8 + parser qwen3.5; (b) sampling defaults drift
+    between a vendor's tags. Read them from the source of truth instead.
+    """
+    if "/" not in ref:
+        ref = "library/" + ref
+    repo, _, tag = ref.partition(":")
+    tag = tag or "latest"
+    req = urllib.request.Request(f"{_OLLAMA_REGISTRY}/{repo}/manifests/{tag}",
+                                 headers={"Accept": _OLLAMA_MANIFEST_ACCEPT})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        man = json.loads(r.read())
+
+    spec = {"renderer": "", "parser": "", "params": {}, "requires": "", "license": ""}
+    cfg_digest = (man.get("config") or {}).get("digest")
+    if cfg_digest:
+        cfg = _registry_blob(repo, cfg_digest, timeout)
+        spec["renderer"] = cfg.get("renderer") or ""
+        spec["parser"] = cfg.get("parser") or ""
+        # `requires` is the minimum ollama version the renderer needs. Without it a
+        # user on an older build pulls, loads, sees healthy VRAM in `ollama ps`, and
+        # then hits `unknown renderer "..."` at prompt-render time. With it, ollama
+        # can say plainly that the client is too old. It IS settable locally:
+        # parser.go accepts a REQUIRES directive and create.go copies it into config.
+        spec["requires"] = cfg.get("requires") or ""
+    for layer in man.get("layers", []):
+        mt = str(layer.get("mediaType", ""))
+        if mt.endswith("params"):
+            spec["params"] = _registry_blob(repo, layer["digest"], timeout)
+        elif mt.endswith("license"):
+            req = urllib.request.Request(f"{_OLLAMA_REGISTRY}/{repo}/blobs/{layer['digest']}")
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                spec["license"] = r.read().decode("utf-8", "replace")
+    return spec
+
+
+def _modelfile_param_lines(params: dict) -> list:
+    """Render a params dict as Modelfile PARAMETER lines."""
+    out = []
+    for k, v in sorted(params.items()):
+        if isinstance(v, bool):
+            out.append(f"PARAMETER {k} {str(v).lower()}")
+        elif isinstance(v, (int, float)):
+            out.append(f"PARAMETER {k} {v}")
+        elif isinstance(v, list):
+            out.extend(f'PARAMETER {k} "{item}"' for item in v)
+        else:
+            out.append(f'PARAMETER {k} "{v}"')
+    return out
+
 
 def _uses_imatrix_by_rule(quant: str) -> bool:
     """True iff `quant` should be built WITH an imatrix under the name-based rule:
@@ -708,8 +791,17 @@ def quantize_one(tools: dict, f16_gguf: Path, output_dir: Path,
     out_name = f"{model_name}-{quant}.gguf"
     out_path = output_dir / out_name
     if out_path.exists():
-        print(f"  {quant}: already exists, skipping", flush=True)
-        return out_path
+        # Never re-use an existing artifact without looking inside it: a killed
+        # quantize leaves a full-size file whose sidecar hash matches its own
+        # corrupt bytes. Re-quantize instead of shipping it.
+        if not gguf_magic_ok(out_path):
+            print(f"  {quant}: existing file is NOT a GGUF (truncated/partial "
+                  f"quantize) — discarding and rebuilding", flush=True)
+            out_path.unlink(missing_ok=True)
+            (output_dir / f"{out_name}.sha256").unlink(missing_ok=True)
+        else:
+            print(f"  {quant}: already exists, skipping", flush=True)
+            return out_path
 
     # Determine the base quant type (= file-base FTYPE arg) for llama-quantize
     if quant in _L_XL_VARIANTS:
@@ -986,25 +1078,50 @@ def sanity_check(tools: dict, gguf_path: Path, quant_name: str,
         print(f"  {quant_name}: sanity check skipped (no llama-server)", flush=True)
         return True
 
-    # Start server with --fit, reasoning disabled for clean JSON answers
+    # Serve on the model's OWN chat template (--jinja) with a small but NON-ZERO
+    # thinking budget.
+    #
+    # The previous config was `--reasoning-format deepseek --reasoning-budget 0`,
+    # which false-FAILed every tier of the Qwen3.6/3.8 family: those are
+    # thinking-in-content reasoners, and budget-0 plus a foreign reasoning format
+    # strands the answer, so the expected string never appears. That turned green
+    # quants into "sanity FAIL, skipping upload" on EVERY tier -- hours of building
+    # with nothing reaching HF. A bounded budget lets a thinking model finish
+    # reasoning and still answer, and is harmless on a model that never thinks.
+    base_args = [server_bin, "-m", str(gguf_path), "--port", str(port),
+                 "-c", "4096", "--fit", "on", "--no-warmup", "-t", "4", "--jinja"]
     proc = subprocess.Popen(
-        [server_bin, "-m", str(gguf_path), "--port", str(port),
-         "-c", "2048", "--fit", "on", "--no-warmup", "-t", "4",
-         "--reasoning-format", "deepseek", "--reasoning-budget", "0"],
+        base_args + ["--reasoning-budget", "256"],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
     )
 
-    # Wait for ready
-    ready = False
-    for _ in range(120):
-        try:
-            r = requests.get(f"http://localhost:{port}/health", timeout=2)
-            if r.status_code == 200:
-                ready = True
-                break
-        except Exception:
-            pass
-        time.sleep(1)
+    # Readiness is `"status":"ok"`, NOT HTTP 200. llama-server answers /health with
+    # HTTP 200 and {"error":"Loading model"} for the whole load, so a status-code
+    # probe reports "ready" while the model is still loading and every request
+    # after it fails against a model that is not there yet.
+    def _ready(deadline_s: int) -> bool:
+        for _ in range(deadline_s):
+            if proc.poll() is not None:
+                return False          # server died; don't wait out the clock
+            try:
+                r = requests.get(f"http://localhost:{port}/health", timeout=2)
+                if '"status":"ok"' in r.text.replace(" ", ""):
+                    return True
+            except Exception:
+                pass
+            time.sleep(1)
+        return False
+
+    ready = _ready(180)
+    if not ready and proc.poll() is not None:
+        # Most likely an unsupported flag on an older llama.cpp. Retry bare before
+        # calling the quant bad: a harness limitation must never be reported as a
+        # model defect.
+        print(f"  {quant_name}: sanity: server exited; retrying without "
+              f"--reasoning-budget", flush=True)
+        proc = subprocess.Popen(base_args, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE)
+        ready = _ready(180)
 
     if not ready:
         proc.kill()
@@ -1018,8 +1135,8 @@ def sanity_check(tools: dict, gguf_path: Path, quant_name: str,
             r = requests.post(
                 f"http://localhost:{port}/v1/chat/completions",
                 json={"model": "test", "messages": [{"role": "user", "content": prompt}],
-                      "max_tokens": 100, "temperature": 0},
-                timeout=120,
+                      "max_tokens": 768, "temperature": 0},
+                timeout=180,
             )
             msg = r.json()["choices"][0]["message"]
             content = msg.get("content", "") + " " + msg.get("reasoning_content", "")
@@ -1405,6 +1522,66 @@ def _ollama_store() -> Path:
     return Path("/root/.ollama/models")
 
 
+def _read_local_tag_config(target_tag: str) -> dict | None:
+    """Read the manifest CONFIG blob ollama wrote for a local tag.
+
+    Returns the parsed config (renderer/parser/model_family/...) or None when the
+    manifest cannot be located — which itself is a red flag: it means the store
+    this process resolved is not the store the daemon writes to (the classic
+    OLLAMA_MODELS-not-exported case, where the post-push blob purge then frees
+    nothing and the live store grows unbounded).
+    """
+    repo, _, tag = target_tag.partition(":")
+    tag = tag or "latest"
+    manifest = _ollama_store() / "manifests" / "registry.ollama.ai" / repo / tag
+    try:
+        man = json.loads(manifest.read_text())
+        digest = (man.get("config") or {}).get("digest", "")
+        blob = _ollama_store() / "blobs" / digest.replace(":", "-")
+        return json.loads(blob.read_text())
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def gguf_magic_ok(path: Path) -> bool:
+    """True when `path` starts with the GGUF magic. Cheap, and load-bearing.
+
+    A quantize killed part-way leaves a plausible-looking file: right name, right
+    directory, multi-GB, and a `.sha256` sidecar that matches its own corrupt bytes
+    perfectly — so every hash check passes. The only thing wrong is the content, and
+    the first four bytes are enough to see it (a truncated llama-quantize output
+    begins `00 00 00 00`).
+    On 2026-09-03 two such files (IQ3_XS, IQ4_NL) were published to Hugging Face
+    because the `already exists, skipping` path re-used them without ever looking
+    inside, and `ollama create` rejected both with `unsupported content type: unknown`.
+    """
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(4) == b"GGUF"
+    except OSError:
+        return False
+
+
+def _chown_blob_to_store_owner(blob_path: Path, blob_dir: Path, label: str) -> bool:
+    """Give a pre-staged blob the same owner as the store, so the daemon can touch it.
+
+    Returns True when the blob ends up owned by the store owner (or already was).
+    """
+    try:
+        want = os.stat(blob_dir)
+        cur = os.stat(blob_path)
+        if (cur.st_uid, cur.st_gid) == (want.st_uid, want.st_gid):
+            return True
+        os.chown(blob_path, want.st_uid, want.st_gid)
+        os.chmod(blob_path, 0o644)
+        print(f"{label}: blob chowned to uid={want.st_uid} gid={want.st_gid} "
+              f"(store owner) so the daemon can chtimes it", flush=True)
+        return True
+    except OSError as e:
+        print(f"{label}: cannot chown pre-staged blob ({e})", flush=True)
+        return False
+
+
 def _prestage_ollama_blob(gguf_path: Path, label: str) -> bool:
     """Pre-stage GGUF as ollama blob via hardlink so `ollama create` skips
     the multi-minute "gathering model components" file-copy step.
@@ -1444,9 +1621,25 @@ def _prestage_ollama_blob(gguf_path: Path, label: str) -> bool:
     blob_path = blob_dir / f"sha256-{sha}"
     if blob_path.exists():
         print(f"{label}: ollama blob already present for sha256-{sha[:12]}...", flush=True)
+        _chown_blob_to_store_owner(blob_path, blob_dir, label)
         return True
     try:
         os.link(str(gguf_path), str(blob_path))
+        # The daemon runs as its own user (`User=ollama`); a hardlink made by root
+        # stays root-owned, and `ollama create` then calls chtimes() on the blob —
+        # which a non-owner cannot do. It fails with
+        #   Error: chtimes <blob>: operation not permitted
+        # or, having half-written the blob, the later read reports
+        #   unsupported content type: unknown            (server/create.go)
+        # Both were seen on bs2 2026-09-03 (ollama 0.33.2) and killed EVERY new
+        # tier's create while tiers whose blob ollama had written itself passed.
+        # If we cannot hand ownership over, drop the link and let ollama copy —
+        # a copy costs disk and minutes, a bad blob costs the whole publish.
+        if not _chown_blob_to_store_owner(blob_path, blob_dir, label):
+            blob_path.unlink(missing_ok=True)
+            print(f"{label}: pre-stage reverted (cannot chown blob to store owner); "
+                  f"ollama will copy", flush=True)
+            return False
         print(f"{label}: pre-staged ollama blob sha256-{sha[:12]}... (hardlink, 0 disk cost)", flush=True)
         return True
     except OSError as e:
@@ -1465,6 +1658,36 @@ def _prestage_ollama_blob(gguf_path: Path, label: str) -> bool:
             return False
         print(f"{label}: blob pre-stage failed ({e}); ollama will copy", flush=True)
         return False
+
+
+def hf_delete_quant(repo_id: str, gguf_path: Path, quant_name: str) -> list[str]:
+    """Remove a published quant (GGUF + .sha256 sidecar) from the HF repo.
+
+    Called when the post-push sanity gate fails: the bytes are already on HF
+    (and on ollama.com), so the tier has to be actively withdrawn rather than
+    merely skipped. Returns the paths actually deleted. Never raises — a
+    failure here must not mask the sanity failure that triggered it; the
+    caller still records the tier and the end-of-run report still fires.
+    """
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    removed: list[str] = []
+    names = [gguf_path.name, _sha256_sidecar_path(gguf_path).name]
+    for name in names:
+        try:
+            api.delete_file(
+                path_in_repo=name,
+                repo_id=repo_id,
+                repo_type="model",
+                commit_message=f"Remove {name}: failed post-push sanity check",
+            )
+            removed.append(name)
+            print(f"  {quant_name}: removed {name} from {repo_id}", flush=True)
+        except Exception as exc:
+            print(f"  {quant_name}: could NOT remove {name} from {repo_id}: {exc}",
+                  flush=True)
+    return removed
 
 
 def push_to_ollama_from_local(gguf_path: Path, ollama_target: str,
@@ -1513,6 +1736,16 @@ def push_to_ollama_from_local(gguf_path: Path, ollama_target: str,
             # per-turn assistant/tool format that the renderer would otherwise
             # emit. Mirrors the published mannix/gemma4-98e recipe.
             lines.append('TEMPLATE """' + GEMMA4_A4B_TOOLS_TEMPLATE + '"""')
+    # Serving identity (renderer/parser/params) — see the _OLLAMA_RENDERER note.
+    if _OLLAMA_RENDERER:
+        lines.append(f"RENDERER {_OLLAMA_RENDERER}")
+    if _OLLAMA_PARSER:
+        lines.append(f"PARSER {_OLLAMA_PARSER}")
+    if _OLLAMA_REQUIRES:
+        lines.append(f"REQUIRES {_OLLAMA_REQUIRES}")
+    lines.extend(_modelfile_param_lines(_OLLAMA_PARAMS))
+    if _OLLAMA_LICENSE:
+        lines.append('LICENSE """' + _OLLAMA_LICENSE.replace('"""', '\"\"\"') + '"""')
     mf_path.write_text("\n".join(lines) + "\n")
 
     def _flush_local_refs():
@@ -1542,6 +1775,31 @@ def push_to_ollama_from_local(gguf_path: Path, ollama_target: str,
     if not create_ok:
         print(f"{label}: FINAL FAIL on create after {max_attempts} attempts", flush=True)
         return False
+
+    # Gate: read the config blob ollama actually WROTE and assert the serving
+    # identity landed. `ollama create` returns 0 for a bare tag just as happily
+    # as for a correct one, so the exit code proves nothing here. A too-old
+    # daemon that does not know the renderer is exactly the case this catches:
+    # it loads fine and fails later at prompt-render time, in the user's hands.
+    if _OLLAMA_RENDERER or _OLLAMA_PARSER:
+        got = _read_local_tag_config(target_tag)
+        if got is None:
+            print(f"{label}: FAIL — cannot read back config for {target_tag} "
+                  f"(store {_ollama_store()}); refusing to push unverified.", flush=True)
+            return False
+        bad = []
+        if _OLLAMA_RENDERER and got.get("renderer") != _OLLAMA_RENDERER:
+            bad.append(f"renderer={got.get('renderer')!r} want {_OLLAMA_RENDERER!r}")
+        if _OLLAMA_PARSER and got.get("parser") != _OLLAMA_PARSER:
+            bad.append(f"parser={got.get('parser')!r} want {_OLLAMA_PARSER!r}")
+        if bad:
+            print(f"{label}: FAIL — serving identity not written: {'; '.join(bad)}. "
+                  f"Daemon is likely too old for this renderer (`ollama --version`). "
+                  f"Refusing to push a tag that would silently lose chat/thinking.",
+                  flush=True)
+            return False
+        print(f"{label}: config verified renderer={got.get('renderer')!r} "
+              f"parser={got.get('parser')!r}", flush=True)
 
     # Push
     print(f"{label}: pushing {target_tag} ...", flush=True)
@@ -1613,7 +1871,10 @@ def upload_worker(upload_queue: Queue, repo_id: str, stop_event: Event,
                   keep_base: set[str] = None,
                   ollama_target: str = None,
                   ollama_template: str = "auto",
-                  ollama_failed: list = None):
+                  ollama_failed: list = None,
+                  tools: dict = None,
+                  sanity_enabled: bool = True,
+                  sanity_failed: list = None):
     """Worker thread: uploads completed quants from queue, optionally pushes
     to ollama.com, then deletes the local file.
 
@@ -1624,6 +1885,13 @@ def upload_worker(upload_queue: Queue, repo_id: str, stop_event: Event,
     ollama_failed: shared list to record (quant_name, gguf_filename) pairs whose
                    inline ollama push failed; main() retries them at the end
                    by re-downloading from the published HF GGUF repo.
+    tools: llama.cpp tool paths, needed by the post-push sanity gate.
+    sanity_enabled: run sanity_check() on the shipped bytes AFTER the HF upload
+                   and the ollama push. Default ON — disable only via
+                   --no-sanity-check.
+    sanity_failed: shared list to record (quant_name, repo_id, removed_paths,
+                   ollama_tag) for every tier that failed the gate. main()
+                   prints the manual ollama-removal instructions at the end.
     """
     while not stop_event.is_set() or not upload_queue.empty():
         try:
@@ -1633,6 +1901,15 @@ def upload_worker(upload_queue: Queue, repo_id: str, stop_event: Event,
         if item is None:
             break
         gguf_path, quant_name = item
+        # Last gate before the artifact leaves this machine. A publish is the one
+        # step that cannot be quietly retried: a corrupt tier on the Hub is public
+        # the moment it lands. Cost here is a 4-byte read.
+        if not gguf_magic_ok(gguf_path):
+            print(f"  {quant_name}: REFUSING UPLOAD — {gguf_path.name} is not a GGUF "
+                  f"(truncated/partial quantize). Local file kept for inspection.",
+                  flush=True)
+            upload_queue.task_done()
+            continue
         try:
             upload_gguf(repo_id, gguf_path, quant_name)
             # Update README with quant size
@@ -1671,12 +1948,33 @@ def upload_worker(upload_queue: Queue, repo_id: str, stop_event: Event,
                     # the local file is about to be deleted to save disk).
                     ollama_failed.append((quant_name, gguf_path.name))
 
+            # ── Post-push sanity gate ────────────────────────────────────
+            # Runs on the SAME local bytes that were just shipped to HF and
+            # ollama.com — a gate that inspects anything else cannot certify
+            # what was published. A failure withdraws the tier from HF here;
+            # the ollama registry has no delete API, so the tag is recorded
+            # and main() tells the operator to remove it by hand.
+            sanity_ok = True
+            if (sanity_enabled and tools and gguf_path.exists()
+                    and not quant_name.upper().startswith(("F16", "F32"))):
+                sanity_ok = sanity_check(tools, gguf_path, quant_name)
+                if not sanity_ok:
+                    print(f"  {quant_name}: SANITY FAILED after push — "
+                          f"withdrawing from {repo_id}", flush=True)
+                    removed = hf_delete_quant(repo_id, gguf_path, quant_name)
+                    tag = (f"{ollama_target}:{_gguf_tag_from_filename(gguf_path)}"
+                           if ollama_target else None)
+                    if sanity_failed is not None:
+                        sanity_failed.append((quant_name, repo_id, removed, tag))
+
             # Delete the GGUF after successful upload to save disk (unless
             # keep_base=None = keep all). The `.sha256` sidecar is deliberately
             # NOT deleted — it stays for cross-tier CD integrity checks (CD-*
             # tiers built later in the same run consult the sidecar of the
             # already-deleted plain Q-* counterpart) and for forensics.
-            if keep_base is not None and gguf_path.name not in keep_base:
+            # A sanity-FAILED tier keeps its local GGUF: those bytes are the
+            # only remaining copy and the sole evidence for the RCA.
+            if sanity_ok and keep_base is not None and gguf_path.name not in keep_base:
                 gguf_path.unlink(missing_ok=True)
                 print(f"  {quant_name}: deleted local file after upload "
                       f"(sidecar {sidecar.name} kept)", flush=True)
@@ -1701,8 +1999,13 @@ def main():
                         help="Comma-separated list of quants to create (overrides full list)")
     parser.add_argument("--exclude", default=None,
                         help="Comma-separated list of quants to exclude from full list")
-    parser.add_argument("--sanity-check", action="store_true",
-                        help="Run sanity check on each quant before upload")
+    parser.add_argument("--sanity-check", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Run the sanity check on every quant AFTER it is "
+                             "uploaded to HF and pushed to ollama (default: ON). "
+                             "A failing tier is withdrawn from HF automatically and "
+                             "its ollama tag is reported for manual removal. "
+                             "Disable with --no-sanity-check.")
     parser.add_argument("--no-upload", action="store_true",
                         help="Don't upload to HF, just quantize locally")
     parser.add_argument("--no-imatrix", action="store_true",
@@ -1740,6 +2043,19 @@ def main():
                         help="If set, after each successful HF upload also push the SAME local GGUF "
                              "to ollama.com as <ollama-target>:<quant-tag> (e.g. mannix/gemma4-31b-he1). "
                              "Skips F16/F32 bases. Requires the `ollama` CLI to be installed and authenticated.")
+    parser.add_argument("--ollama-inherit", default=None, metavar="REF",
+                        help="Copy RENDERER/PARSER/PARAMETER verbatim from a published ollama "
+                             "model (e.g. 'library/qwen3.8:27b'). Use this for any derivative of "
+                             "a vendor model: a bare FROM Modelfile publishes a tag with an empty "
+                             "config, which silently loses chat structure and the thinking channel. "
+                             "Explicit --ollama-renderer/--ollama-parser override what is fetched.")
+    parser.add_argument("--ollama-renderer", default=None,
+                        help="RENDERER name for the published tag (overrides --ollama-inherit).")
+    parser.add_argument("--ollama-parser", default=None,
+                        help="PARSER name for the published tag (overrides --ollama-inherit). "
+                             "NOTE: not derivable from the renderer name — ollama has a qwen3.8 "
+                             "renderer but no qwen3.8 parser; the pairing is renderer qwen3.8 + "
+                             "parser qwen3.5.")
     parser.add_argument("--ollama-template", choices=["auto", "gemma4", "gemma4-a4b"],
                         default="auto",
                         help="Ollama Modelfile chat template strategy. "
@@ -1784,6 +2100,25 @@ def main():
         parser.error("--force-imatrix and --no-imatrix are mutually exclusive")
     global _FORCE_IMATRIX
     _FORCE_IMATRIX = args.force_imatrix
+
+    global _OLLAMA_RENDERER, _OLLAMA_PARSER, _OLLAMA_PARAMS
+    global _OLLAMA_REQUIRES, _OLLAMA_LICENSE
+    if getattr(args, "ollama_inherit", None):
+        spec = fetch_official_ollama_spec(args.ollama_inherit)
+        _OLLAMA_RENDERER = spec["renderer"]
+        _OLLAMA_PARSER = spec["parser"]
+        _OLLAMA_PARAMS = spec["params"]
+        _OLLAMA_REQUIRES = spec.get("requires", "")
+        _OLLAMA_LICENSE = spec.get("license", "")
+        print(f">>> ollama identity inherited from {args.ollama_inherit}: "
+              f"renderer={_OLLAMA_RENDERER!r} parser={_OLLAMA_PARSER!r} "
+              f"params={json.dumps(_OLLAMA_PARAMS, sort_keys=True)} "
+              f"requires={_OLLAMA_REQUIRES or '(none)'} "
+              f"license={len(_OLLAMA_LICENSE)}B", flush=True)
+    if getattr(args, "ollama_renderer", None):
+        _OLLAMA_RENDERER = args.ollama_renderer
+    if getattr(args, "ollama_parser", None):
+        _OLLAMA_PARSER = args.ollama_parser
 
     # Set HF token
     if args.hf_token:
@@ -2288,6 +2623,9 @@ def main():
     stop_upload = Event()
     upload_thread = None
     ollama_failed: list = []   # (quant_name, gguf_filename) for end-of-run retry
+    # (quant_name, repo_id, removed_paths, ollama_tag) for tiers that failed the
+    # post-push sanity gate and were withdrawn from HF.
+    sanity_failed: list = []
     if hf_repo:
         # Never delete the base F16/F32 GGUF or imatrix — quants depend on them
         # If --keep-local, keep everything by passing all filenames
@@ -2298,7 +2636,8 @@ def main():
         upload_thread = Thread(target=upload_worker,
                                args=(upload_queue, hf_repo, stop_upload, keep_files,
                                      args.ollama_target, args.ollama_template,
-                                     ollama_failed),
+                                     ollama_failed, tools, args.sanity_check,
+                                     sanity_failed),
                                daemon=True)
         upload_thread.start()
 
@@ -2360,11 +2699,14 @@ def main():
             # tensor assigned to its default tier).
             verify_cd_distinct(gguf_path, quant, model_name, output_dir, hf_repo)
 
-            # Sanity check
-            if args.sanity_check:
+            # Sanity check. With an upload target the gate runs POST-push in
+            # upload_worker (on the shipped bytes, so a failure can withdraw
+            # them). With --no-upload there is nothing to withdraw, so it runs
+            # here instead and simply marks the tier failed.
+            if args.sanity_check and not hf_repo:
                 ok = sanity_check(tools, gguf_path, quant)
                 if not ok:
-                    print(f"  {quant}: FAILED sanity check, skipping upload", flush=True)
+                    print(f"  {quant}: FAILED sanity check", flush=True)
                     failed.append((quant, "sanity check failed"))
                     continue
 
@@ -2449,7 +2791,13 @@ def main():
         if ollama_failed and any(q == lt for q, _ in ollama_failed):
             if 'ollama_still_failed' in locals() and lt in ollama_still_failed:
                 lt_on_ollama = False
-        if not lt_on_ollama:
+        # A tier withdrawn by the sanity gate must never become :latest — it
+        # is no longer on HF and is queued for manual removal from ollama.com.
+        lt_sanity_failed = any(q == lt for q, _, _, _ in sanity_failed)
+        if lt_sanity_failed:
+            print(f"\n:latest skipped — {lt} FAILED the post-push sanity gate",
+                  flush=True)
+        elif not lt_on_ollama:
             print(f"\n:latest skipped — {lt} did not land on ollama.com", flush=True)
         else:
             print(f"\n=== :latest retag (source=:{lt}) ===", flush=True)
@@ -2492,6 +2840,35 @@ def main():
                                        capture_output=True, text=True)
     elif args.ollama_target and args.ollama_no_latest:
         print("\n:latest stage skipped (--ollama-no-latest)", flush=True)
+
+    # ── Post-push sanity failures ────────────────────────────
+    # These tiers were published, then failed the gate on the shipped bytes.
+    # HF was cleaned up automatically; ollama.com has no delete API, so the
+    # operator has to remove the tag by hand. Make that unmissable.
+    if sanity_failed:
+        for q, _repo, _removed, _tag in sanity_failed:
+            if q in succeeded:
+                succeeded.remove(q)
+            failed.append((q, "post-push sanity check failed (withdrawn from HF)"))
+        print(f"\n{'!'*60}", flush=True)
+        print(f"  {len(sanity_failed)} TIER(S) FAILED THE POST-PUSH SANITY CHECK",
+              flush=True)
+        print(f"{'!'*60}", flush=True)
+        for q, repo, removed, tag in sanity_failed:
+            print(f"  {q}:", flush=True)
+            if removed:
+                print(f"    HF   — REMOVED from {repo}: {', '.join(removed)}",
+                      flush=True)
+            else:
+                print(f"    HF   — removal FAILED, delete by hand: "
+                      f"https://huggingface.co/{repo}", flush=True)
+            if tag:
+                print(f"    OLLAMA — REMOVE THIS TAG BY HAND: {tag}", flush=True)
+        if any(t for _, _, _, t in sanity_failed):
+            print("\n  ollama.com has no delete API. Remove each tag above at", flush=True)
+            print("  https://ollama.com/<namespace>/<model> -> tag -> Delete.", flush=True)
+        print(f"  Local GGUFs were KEPT for RCA under {output_dir}", flush=True)
+        print(f"{'!'*60}", flush=True)
 
     # ── Summary ──────────────────────────────────────────────
     elapsed = time.time() - t_total
