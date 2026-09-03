@@ -683,6 +683,22 @@ def human_bytes(n: int) -> str:
         n /= 1024
 
 
+def detect_output_gate_type(cfg: dict):
+    """output_gate_type from a base config, checking BOTH layouts.
+
+    Qwen publishes the 27B VL configs with the text tower nested under "text_config",
+    so a top-level-only lookup returns None and silently disables the auto MLP-skip
+    guard on the exact family it protects. Verified 2026-09-02 against the real
+    Qwen/Qwen3.8-27B and Qwen/Qwen3.6-27B config.json (top-level None, text_config
+    'swish'). The failure is invisible -- a full MLP merge runs fine and leaks <think>
+    ~80% of the time. [[feedback_an_unchecked_case_is_silent]]
+    """
+    v = cfg.get("output_gate_type")
+    if v is None:
+        v = cfg.get("text_config", {}).get("output_gate_type")
+    return v
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", required=True, type=Path, help="Base model directory (HF safetensors). The merged delta is added TO this — it's the starting point of the output model.")
@@ -834,9 +850,13 @@ def main():
     base_gate_type = None
     if base_cfg_path.exists():
         try:
-            base_gate_type = json.loads(base_cfg_path.read_text()).get("output_gate_type")
+            base_gate_type = detect_output_gate_type(json.loads(base_cfg_path.read_text()))
         except Exception as e:
             print(f"WARNING: could not parse {base_cfg_path}: {e}", flush=True)
+    if base_gate_type is None:
+        print("  auto MLP-skip NOT triggered: no output_gate_type at top level or under "
+              "text_config in the base config. If this is a Qwen3.6+ base, the fragile "
+              "think-policy is UNPROTECTED — pass --skip-patterns explicitly.", flush=True)
     if base_gate_type is not None and not args.no_auto_mlp_skip:
         added = [p for p in auto_mlp if not any(p in s or s in p for s in skip_patterns)]
         if added:
