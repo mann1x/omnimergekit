@@ -58,3 +58,39 @@ install the binary to restore the gate.
 > Historical incident: 2026-05-23 — a live HF token leaked via a `${HF_TOKEN:-...}`
 > fallback in `scripts/pod_quant_31b.sh`. Token was revoked, history scrubbed, and
 > this gate added so the class of mistake is now un-committable.
+
+## Dependency advisories — accepted risk on the pinned eval stack
+
+`requirements.txt` and `.requirements_eval_filtered.txt` pin `torch==2.10.0` and
+`transformers==5.5.0`. These pins are **provenance**, not merely a lockfile: they
+record the stack every published eval score was produced on. Bumping them makes
+future scores incomparable to every result already released, so a dependency
+advisory is not on its own sufficient reason to move them. Decide explicitly,
+record the decision here, and re-pin the whole cohort together — never one
+package silently.
+
+Reviewed 2026-09-03 (4 open Dependabot alerts, 2 high + 2 low, duplicated across
+the two manifests):
+
+| advisory | package | status |
+|---|---|---|
+| `torch.jit.script` memory corruption (`<= 2.12.1`, fixed 2.13.0) | torch 2.10.0 | **NOT EXPOSED** |
+| `save_pretrained` path traversal via chat-template names (`< 5.10.0`, fixed 5.10.0) | transformers 5.5.0 | **ACCEPTED** |
+
+**torch — not exposed.** `git grep -nE "torch\.jit|jit\.script|jit\.trace|TorchScript"`
+over the whole tracked tree returns zero hits. The vulnerable entry point is never
+called. Re-run that grep before assuming this still holds; introducing any
+TorchScript use makes the advisory live and this row must be revisited.
+
+**transformers — accepted, with a real surface.** The flaw allows a crafted chat
+template *name* to write outside the target directory during `save_pretrained`,
+and this repo has ~52 `save_pretrained` call sites and routinely loads
+third-party checkpoints from the Hub. It is accepted because re-pinning would
+invalidate the published v4/v6/v7 eval bases, not because the risk is nil.
+Mitigation until the pin moves: treat an untrusted checkpoint's `config.json` /
+`chat_template.jinja` as hostile input — prefer vendor and own-account repos, and
+check `save_pretrained` wrote only inside the intended output dir when merging a
+checkpoint from an unfamiliar author.
+
+Revisit when a cohort boundary opens (no eval in flight, no run mid-campaign):
+that is the only cheap moment to move the pin.
