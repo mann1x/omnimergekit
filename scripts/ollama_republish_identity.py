@@ -36,7 +36,7 @@ from pathlib import Path
 REG = "https://registry.ollama.ai/v2"
 ACCEPT = {"Accept": "application/vnd.docker.distribution.manifest.v2+json"}
 # Directives we regenerate; anything else in the derived Modelfile is preserved.
-_STRIP = re.compile(r"^\s*(RENDERER|PARSER|PARAMETER)\b", re.I)
+_STRIP = re.compile(r"^\s*(RENDERER|PARSER|PARAMETER|REQUIRES)\b", re.I)
 # TEMPLATE is dropped too, and that is deliberate. `ollama show --modelfile` on a
 # tag with no template layer renders the GGUF-derived fallback as a literal
 # TEMPLATE directive -- and on complex Jinja that fallback is the degenerate
@@ -75,17 +75,25 @@ def _get(url: str, headers: dict | None = None, timeout: int = 60):
 
 
 def fetch_identity(ref: str) -> dict:
-    """renderer / parser / params of a published model, read verbatim."""
+    """renderer / parser / params / requires of a published model, verbatim.
+
+    `requires` matters as much as the renderer: it is the guard that makes an
+    ollama too old for the renderer REFUSE the model instead of loading it and
+    degrading silently at render time (the qwen3.8 renderer needs >= 0.32.12).
+    A tag that carries the renderer but not the requires floor still fails on
+    an old client -- just later, and invisibly.
+    """
     if "/" not in ref:
         ref = "library/" + ref
     repo, _, tag = ref.partition(":")
     man = _get(f"{REG}/{repo}/manifests/{tag or 'latest'}", ACCEPT)
-    out = {"renderer": "", "parser": "", "params": {}}
+    out = {"renderer": "", "parser": "", "params": {}, "requires": ""}
     cfg = (man.get("config") or {}).get("digest")
     if cfg:
         c = _get(f"{REG}/{repo}/blobs/{cfg}")
         out["renderer"] = c.get("renderer") or ""
         out["parser"] = c.get("parser") or ""
+        out["requires"] = c.get("requires") or ""
     for layer in man.get("layers", []):
         if str(layer.get("mediaType", "")).endswith("params"):
             out["params"] = _get(f"{REG}/{repo}/blobs/{layer['digest']}")
@@ -98,6 +106,38 @@ def published_config(namespace: str, tag: str) -> dict | None:
         return _get(f"{REG}/{namespace}/blobs/{man['config']['digest']}")
     except Exception:
         return None
+
+
+def published_identity(namespace: str, tag: str) -> dict | None:
+    """Everything this tool WRITES, read back off the registry.
+
+    The skip test has to compare the full intended identity, not merely ask
+    whether a renderer exists. A tag carrying renderer+parser but missing
+    `requires` is NOT done -- it is missing the guard that stops an old ollama
+    loading it and degrading at render time. Comparing only "has something"
+    makes the tool accept partial state and never converge.
+    """
+    try:
+        man = _get(f"{REG}/{namespace}/manifests/{tag}", ACCEPT)
+    except Exception:
+        return None
+    out = {"renderer": "", "parser": "", "requires": "", "params": {}}
+    cfg = (man.get("config") or {}).get("digest")
+    if cfg:
+        try:
+            c = _get(f"{REG}/{namespace}/blobs/{cfg}")
+            out["renderer"] = c.get("renderer") or ""
+            out["parser"] = c.get("parser") or ""
+            out["requires"] = c.get("requires") or ""
+        except Exception:
+            return None
+    for layer in man.get("layers", []):
+        if str(layer.get("mediaType", "")).endswith("params"):
+            try:
+                out["params"] = _get(f"{REG}/{namespace}/blobs/{layer['digest']}")
+            except Exception:
+                return None
+    return out
 
 
 def list_tags(namespace: str) -> list[str]:
@@ -154,6 +194,17 @@ def run(cmd: list[str], timeout: int = 7200):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
+def has_vision(ref: str) -> bool:
+    """True if the local tag reports the vision capability.
+
+    Read via capture_output, never `ollama show | grep -q`: grep exits on match,
+    SIGPIPEs ollama show (141), and under `set -o pipefail` the caller inherits
+    that -- a model that HAS vision then reports FALSE (bug-666, 13 lost tiers).
+    """
+    r = run(["ollama", "show", ref], timeout=300)
+    return "vision" in (r.stdout or "").lower()
+
+
 def free_gb(path: Path) -> float:
     st = os.statvfs(path)
     return st.f_bavail * st.f_frsize / 1e9
@@ -191,6 +242,9 @@ def main() -> int:
     ap.add_argument("--namespace", required=True, help="e.g. mannix/omnimerge-v4")
     ap.add_argument("--inherit", required=True, help="reference model, e.g. library/qwen3.6:27b")
     ap.add_argument("--only", default=None, help="comma-separated subset of tags")
+    ap.add_argument("--license", type=Path, default=None,
+                    help="Embed this licence file into any tag that lacks a licence layer. "
+                         "Tags that already carry one are left byte-identical.")
     ap.add_argument("--min-free-gb", type=float, default=120.0,
                     help="refuse to pull when the store filesystem is below this (default 120)")
     ap.add_argument("--dry-run", action="store_true")
@@ -212,7 +266,8 @@ def main() -> int:
         print(f"FATAL: {args.inherit} declares no renderer/parser — nothing to inherit", flush=True)
         return 2
     print(f">>> identity from {args.inherit}: renderer={ident['renderer']!r} "
-          f"parser={ident['parser']!r} params={json.dumps(ident['params'], sort_keys=True)}",
+          f"parser={ident['parser']!r} requires={ident['requires']!r} "
+          f"params={json.dumps(ident['params'], sort_keys=True)}",
           flush=True)
 
     tags = args.only.split(",") if args.only else list_tags(args.namespace)
@@ -224,12 +279,19 @@ def main() -> int:
     done = skipped = failed = 0
     for i, tag in enumerate(tags, 1):
         ref = f"{args.namespace}:{tag}"
-        cfg = published_config(args.namespace, tag)
-        if cfg and (cfg.get("renderer") or cfg.get("parser")):
-            print(f"[{i}/{len(tags)}] {tag}: already has identity "
-                  f"({cfg.get('renderer')}/{cfg.get('parser')}) — skip", flush=True)
+        cur = published_identity(args.namespace, tag)
+        if cur is not None and all(
+                cur.get(k) == ident.get(k)
+                for k in ("renderer", "parser", "requires", "params")):
+            print(f"[{i}/{len(tags)}] {tag}: identity already matches — skip",
+                  flush=True)
             skipped += 1
             continue
+        if cur is not None and (cur.get("renderer") or cur.get("parser")):
+            diff = [k for k in ("renderer", "parser", "requires", "params")
+                    if cur.get(k) != ident.get(k)]
+            print(f"[{i}/{len(tags)}] {tag}: PARTIAL identity, differs on "
+                  f"{'+'.join(diff)} — republishing", flush=True)
         if args.dry_run:
             print(f"[{i}/{len(tags)}] {tag}: WOULD republish", flush=True)
             done += 1
@@ -254,6 +316,14 @@ def main() -> int:
             failed += 1
             continue
 
+        # A vision tag must still be a vision tag after the rebuild. The Modelfile
+        # is regenerated from `ollama show --modelfile`, and that command is already
+        # known not to round-trip everything (it drops REQUIRES outright). If it also
+        # omits the projector FROM, the recreated tag silently loses its mmproj layer
+        # and the renderer/parser-only verify below would happily push a text-only
+        # model over a good vision tag -- 19 v6 + 45 v4 tags of irreversible damage.
+        had_vision = has_vision(ref)
+
         show = run(["ollama", "show", ref, "--modelfile"])
         if show.returncode != 0:
             print(f"[{i}/{len(tags)}] {tag}: SHOW FAILED", flush=True)
@@ -264,8 +334,15 @@ def main() -> int:
         body = strip_template(
             [ln for ln in show.stdout.splitlines() if not _STRIP.match(ln)])
         lines = body + [f"RENDERER {ident['renderer']}" if ident["renderer"] else "",
-                        f"PARSER {ident['parser']}" if ident["parser"] else ""]
+                        f"PARSER {ident['parser']}" if ident["parser"] else "",
+                        f"REQUIRES {ident['requires']}" if ident["requires"] else ""]
         lines = [x for x in lines if x] + param_lines(ident["params"])
+        # Add a licence only when the tag has none. `show --modelfile` DOES
+        # round-trip LICENSE, so an existing one is already in `body`; appending a
+        # second would create a duplicate layer.
+        if args.license and not any(ln.lstrip().upper().startswith("LICENSE")
+                                    for ln in body):
+            lines.append('LICENSE """' + args.license.read_text() + '"""')
         mf = store.parent / f"_republish_{tag}.Modelfile"
         mf.write_text("\n".join(lines) + "\n")
 
@@ -280,6 +357,14 @@ def main() -> int:
             time.sleep(5)
         mf.unlink(missing_ok=True)
         if not ok:
+            failed += 1
+            continue
+
+        if had_vision and not has_vision(ref):
+            nfrom = sum(1 for ln in body if ln.strip().upper().startswith("FROM"))
+            print(f"[{i}/{len(tags)}] {tag}: VISION LOST in rebuild "
+                  f"({nfrom} FROM line(s) carried over) — NOT pushing; "
+                  f"registry copy untouched, re-pull to restore locally", flush=True)
             failed += 1
             continue
 

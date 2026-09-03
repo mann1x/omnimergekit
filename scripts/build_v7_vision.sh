@@ -13,6 +13,9 @@
 # Idempotent: a tier whose vision tag is already on ollama.com is skipped.
 # Launch:  setsid nohup bash build_v7_vision.sh >LOG 2>&1 </dev/null &
 set -uo pipefail
+# NOTE 2026-09-03: capability/registry probes capture first and match via
+# herestring. `cmd | grep -q` under `set -o pipefail` inverts the result --
+# grep exits on match, SIGPIPEs cmd, and the pipeline inherits cmd's death.
 
 MMPROJ="/mnt/sdc/ml/gguf/v6coder/mmproj-gemma4.gguf"
 BLOBS="/usr/share/ollama/.ollama/models/blobs"
@@ -69,7 +72,8 @@ build_one(){
     ollama create "$REPO:$VT" -f "$WORK/mfv_$T" >/dev/null 2>&1 || { LOG "     CREATE FAILED — skip"; continue; }
     local vcap=0 ck
     for ck in 1 2 3; do
-      if ollama show "$REPO:$VT" 2>/dev/null | grep -qi vision; then vcap=1; break; fi
+      caps=$(ollama show "$REPO:$VT" 2>/dev/null || true)
+      if grep -qi vision <<<"$caps"; then vcap=1; break; fi
       LOG "     vision cap not visible (check $ck/3) — recreate+retry"
       ollama create "$REPO:$VT" -f "$WORK/mfv_$T" >/dev/null 2>&1; sleep 3
     done

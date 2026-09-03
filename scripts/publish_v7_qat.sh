@@ -4,6 +4,9 @@
 # Recipe: NOSHARED (drop-only). Clean published name carries noshared bytes.
 # imatrix: NONE (Q4_0 imatrix-free; QAT calibration baked in) — documented, not lost.
 set -uo pipefail
+# NOTE 2026-09-03: capability/registry probes capture first and match via
+# herestring. `cmd | grep -q` under `set -o pipefail` inverts the result --
+# grep exits on match, SIGPIPEs cmd, and the pipeline inherits cmd's death.
 export PATH="/srv/ml/envs/envs/omnimergekit/bin:$PATH"
 export HF_XET_HIGH_PERFORMANCE=1
 PY=/srv/ml/envs/envs/omnimergekit/bin/python
@@ -49,7 +52,7 @@ for r in "${ROWS[@]}"; do
   L ">>> ollama push $om:qat-Q4_0"
   ollama push "$om:qat-Q4_0" || { L "FATAL ollama push failed $m"; exit 1; }
   sleep 5
-  curl -s "https://ollama.com/$om" | grep -q ":qat-Q4_0" \
+  grep -q ":qat-Q4_0" <<<"$(curl -s "https://ollama.com/$om" || true)" \
     && L "  [ok] $om:qat-Q4_0 visible on ollama.com" \
     || L "  [WARN] qat-Q4_0 not yet visible on ollama.com (propagation lag)"
 done

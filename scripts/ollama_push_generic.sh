@@ -85,6 +85,9 @@ hf_download_one() {
 }
 
 # Run pre-download + create + push for one tag with retry. Returns 0 on success.
+# Optional path to a licence file embedded into every tag (empty = no licence layer).
+OL_LICENSE="${OL_LICENSE:-}"
+
 push_one_tag() {
     local TAG="$1" FILENAME="$2"
     local LABEL="${3:-}"
@@ -106,9 +109,21 @@ push_one_tag() {
         log "$LABEL $TAG:   downloaded $(du -h "$GGUF" | cut -f1) to $GGUF"
 
         # 2. Modelfile referencing the local file
+        # OL_LICENSE, when set, embeds the licence as a real layer. Without it the
+        # tag ships with NO licence at all and the ollama page shows none -- that is
+        # how mannix/omnimerge-v4 + -v4-mtp (92 tags) came to lack one while v6 has
+        # it. `ollama show --modelfile` does round-trip LICENSE, so a later identity
+        # republish preserves whatever is set here; it cannot invent one.
         cat > "$MF" <<EOF
 FROM $GGUF
 EOF
+        if [[ -n "$OL_LICENSE" ]]; then
+            if [[ -f "$OL_LICENSE" ]]; then
+                { printf 'LICENSE """'; cat "$OL_LICENSE"; printf '"""\n'; } >> "$MF"
+            else
+                log "$LABEL $TAG:   WARN OL_LICENSE=$OL_LICENSE not found — no licence layer"
+            fi
+        fi
 
         # 3. ollama create from local file (no HF pull)
         if ollama create "${OL_TARGET}:${TAG}" -f "$MF" >>"$LOG" 2>&1; then

@@ -23,6 +23,14 @@ set -uo pipefail
 REPO="${REPO:-mannix/gemma4-98e-v6-coder}"
 MMPROJ="${MMPROJ:-/mnt/sdc/ml/gguf/v6coder/mmproj-gemma4.gguf}"
 WORK="${WORK:-/mnt/sdc/ml/gguf/v6coder/vision_work}"
+# Settle time between daemon operations. ollama create/rm prune and rewrite blobs
+# in the background; the next operation can start before the previous one's
+# bookkeeping has landed. A pause between steps costs ~1 min/tier and removes a
+# whole class of race. Override with SETTLE=0 to run flat out.
+SETTLE="${SETTLE:-10}"
+# Minimum ollama version floor to stamp on the vision tags (see the REQUIRES note
+# at modelfile assembly). Empty = omit the directive.
+REQUIRES="${REQUIRES:-}"
 mkdir -p "$WORK"
 LOG(){ echo "[vis $(date -u +%H:%M:%S)] $*"; }
 
@@ -96,10 +104,16 @@ gc_blobs(){
 for T in "$@"; do
   VT="vision-$T"
   LOG "===== tier $T -> $REPO:$VT ====="
-  if curl -s "https://ollama.com/$REPO/tags" 2>/dev/null | grep -q ":$VT\b"; then
+  # Capture FIRST, then match via herestring (no pipe at all) -- same SIGPIPE trap as the vision-capability check
+  # below: `curl | grep -q` under pipefail makes grep exit on match, SIGPIPE curl
+  # (exit 23), and the pipeline inherits 23, so a tag that IS published reads as
+  # absent. This skip had therefore never fired; every run redid published tiers.
+  tags=$(curl -s "https://ollama.com/$REPO/tags" 2>/dev/null || true)
+  if grep -q ":$VT\b" <<<"$tags"; then
     LOG "  $VT already on registry — skip"; continue
   fi
   LOG "  pull $REPO:$T"
+  sleep "$SETTLE"
   ollama pull "$REPO:$T" >/dev/null 2>&1 || { LOG "  PULL FAILED — skip"; continue; }
   ollama show "$REPO:$T" --modelfile > "$WORK/mf_$T" 2>/dev/null || { LOG "  modelfile FAILED — skip"; continue; }
   # vision modelfile = original (params/renderer/parser/FROM base-blob) + projector,
@@ -119,26 +133,80 @@ for T in "$@"; do
     LOG "  WARNING: template strip empty for $T; keeping original"
     rm -f "$WORK/mf_$T.stripped"
   fi
-  { cat "$WORK/mf_$T"; echo; echo "FROM $MMPROJ"; } > "$WORK/mfv_$T"
+  # Re-assert REQUIRES. `ollama show --modelfile` round-trips RENDERER, PARSER and
+  # PARAMETER but NOT REQUIRES, so a vision tag derived from a text tag silently
+  # loses the version floor -- and REQUIRES is precisely the guard that makes an
+  # older ollama REFUSE the model instead of loading it and degrading at render
+  # time. Without this the floor has to be reattached by a second identity pass.
+  { cat "$WORK/mf_$T"
+    echo
+    [ -n "$REQUIRES" ] && echo "REQUIRES $REQUIRES"
+    echo "FROM $MMPROJ"; } > "$WORK/mfv_$T"
+  # Pre-stage the projector blob under its final digest. `ollama rm` prunes it
+  # after every tier, so each create otherwise re-copies 927 MB into a temp blob
+  # and renames it -- and ANY concurrent prune (this script's own rm, or another
+  # tool GCing the same store) deletes that temp mid-write. The rename then fails
+  # with "no such file or directory", the projector layer never lands, and the
+  # vision capability check correctly refuses to push. Staging the blob makes
+  # create say "using existing layer" and removes the write entirely.
+  if [ ! -f "$BLOBS/$MMSHA" ]; then
+    LOG "  staging mmproj blob $MMSHA"
+    cp -f "$MMPROJ" "$BLOBS/.stage_$MMSHA" && mv -f "$BLOBS/.stage_$MMSHA" "$BLOBS/$MMSHA" || {
+      LOG "  mmproj stage FAILED — skip"; rm -f "$BLOBS/.stage_$MMSHA"; continue; }
+    OWNER=$(stat -c "%u:%g" "$BLOBS" 2>/dev/null)
+    [ -n "$OWNER" ] && chown "$OWNER" "$BLOBS/$MMSHA" 2>/dev/null
+  fi
   LOG "  create $REPO:$VT"
-  ollama create "$REPO:$VT" -f "$WORK/mfv_$T" >/dev/null 2>&1 || { LOG "  CREATE FAILED — skip"; continue; }
+  if ! ollama create "$REPO:$VT" -f "$WORK/mfv_$T" > "$WORK/create_$T.log" 2>&1; then
+    LOG "  CREATE FAILED — skip"
+    sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' "$WORK/create_$T.log" | grep -viE "gathering|copying file" | tail -3 | while read -r l; do LOG "    | $l"; done
+    ollama rm "$REPO:$T" >/dev/null 2>&1
+    continue
+  fi
   # confirm vision capability before pushing; ollama create occasionally
   # returns before the projector layer is queryable -> recreate+recheck up to 3x.
+  sleep "$SETTLE"
   vcap=0
   for _ck in 1 2 3; do
-    if ollama show "$REPO:$VT" 2>/dev/null | grep -qi vision; then vcap=1; break; fi
+    # Capture FIRST, match via herestring. Never `ollama show | grep -q` under pipefail:
+    # grep -q exits the moment it matches, which SIGPIPEs ollama show (exit
+    # 141), and pipefail makes the pipeline inherit 141 -- so a model that DOES
+    # have vision reports "not visible". It is a race with how fast ollama show
+    # flushes, which is why it passed 6 of 19 tiers on 2026-09-03 and failed 13.
+    caps=$(ollama show "$REPO:$VT" 2>/dev/null || true)
+    if grep -qi vision <<<"$caps"; then vcap=1; break; fi
     LOG "  vision cap not visible (check $_ck/3) - recreate+retry"
-    ollama create "$REPO:$VT" -f "$WORK/mfv_$T" >/dev/null 2>&1
-    sleep 3
+    ollama create "$REPO:$VT" -f "$WORK/mfv_$T" > "$WORK/create_$T.log" 2>&1
+    sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' "$WORK/create_$T.log" | grep -viE "gathering|copying file|using existing|writing manifest|^success" | tail -2 | while read -r l; do [ -n "$l" ] && LOG "    | $l"; done
+    sleep "$SETTLE"
   done
   if [ "$vcap" = 0 ]; then
-    LOG "  WARN: $VT no vision capability after 3 tries - NOT pushing"; ollama rm "$REPO:$VT" >/dev/null 2>&1; continue
+    LOG "  WARN: $VT no vision capability after 3 tries - NOT pushing"
+    LOG "    manifest layers: $(python3 -c "
+import json,sys
+try:
+    m=json.load(open(sys.argv[1]))
+    print(', '.join(l['"'"'mediaType'"'"'].split('"'"'.'"'"')[-1] for l in m['"'"'layers'"'"']))
+except Exception as e:
+    print('NO MANIFEST', e)
+" "$MANIFESTS/registry.ollama.ai/${REPO}/$VT" 2>&1)"
+    # Remove the pulled TEXT tag too. Removing only the vision tag leaves the
+    # 10-23 GB text blob referenced, so gc reports "purged 0" while the store
+    # grows by a full tier per failure -- 195 GB across 13 failures on 2026-09-03.
+    sleep "$SETTLE"
+    ollama rm "$REPO:$VT" "$REPO:$T" >/dev/null 2>&1
+    sleep "$SETTLE"
+    gc_blobs
+    continue
   fi
+  sleep "$SETTLE"
   LOG "  push $REPO:$VT"
   if ! ollama push "$REPO:$VT" 2>&1 | tail -2; then
-    LOG "  PUSH FAILED — leaving tags for inspection"; continue
+    LOG "  PUSH FAILED — leaving tags for inspection (disk NOT reclaimed)"; continue
   fi
+  sleep "$SETTLE"
   ollama rm "$REPO:$T" "$REPO:$VT" >/dev/null 2>&1
+  sleep "$SETTLE"
   gc_blobs
   df -h /root | awk 'NR==2{print "[vis] /root used="$5" avail="$4}'
   rm -f "$WORK/mf_$T" "$WORK/mfv_$T"

@@ -7,6 +7,9 @@
 # so disk stays bounded to ~1 tier at a time. F16 is intentionally NOT pushed.
 # Launch:  setsid nohup bash republish_coderx_ollama.sh >LAUNCH 2>&1 </dev/null &
 set -uo pipefail
+# NOTE 2026-09-03: capability/registry probes capture first and match via
+# herestring. `cmd | grep -q` under `set -o pipefail` inverts the result --
+# grep exits on match, SIGPIPEs cmd, and the pipeline inherits cmd's death.
 OL=/usr/local/bin/ollama
 REPO=mannix/gemma4-98e-v7-coderx
 GG=/mnt/sdc/ml/cx_std16/gguf_coderx
@@ -97,7 +100,8 @@ for T in "${TIERS[@]}"; do
     vcap=0
     for ck in 1 2 3; do
       $OL create "$REPO:$VT" -f "$WORK/mfv_$T" >/dev/null 2>&1
-      $OL show "$REPO:$VT" 2>/dev/null | grep -qi vision && { vcap=1; break; }
+      caps=$($OL show "$REPO:$VT" 2>/dev/null || true)
+      grep -qi vision <<<"$caps" && { vcap=1; break; }
       sleep 3
     done
     if [ "$vcap" = 1 ]; then

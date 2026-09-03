@@ -5,6 +5,9 @@
 # for BOTH v7-coder + v7-coderx. Verifies via registry manifests HTTP 200.
 # NOTE: cannot delete the old :qat-Q4_0 (ollama 0.30.4 has no remote rm) — flagged for web.
 set -uo pipefail
+# NOTE 2026-09-03: capability/registry probes capture first and match via
+# herestring. `cmd | grep -q` under `set -o pipefail` inverts the result --
+# grep exits on match, SIGPIPEs cmd, and the pipeline inherits cmd's death.
 MMPROJ=/mnt/sdc/ml/gguf/v6coder/mmproj-gemma4.gguf
 WORK=/mnt/sdc/ml/gguf/v7_qat_vision_work; mkdir -p "$WORK"
 LOG=/srv/ml/logs/publish_v7_qat_tags_$(date -u +%Y%m%d_%H%M%S).log
@@ -38,7 +41,8 @@ for r in "${ROWS[@]}"; do
     L ">>> create $repo:vision-qat"
     ollama create "$repo:vision-qat" -f "$vmf" || { L "FATAL create $repo:vision-qat"; exit 1; }
     vok=0; for ck in 1 2 3; do
-      ollama show "$repo:vision-qat" 2>/dev/null | grep -qi vision && { vok=1; break; }
+      caps=$(ollama show "$repo:vision-qat" 2>/dev/null || true)
+      grep -qi vision <<<"$caps" && { vok=1; break; }
       L "  vision cap not visible (check $ck/3) — recreate+retry"; ollama create "$repo:vision-qat" -f "$vmf" >/dev/null 2>&1; sleep 3
     done
     [ "$vok" = 1 ] || { L "FATAL $repo:vision-qat no vision cap after 3 tries"; exit 1; }

@@ -6,6 +6,9 @@
 # bounded to ~1 tier at a time. Loop transfer to ollama 0.30.10 confirmed 0/8 both temps.
 # Launch:  setsid nohup bash republish_std16_ollama.sh >LOG 2>&1 </dev/null &
 set -uo pipefail
+# NOTE 2026-09-03: capability/registry probes capture first and match via
+# herestring. `cmd | grep -q` under `set -o pipefail` inverts the result --
+# grep exits on match, SIGPIPEs cmd, and the pipeline inherits cmd's death.
 OL=/usr/local/bin/ollama
 REPO=mannix/gemma4-98e-v7-coder
 GG=/mnt/sdc/ml/std16_cohort/gemma-4-A4B-98e-v7-coder-it-GGUF
@@ -96,7 +99,8 @@ for T in "${TIERS[@]}"; do
     vcap=0
     for ck in 1 2 3; do
       $OL create "$REPO:$VT" -f "$WORK/mfv_$T" >/dev/null 2>&1
-      $OL show "$REPO:$VT" 2>/dev/null | grep -qi vision && { vcap=1; break; }
+      caps=$($OL show "$REPO:$VT" 2>/dev/null || true)
+      grep -qi vision <<<"$caps" && { vcap=1; break; }
       sleep 3
     done
     if [ "$vcap" = 1 ]; then
