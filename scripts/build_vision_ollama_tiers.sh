@@ -43,6 +43,25 @@ resolve_store(){
 STORE="$(resolve_store)"
 BLOBS="${BLOBS:-$STORE/blobs}"
 MANIFESTS="${MANIFESTS:-$STORE/manifests}"
+STRIPPER="$WORK/_strip_template.py"
+mkdir -p "$WORK"
+cat > "$STRIPPER" <<'PYSTRIP'
+import re, sys
+lines = open(sys.argv[1]).read().splitlines()
+out, i = [], 0
+while i < len(lines):
+    if re.match(r"\s*TEMPLATE\b", lines[i], re.I):
+        parts = lines[i].split(None, 1)
+        rest = parts[1] if len(parts) > 1 else ""
+        if rest.startswith('"""') and rest.count('"""') < 2:
+            i += 1
+            while i < len(lines) and '"""' not in lines[i]:
+                i += 1
+        i += 1
+        continue
+    out.append(lines[i]); i += 1
+print("\n".join(out))
+PYSTRIP
 LOG "ollama store: $STORE"
 
 [ -f "$MMPROJ" ] || { LOG "FATAL: mmproj missing $MMPROJ"; exit 1; }
@@ -83,7 +102,23 @@ for T in "$@"; do
   LOG "  pull $REPO:$T"
   ollama pull "$REPO:$T" >/dev/null 2>&1 || { LOG "  PULL FAILED — skip"; continue; }
   ollama show "$REPO:$T" --modelfile > "$WORK/mf_$T" 2>/dev/null || { LOG "  modelfile FAILED — skip"; continue; }
-  # vision modelfile = original (template/params/FROM base-blob) + projector
+  # vision modelfile = original (params/renderer/parser/FROM base-blob) + projector,
+  # with any TEMPLATE directive STRIPPED. `ollama show --modelfile` renders a
+  # GGUF-derived chat template as a literal TEMPLATE for tags carrying no template
+  # layer, and on complex Jinja that fallback is the degenerate `{{ .Prompt }}`.
+  # Baking it into the vision tag creates a real template layer that then SHADOWS
+  # the renderer. That is exactly how mannix/omnimerge-v4:vision-Q4_K_M ended up
+  # with a 13-byte `{{ .Prompt }}` layer while its own text tag has none.
+  # Vendor tags (library/qwen3.6:27b, library/qwen3.8:27b) ship no template layer.
+  python3 "$STRIPPER" "$WORK/mf_$T" > "$WORK/mf_$T.stripped"
+  if [ -s "$WORK/mf_$T.stripped" ]; then
+    cmp -s "$WORK/mf_$T" "$WORK/mf_$T.stripped" || \
+      LOG "  stripped a derived TEMPLATE from $T (would have shadowed the renderer)"
+    mv "$WORK/mf_$T.stripped" "$WORK/mf_$T"
+  else
+    LOG "  WARNING: template strip empty for $T; keeping original"
+    rm -f "$WORK/mf_$T.stripped"
+  fi
   { cat "$WORK/mf_$T"; echo; echo "FROM $MMPROJ"; } > "$WORK/mfv_$T"
   LOG "  create $REPO:$VT"
   ollama create "$REPO:$VT" -f "$WORK/mfv_$T" >/dev/null 2>&1 || { LOG "  CREATE FAILED — skip"; continue; }
