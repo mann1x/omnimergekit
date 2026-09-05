@@ -190,7 +190,7 @@ EOF
 
 # --- upload ---
 echo "[$(date -Iseconds)] creating HF repo (if missing) + uploading ..."
-hf repo create "$TARGET" --type model -y 2>&1 | tail -3 || true
+hf repo create "$TARGET" --type model --exist-ok 2>&1 | tail -3 || true
 HF_XET_HIGH_PERFORMANCE=1 hf upload "$TARGET" "$MLX_DIR" . \
     --commit-message "MLX-${BITS}bit (${BACKEND}) conversion of $SOURCE"
 
