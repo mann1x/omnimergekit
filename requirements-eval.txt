@@ -54,3 +54,11 @@ sqlitedict>=2.1.0
 # per-template vLLM-config fingerprints. Inherited from requirements.txt
 # (transformers pulls PyYAML transitively) — listed here for clarity.
 pyyaml>=6.0
+
+# Chart rendering for eval/toolbench/plot_cohort.py (cohort dot-and-whisker PNG).
+# matplotlib is ALSO in requirements-dev.txt, but plot_cohort.py is part of the
+# eval path, not a dev helper — a machine that installs only requirements-eval.txt
+# must still be able to render the cohort chart. Install with numpy/pillow
+# constrained: the omnimergekit env runs numpy 1.26.4 and an unconstrained
+# resolve can pull a newer numpy that breaks the pinned torch 2.10.0+cu128 build.
+matplotlib>=3.8

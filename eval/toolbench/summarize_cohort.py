@@ -10,7 +10,11 @@ Guards the two comparability traps:
 """
 import re, os, glob, statistics, sys
 
-W = os.environ.get("OMK_TB_OUT") or sys.exit("OMK_TB_OUT must point at the results directory")
+def results_dir():
+    d = os.environ.get("OMK_TB_OUT")
+    if not d:
+        sys.exit("OMK_TB_OUT must point at the results directory")
+    return d
 T95 = {2:12.706,3:4.303,4:3.182,5:2.776,6:2.571,7:2.447,8:2.365,9:2.306,10:2.262}
 
 def parse(cell):
@@ -25,19 +29,52 @@ def parse(cell):
     return dict(pts=pts, mx=mx, excluded=int(exc.group(1)) if exc else 0,
                 which=which[0] if which else "")
 
-cells = {}
-for d in sorted(glob.glob(os.path.join(W, "*-s*"))):
-    b = os.path.basename(d)
-    name, seed = b.rsplit("-s", 1)
-    r = parse(d)
-    if r: cells.setdefault(name, {})[int(seed)] = r
+def load_cells(W):
+    """{model: {seed: {pts, mx, excluded, which}}} for every parsable cell."""
+    cells = {}
+    for d in sorted(glob.glob(os.path.join(W, "*-s*"))):
+        name, seed = os.path.basename(d).rsplit("-s", 1)
+        r = parse(d)
+        if r:
+            cells.setdefault(name, {})[int(seed)] = r
+    return cells
+
+
+def balanced(cells):
+    """Seeds every model shares, plus the ragged extras that must NOT be pooled."""
+    if not cells:
+        return set(), {}
+    sets = {n: set(v) for n, v in cells.items()}
+    common = set.intersection(*sets.values())
+    ragged = {m: sorted(s - common) for m, s in sets.items() if s - common}
+    return common, ragged
+
+
+def summarize(cells, common):
+    """[(mean, name, sd, half_ci, n_excluded, mixed_denominator)] for balanced seeds."""
+    out = []
+    for name, byseed in cells.items():
+        raw = [byseed[s]["pts"] for s in sorted(common)]
+        ex = sum(byseed[s]["excluded"] for s in sorted(common))
+        mixed = len({byseed[s]["mx"] for s in sorted(common)}) > 1
+        n = len(raw)
+        mean = statistics.mean(raw)
+        if n >= 2:
+            sd = statistics.stdev(raw)
+            half = T95.get(n, 2.0) * sd / (n ** 0.5)
+        else:
+            sd = half = 0.0
+        out.append((mean, name, sd, half, ex, mixed))
+    return sorted(out, reverse=True)
+
+
+W = results_dir()
+cells = load_cells(W)
 
 if not cells: print("no cells yet"); sys.exit()
-seeds_by_model = {n: set(v) for n, v in cells.items()}
-common = set.intersection(*seeds_by_model.values()) if seeds_by_model else set()
+common, ragged = balanced(cells)
 n = len(common)
 print(f"BALANCED across all {len(cells)} models at n={n}  seeds={sorted(common)}")
-ragged = {m: sorted(s - common) for m, s in seeds_by_model.items() if s - common}
 if ragged: print(f"  (extra unbalanced cells, NOT pooled: {ragged})")
 
 anyexc = False

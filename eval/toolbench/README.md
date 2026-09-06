@@ -18,6 +18,7 @@ share it.
 | `run_cohort.sh` | the driver: boots a server per (seed, model), runs the bench, tears down |
 | `fetch_models.sh` | byte-size-verified download of the external GGUFs |
 | `summarize_cohort.py` | aggregation + 95% CI, with denominator/balance guards |
+| `plot_cohort.py` | dot-and-whisker PNG (shares the loader, so it shares the guards) |
 
 ## Usage
 
@@ -29,7 +30,17 @@ export OMK_TB_OUT=/path/to/results/dir
 bash eval/toolbench/fetch_models.sh
 bash eval/toolbench/run_cohort.sh
 python eval/toolbench/summarize_cohort.py
+python eval/toolbench/plot_cohort.py -o toolbench_scores.png
 ```
+
+The chart plots only the balanced seed set, draws 95% CI whiskers once n>=2, marks
+any cell graded on <176 with `*`, and shows the published r/LocalLLaMA values as a
+grey tick — as a *separate, labelled* series, never merged into ours, because those
+were measured on a different basis (256 K ctx, harness v2.6.0, no MTP, other quants).
+
+`plot_cohort.py` needs matplotlib (`requirements-eval.txt`). Install it with
+numpy/pillow constrained — an unconstrained resolve can pull a newer numpy that
+breaks the pinned `torch 2.10.0+cu128` build.
 
 Overridable: `OMK_TB_SEEDS` (default `42 43 44 45 46`), `OMK_TB_CTX` (65536),
 `OMK_TB_PRESSURE` (0.25), `OMK_TB_PORT` (8265).
