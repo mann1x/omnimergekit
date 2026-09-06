@@ -2,8 +2,20 @@
 # Tested on Python 3.11 + CUDA 12.x. Pinned to versions that have been validated in production.
 
 # Core ML
+#
+# torch 2.10.0+cu128 is NOT on PyPI (PyPI stops at 2.8.0). Install it from the
+# CUDA 12.8 index or this file cannot resolve at all:
+#     pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128
+--extra-index-url https://download.pytorch.org/whl/cu128
 torch==2.10.0
-numpy==2.2.6
+
+# numpy 1.26.4, NOT 2.2.6. 2.2.6 was written in the initial commit and has never
+# been validated -- the production omnimergekit env has always run 1.26.4, and every
+# eval in this repo was produced on it. Verified 2026-09-06: torch 2.10.0+cu128,
+# bitsandbytes, fla, causal_conv1d, scipy and sklearn all import cleanly against
+# 1.26.4. Nothing in the env hard-requires numpy<2 (evaluate's <2.0.0 is a dev/test
+# extra), so this pin records the validated reality rather than a hard constraint.
+numpy==1.26.4
 
 # HF stack
 transformers==5.5.0
@@ -17,6 +29,16 @@ hf-transfer>=0.1.8            # large-file accel uploads
 # Hybrid attention (Qwen3.5 / Qwen3.6 require these for >1k context fwd+bwd without OOM)
 flash-linear-attention>=0.5.0
 causal-conv1d>=1.6.0
+
+# KNOWN DEVIATION -- cannot be expressed as a pin. torch 2.10.0 HARD-declares
+# cuda-bindings==12.9.4 and triton==3.6.0, so pinning the pair this repo actually
+# validated (cuda-bindings 13.3.0 / triton 3.7.0) makes the file unresolvable
+# (`ResolutionImpossible`; verified 2026-09-06). A plain install therefore lands on
+# torch's declared versions, which is NOT the env these results were produced on.
+# To reproduce the validated env, install this file first, then override:
+#     pip install --no-deps cuda-bindings==13.3.0 triton==3.7.0
+# `pip check` will then report both as mismatches against torch's metadata. That is
+# the expected, validated state -- do not "fix" it by downgrading.
 
 # Optional inference / quant accel
 bitsandbytes==0.49.2

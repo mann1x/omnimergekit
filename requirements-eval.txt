@@ -59,6 +59,7 @@ pyyaml>=6.0
 # matplotlib is ALSO in requirements-dev.txt, but plot_cohort.py is part of the
 # eval path, not a dev helper — a machine that installs only requirements-eval.txt
 # must still be able to render the cohort chart. Install with numpy/pillow
-# constrained: the omnimergekit env runs numpy 1.26.4 and an unconstrained
-# resolve can pull a newer numpy that breaks the pinned torch 2.10.0+cu128 build.
+# constrained to the requirements.txt pin (numpy==1.26.4): an unconstrained resolve
+# can pull a newer numpy that breaks the pinned torch 2.10.0+cu128 build.
+#     pip install -c <(echo numpy==1.26.4) "matplotlib>=3.8" 
 matplotlib>=3.8
