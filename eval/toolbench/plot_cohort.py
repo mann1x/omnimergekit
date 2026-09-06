@@ -51,6 +51,16 @@ def main():
     rows = sc.summarize(cells, common)
     n = len(common)
 
+    # A model the driver has attempted but that has no balanced cell yet would
+    # otherwise disappear from the chart with no explanation. Recover the intended
+    # roster from the driver log and report the gap.
+    roster = set()
+    dl = os.path.join(W, "driver.log")
+    if os.path.exists(dl):
+        import re as _re
+        roster = set(_re.findall(r"== ([A-Za-z0-9._-]+) \(", open(dl, errors="replace").read()))
+    pending = sorted(roster - set(cells)) if roster else []
+
     C = {"ours": "#c2410c", "base": "#334155", "excl": "#b45309"}
     names = [r[1] for r in rows][::-1]          # best at top
     means = [r[0] for r in rows][::-1]
@@ -111,6 +121,7 @@ def main():
                                "plotted value counts them as 0, so it is a LOWER BOUND")
     if n < 2:     notes.append("n=1 — no confidence interval yet")
     if ragged:    notes.append("in-flight cells excluded to keep the cohort balanced")
+    if pending:   notes.append("awaiting cells (re-running, not yet plotted): " + ", ".join(pending))
     if notes:
         fig.text(.012, .012, "  ·  ".join(notes), fontsize=8.2, color="#94a3b8")
 
