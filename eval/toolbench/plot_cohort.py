@@ -107,7 +107,8 @@ def main():
     ax.legend(handles=handles, loc="lower right", frameon=False, fontsize=8.6)
 
     notes = []
-    if any(excl): notes.append("* graded on <176 (scenario dropped to an infrastructure timeout)")
+    if any(excl): notes.append("* scenario(s) dropped on a 120s request timeout (infrastructure, not model failure); "
+                               "plotted value counts them as 0, so it is a LOWER BOUND")
     if n < 2:     notes.append("n=1 — no confidence interval yet")
     if ragged:    notes.append("in-flight cells excluded to keep the cohort balanced")
     if notes:
