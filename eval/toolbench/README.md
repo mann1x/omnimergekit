@@ -71,9 +71,36 @@ Overridable: `OMK_TB_SEEDS` (default `42 43 44 45 46`), `OMK_TB_CTX` (65536),
    The exclusion is **not random** — it lands on the slowest models — and it also leaks
    infrastructure variance into that row's CI. `summarize_cohort.py` still flags any cell
    graded on `<176`; treat a flagged cell as a defect to re-run, not a number to caveat.
-2. **MTP is a property of the file, not the repo tag.** `bartowski/Ornith-1.5-35B-A3B-IQ4_XS`
-   carries a NextN head despite no `mtp` tag. The driver detects `nextn`/`mtp` tensors by
-   reading the GGUF header, and never assumes.
+2. **Speculation is a property of the file, not the repo tag or the name.**
+   `bartowski/Ornith-1.5-35B-A3B-IQ4_XS` carries a NextN head despite no `mtp` tag. Worse,
+   **unsloth ships Qwen3.6-27B in two repos under the SAME filename** — only
+   `unsloth/Qwen3.6-27B-MTP-GGUF` has the head (`Q4_K_M`, +289 MB, 866 tensors vs 851). Pick
+   the wrong one and the cell just runs slower, with nothing in the output saying its serve
+   geometry differed. The driver reads `nextn`/`mtp` tensors out of the GGUF header and never
+   assumes; save the two builds under **distinct local filenames**.
+
+   Pass `--require-mtp` (opt-in, default OFF) to make a cell with no speculation an ERROR
+   rather than a silent downgrade. Default is off so a legitimately head-less model can still
+   be benchmarked.
+
+### Speculation: self-MTP vs an external drafter
+
+Model entries are `name|gguf[|drafter_gguf]`:
+
+| form | serves as | for |
+|---|---|---|
+| `name\|model.gguf` + NextN head in file | `--spec-type draft-mtp` | Qwen3.5/3.6/3.8 family |
+| `name\|model.gguf\|drafter.gguf` | `--spec-type draft-assistant --mtp-head <drafter>` | **Gemma-4** (`google/gemma-4-26B-A4B-it-assistant`) |
+| `name\|model.gguf`, no head | no speculation (or abort under `--require-mtp`) | — |
+
+Gemma-4's drafter is a *separate* model loaded **into** the target (EAGLE-style: it shares
+the target's KV cache and reads its residual stream), which is why it needs `--mtp-head`
+rather than `-md/--spec-draft-model`. Draft depth is `OMK_TB_DRAFT_N` (default 3).
+A named drafter that is missing on disk is a loud failure, never a silent fallback.
+
+Speculative decoding is **distribution-preserving**, so it changes speed, not scores — but
+a cohort should still hold it constant, because it changes the serve geometry the numbers
+were produced under.
 3. **`cmd | grep -q PAT` under `set -o pipefail` returns non-zero ON MATCH** — `grep -q`
    exits at the first hit and SIGPIPEs the producer (141). A readiness gate written that
    way fails while the server is healthy, and silently skips every model. Capture first,

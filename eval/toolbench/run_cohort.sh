@@ -36,15 +36,49 @@ PRESSURE="${OMK_TB_PRESSURE:-0.25}"
 # of 176 and was not comparable to anything. No other model exceeded 120 s more than
 # once (max 127.9 s), so a higher value is a NO-OP for them and does not rebase them.
 TIMEOUT="${OMK_TB_TIMEOUT:-600}"
+# --require-mtp (or OMK_TB_REQUIRE_MTP=1) -- OPT-IN, default OFF.
+# When set, a GGUF with no NextN head aborts that cell instead of running it
+# headless. Use it when a cohort must hold serve geometry constant across models.
+# It exists because a missing head is usually a SOURCING error, not a property of
+# the model: unsloth ships Qwen3.6-27B in two repos under the SAME filename, and
+# only `-MTP-GGUF` carries the head -- so the wrong pick runs, and is merely slower,
+# with nothing in the output saying the geometry differed.
+# Default stays OFF so a legitimately head-less model can still be benchmarked.
+REQUIRE_MTP="${OMK_TB_REQUIRE_MTP:-0}"
+DRAFT_N="${OMK_TB_DRAFT_N:-3}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --require-mtp)    REQUIRE_MTP=1 ;;
+    --no-require-mtp) REQUIRE_MTP=0 ;;
+    -h|--help)
+      echo "usage: $(basename "$0") [--require-mtp|--no-require-mtp]"
+      echo "  --require-mtp   abort any cell whose GGUF has no NextN head"
+      echo "                  (default OFF; env: OMK_TB_REQUIRE_MTP=1)"
+      echo "  env: OMK_TB_BIN OMK_TB_MODELS OMK_TB_OUT OMK_TB_SEEDS OMK_TB_CTX"
+      echo "       OMK_TB_PRESSURE OMK_TB_TIMEOUT OMK_TB_PORT OMK_TB_DRAFT_N"
+      exit 0 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
 mkdir -p "$W"
 export PATH="$HOME/.local/bin:$PATH"
 
+# Entries are  name|gguf[|drafter_gguf]
+#   2 fields -> self-speculation. If the GGUF carries a NextN/mtp head the driver
+#              serves it with --spec-type draft-mtp; otherwise no speculation.
+#   3 fields -> EXTERNAL drafter, for models whose head ships as a separate file
+#              (Gemma-4: google/gemma-4-26B-A4B-it-assistant). Served with
+#              --spec-type draft-assistant --mtp-head <drafter>, which loads the
+#              assistant INTO the target. e.g.
+#   "gemma4-26b|google_gemma-4-26B-A4B-it-Q4_K_M.gguf|gemma-4-26B-A4B-it-assistant-Q8_0.gguf"
 MODELS=(
   "a3b-coder|Qwen3.6-27B-A3B-Coder-Q4_K_M.gguf"
   "a3b-coderx|Qwen3.6-27B-A3B-CoderX-Q4_K_M.gguf"
   "omnimerge-v4|Qwen3.6-27B-Omnimerge-v4-Q4_K_M.gguf"
   "omnimerge-v6|Qwen3.8-27B-Omnimerge-v6-Q4_K_M.gguf"
-  "qwen3.6-27b|Qwen3.6-27B-Q4_K_M.gguf"
+  "qwen3.6-27b|Qwen3.6-27B-MTP-Q4_K_M.gguf"
   "qwen3.8-27b|Qwen3.8-27B-UD-Q4_K_M.gguf"
   "ornith-1.5-35b|Ornith-1.5-35B-A3B-IQ4_XS.gguf"
   "qwen3.6-35b-a3b|Qwen_Qwen3.6-35B-A3B-IQ4_XS.gguf"
@@ -97,7 +131,8 @@ PY
 for SEED in $SEEDS; do
 log "######## SEED $SEED — balanced pass over all ${#MODELS[@]} models ########"
 for entry in "${MODELS[@]}"; do
-  NAME="${entry%%|*}"; GGUF="${entry##*|}"; MODEL="$MDIR/$GGUF"
+  IFS="|" read -r NAME GGUF DRAFTER <<<"$entry"
+  MODEL="$MDIR/$GGUF"
 
   # wait up to 40 min for a still-downloading file
   for _ in $(seq 1 40); do [ -f "$MODEL" ] && break; log "waiting for $GGUF ..."; sleep 30; done
@@ -110,8 +145,33 @@ for entry in "${MODELS[@]}"; do
   todo="$SEED"
 
   MTP=$(has_nextn "$MODEL")
-  SPEC=""; [ "$MTP" = "YES" ] && SPEC="--spec-type draft-mtp --spec-draft-n-max 3"
-  log "== $NAME ($GGUF) nextn=$MTP seed=$SEED"
+  SPEC_KIND="none"
+  if [ -n "${DRAFTER:-}" ]; then
+    DPATH="$MDIR/$DRAFTER"
+    if [ ! -f "$DPATH" ]; then
+      log "!! $NAME — drafter $DRAFTER NOT FOUND at $DPATH"
+      echo "$NAME DRAFTER_MISSING $DRAFTER (seed $SEED)" >> "$W/SKIPPED.txt"
+      continue
+    fi
+    SPEC_KIND="assistant"
+  elif [ "$MTP" = "YES" ]; then
+    SPEC_KIND="mtp"
+  fi
+  if [ "$SPEC_KIND" = "none" ] && [ "$REQUIRE_MTP" = "1" ]; then
+    log "!! $NAME — no speculation available (--require-mtp is set). Refusing to run it"
+    log "   headless: that would give this cell a different serve geometry than the rest."
+    log "   $GGUF carries no NextN head and no drafter was given. Either point at an"
+    log "   MTP build (e.g. unsloth/<model>-MTP-GGUF), add a 3rd |drafter field to the"
+    log "   MODELS entry (Gemma-4 assistant), or drop --require-mtp."
+    echo "$NAME NO_MTP_HEAD $GGUF (seed $SEED)" >> "$W/SKIPPED.txt"
+    continue
+  fi
+  case "$SPEC_KIND" in
+    assistant) SPEC="--spec-type draft-assistant --mtp-head $DPATH --spec-draft-n-max $DRAFT_N" ;;
+    mtp)       SPEC="--spec-type draft-mtp --spec-draft-n-max $DRAFT_N" ;;
+    *)         SPEC="" ;;
+  esac
+  log "== $NAME ($GGUF) nextn=$MTP spec=$SPEC_KIND${DRAFTER:+ drafter=$DRAFTER} seed=$SEED"
 
   nohup "$BIN" --server -m "$MODEL" --host 127.0.0.1 --port "$PORT" \
       --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0 \
@@ -137,16 +197,16 @@ for entry in "${MODELS[@]}"; do
   [ "$ready" != "1" ] && { log "!! $NAME never ready"; echo "$NAME SERVER_NOT_READY" >> "$W/SKIPPED.txt"; kill_server; continue; }
   log "  ready — VRAM $(nvidia-smi --query-gpu=memory.used --format=csv,noheader)"
 
-  if [ "$MTP" = "YES" ]; then
+  if [ "$SPEC_KIND" != "none" ]; then
     acc=$(curl -s -m 120 "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
       -d '{"model":"'"$NAME"'","messages":[{"role":"user","content":"Count from 1 to 40."}],"max_tokens":140,"temperature":0.6}' \
       | python3 -c "import sys,json;t=json.load(sys.stdin).get('timings',{});print(t.get('draft_n',0),t.get('draft_n_accepted',0))" 2>/dev/null)
     dn=$(echo "$acc" | awk '{print $1}')
     if [ -z "${dn:-}" ] || [ "$dn" -eq 0 ] 2>/dev/null; then
-      log "!! $NAME MTP_NOT_ENGAGED — recorded, running anyway WITHOUT spec (score unaffected)"
-      echo "$NAME MTP_NOT_ENGAGED" >> "$W/SKIPPED.txt"
+      log "!! $NAME SPEC_NOT_ENGAGED ($SPEC_KIND) — recorded, running anyway WITHOUT spec (score unaffected)"
+      echo "$NAME SPEC_NOT_ENGAGED $SPEC_KIND" >> "$W/SKIPPED.txt"
     else
-      log "  MTP engaged: drafted=$dn accepted=$(echo "$acc"|awk '{print $2}')"
+      log "  spec engaged ($SPEC_KIND): drafted=$dn accepted=$(echo "$acc"|awk '{print $2}')"
     fi
   fi
 
