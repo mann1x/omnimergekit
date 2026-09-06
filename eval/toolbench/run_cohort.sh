@@ -46,6 +46,11 @@ TIMEOUT="${OMK_TB_TIMEOUT:-600}"
 # Default stays OFF so a legitimately head-less model can still be benchmarked.
 REQUIRE_MTP="${OMK_TB_REQUIRE_MTP:-0}"
 DRAFT_N="${OMK_TB_DRAFT_N:-3}"
+# Optional chart refresh after each completed seed pass (a new full run over all
+# models). Unset OMK_TB_PNG to disable.
+PNG_OUT="${OMK_TB_PNG:-$W/toolbench_scores.png}"
+PLOT_PY="${OMK_TB_PLOT_PY:-python3}"
+PLOT="$(dirname "$0")/plot_cohort.py"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -224,6 +229,15 @@ for entry in "${MODELS[@]}"; do
   done
   kill_server
 done
+  # A completed pass is a new full run over every model -> refresh the chart.
+  # Best-effort: a plotting failure must never take down the cohort.
+  if [ -f "$PLOT" ]; then
+    if OMK_TB_OUT="$W" "$PLOT_PY" "$PLOT" -o "$PNG_OUT" >/dev/null 2>&1; then
+      log "  chart refreshed -> $PNG_OUT"
+    else
+      log "  !! chart refresh FAILED (cohort unaffected)"
+    fi
+  fi
 log "######## SEED $SEED PASS COMPLETE — balanced cohort at n=$(ls -d "$W"/*-s$SEED 2>/dev/null | wc -l) ########"
 done
 

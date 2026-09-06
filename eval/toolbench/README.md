@@ -43,7 +43,13 @@ numpy/pillow constrained — an unconstrained resolve can pull a newer numpy tha
 breaks the pinned `torch 2.10.0+cu128` build.
 
 Overridable: `OMK_TB_SEEDS` (default `42 43 44 45 46`), `OMK_TB_CTX` (65536),
-`OMK_TB_PRESSURE` (0.25), `OMK_TB_PORT` (8265).
+`OMK_TB_PRESSURE` (0.25), `OMK_TB_PORT` (8265), `OMK_TB_TIMEOUT` (600),
+`OMK_TB_DRAFT_N` (3), `OMK_TB_PNG` (chart path), `OMK_TB_PLOT_PY` (interpreter
+with matplotlib). Flag: `--require-mtp`.
+
+**The chart refreshes itself after every completed seed pass** — i.e. after each
+new full run over all models — so it never silently goes stale. A plotting failure
+is logged and ignored; it can never take down the cohort.
 
 ## The basis (change any of these and every prior number is rebased)
 
