@@ -28,6 +28,14 @@ PORT="${OMK_TB_PORT:-8265}"
 SEEDS="${OMK_TB_SEEDS:-42 43 44 45 46}"
 CTX="${OMK_TB_CTX:-65536}"
 PRESSURE="${OMK_TB_PRESSURE:-0.25}"
+# tool-eval-bench --timeout default is 120s. MEASURED 2026-09-06: qwen3.6-27b
+# (dense 27B, NO MTP head, ~22.8 t/s decode) needs ~131 s for a 3k-token answer;
+# its turn durations reach 335.5 s with 8 turns over 120 s. At the default it lost
+# whole scenarios to a CLIENT-side timeout -- and tool-eval-bench DROPS those from
+# the denominator rather than scoring 0, so that cell was graded on 174/172 instead
+# of 176 and was not comparable to anything. No other model exceeded 120 s more than
+# once (max 127.9 s), so a higher value is a NO-OP for them and does not rebase them.
+TIMEOUT="${OMK_TB_TIMEOUT:-600}"
 mkdir -p "$W"
 export PATH="$HOME/.local/bin:$PATH"
 
@@ -148,7 +156,7 @@ for entry in "${MODELS[@]}"; do
     tool-eval-bench run --hardmode --weight-by-difficulty --backend llamacpp \
         --base-url "http://127.0.0.1:$PORT" \
         --context-size "$CTX" --context-pressure "$PRESSURE" \
-        --seed "$s" --model "$NAME" --output-dir "$OUT" > "$W/$NAME-s$s.log" 2>&1
+        --seed "$s" --model "$NAME" --timeout "$TIMEOUT" --output-dir "$OUT" > "$W/$NAME-s$s.log" 2>&1
     rc=$?; el=$(( $(date +%s) - t0 ))
     pts=$(grep -rhoE "\*\*Total Points\*\*:[[:space:]]*[0-9]+[[:space:]]*/[[:space:]]*[0-9]+" "$OUT" 2>/dev/null | head -1)
     log "     rc=$rc  $((el/60))m$((el%60))s  ${pts:-NO_POINTS}"

@@ -58,11 +58,19 @@ Overridable: `OMK_TB_SEEDS` (default `42 43 44 45 46`), `OMK_TB_CTX` (65536),
 
 ## Traps this tooling guards (each cost real time to find)
 
-1. **Mixed denominators.** A scenario lost to an infrastructure timeout is *dropped
-   from scoring, not zeroed* — that cell is graded on `<176`. Raw Total Points across
-   mixed denominators is not a column. `summarize_cohort.py` flags every such cell and
-   prints an `adj/176` column. The exclusion is **not random**: it lands on the slowest
-   models, so it flatters exactly the cells that can least afford it.
+1. **Mixed denominators — set `--timeout` high enough or the metric silently changes.**
+   A scenario lost to a request timeout is *dropped from scoring, not zeroed*, so that
+   cell is graded on `<176` and its Total Points is not comparable to anything. The
+   default `--timeout 120` is **too low for a dense model without an MTP head**:
+   measured 2026-09-06, `qwen3.6-27b` (dense 27B, ~22.8 t/s decode) needs ~131 s for a
+   3 k-token answer, reached **335.5 s** on its slowest turn, and had **8 turns over
+   120 s** — losing 1 scenario at one seed and 2 at the next (174, then 172).
+   No other model in the cohort exceeded 120 s more than once (max 127.9 s), so raising
+   the timeout is a **no-op for them** and does not rebase their cells. This runner
+   therefore defaults to `--timeout 600` (`OMK_TB_TIMEOUT`).
+   The exclusion is **not random** — it lands on the slowest models — and it also leaks
+   infrastructure variance into that row's CI. `summarize_cohort.py` still flags any cell
+   graded on `<176`; treat a flagged cell as a defect to re-run, not a number to caveat.
 2. **MTP is a property of the file, not the repo tag.** `bartowski/Ornith-1.5-35B-A3B-IQ4_XS`
    carries a NextN head despite no `mtp` tag. The driver detects `nextn`/`mtp` tensors by
    reading the GGUF header, and never assumes.
