@@ -313,25 +313,30 @@ def _mtp_head_ftype(quant: str) -> str:
 # Legacy Q8_0/Q4_0/Q4_1 (no "_K") stay imatrix-free (no meaningful benefit).
 IMATRIX_QUANTS = {q for q in ALL_QUANTS if q.startswith("IQ") or q.startswith("UD-IQ") or "_K" in q}
 
-# Per-tier EXCEPTIONS: K-quant tiers AT/ABOVE the imatrix bit-depth CROSSOVER, built
-# imatrix-FREE. IMATRIX_QUANTS (the rule) and IMATRIX_EXCLUDE (the exceptions) are the
-# two explicit halves of the policy. The crossover is a property of the quant GRID
-# coarseness, not a specific model: at a fine grid (>= Q4 band) the calibration bias
-# outweighs importance-weighting so imatrix is neutral-to-harmful; below it (Q3/Q2/IQ)
-# imatrix is the difference between a good quant and a broken one. Measure ONCE per
-# model family via a Q2->Q6 HE+/MPE ladder — do NOT retest per quant.
-#   v7-coder 98e (2026-06-07, full ladder): Q6_K imatrix -0.6pp, Q5/Q4 wash (within
-#     noise), Q3 +4.0pp, Q2 noimat COLLAPSES to HE+ 0.128 (imatrix mandatory).
-#     Crossover sits between the Q4 and Q3 bands.
-#   v6-coder (2026-05-25): Q4_K_M imatrix HE+ 90.85% vs plain 92.07% (-1.22pp) — same band.
-# So everything at/above the Q4 band is imatrix-free; Q3_K_*/Q2_K_*/IQ*/CD-* keep it
-# (the rule + the CD i-quant mandate handle those). Q8_0/Q4_0/Q4_1 are already free
-# (no "_K", not in IMATRIX_QUANTS).
-IMATRIX_EXCLUDE = {
-    "Q4_K_S", "Q4_K_M", "Q4_K_L",
-    "Q5_K_S", "Q5_K_M", "Q5_K_L",
-    "Q6_K", "Q6_K_L",
-}
+# Per-tier EXCEPTIONS to the rule above: tiers built imatrix-FREE.
+# IMATRIX_QUANTS (the rule) and IMATRIX_EXCLUDE (the exceptions) are the two
+# explicit halves of the policy.
+#
+# EMPTY as of 2026-09-07: every _K/IQ tier builds WITH an imatrix.
+#
+# This set used to hold the whole Q4/Q5/Q6 K band, on the theory that the
+# imatrix crossover is a property of the quant GRID coarseness and therefore
+# carries across models. The two measurements behind it were:
+#   v7-coder 98e (2026-06-07, full ladder): Q6_K imatrix -0.6pp, Q5/Q4 wash
+#     (within noise), Q3 +4.0pp, Q2 noimat COLLAPSES to HE+ 0.128.
+#   v6-coder (2026-05-25): Q4_K_M imatrix HE+ 90.85% vs plain 92.07% (-1.22pp).
+# Both are Gemma-family coder models, and the "measure ONCE per model family"
+# instruction that came with them was never carried out for any other family --
+# so the exclusion kept being applied well outside the evidence for it. On
+# Qwen3.6-27B, for one, the crossover is simply unmeasured, yet its Q4_K_M
+# shipped uncalibrated on the strength of a v6-coder number.
+#
+# Withholding is also the asymmetric error: at worst an imatrix costs ~1pp on a
+# tier where it is neutral, while omitting one where it matters costs far more
+# (see the Q2 collapse above). So calibrate by default. Use --no-imatrix to opt
+# a build out, and repopulate this set only from a ladder measured on THAT
+# family. Q8_0/Q4_0/Q4_1 stay imatrix-free via the rule itself (no "_K").
+IMATRIX_EXCLUDE: set[str] = set()
 
 # Set by --force-imatrix: override IMATRIX_EXCLUDE so imatrix is applied to ALL
 # _K/IQ tiers (incl. Q4/Q5/Q6). The default policy (Q6_K imatrix-free) is the
@@ -907,8 +912,8 @@ def quantize_one(tools: dict, f16_gguf: Path, output_dir: Path,
             cd_needs_imatrix = True
 
     # Add imatrix if available and quant benefits from it: standalone IQ*/UD-IQ*
-    # quants and any _K tier (minus IMATRIX_EXCLUDE, e.g. Q4_K_M which imatrix
-    # hurts), or CD- maps that assign at least one tensor to an IQ*/Q2_K tier
+    # quants and any _K tier (minus IMATRIX_EXCLUDE, which is empty by default),
+    # or CD- maps that assign at least one tensor to an IQ*/Q2_K tier
     # (a hard llama-quantize requirement, never suppressed by the exclude list).
     if imatrix_file and (_uses_imatrix_by_rule(quant) or cd_needs_imatrix):
         cmd.extend(["--imatrix", str(imatrix_file)])
@@ -2255,10 +2260,10 @@ def main():
     parser.add_argument("--no-imatrix", action="store_true",
                         help="Skip imatrix computation")
     parser.add_argument("--force-imatrix", action="store_true",
-                        help="Apply imatrix to ALL _K/IQ tiers, overriding IMATRIX_EXCLUDE "
-                             "(Q4/Q5/Q6). Use for a new model family (crossover unmeasured) or "
-                             "to match a low-bit sibling's recipe. Also forces imatrix generation "
-                             "when only excluded tiers are requested. Mutually exclusive with --no-imatrix.")
+                        help="Apply imatrix to ALL _K/IQ tiers, overriding IMATRIX_EXCLUDE. "
+                             "IMATRIX_EXCLUDE is empty by default, so this is a no-op unless that "
+                             "set has been repopulated from a ladder measured on the model family "
+                             "being built. Mutually exclusive with --no-imatrix.")
     parser.add_argument("--cal-data", default=None,
                         help="Path to calibration data for imatrix (default: bundled calibration_datav5.txt)")
     parser.add_argument("--layer-importance", default=None,
