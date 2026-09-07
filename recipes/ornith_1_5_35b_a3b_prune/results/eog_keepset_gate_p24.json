@@ -1,0 +1,15 @@
+{
+  "reference": "coder_tc",
+  "max_drop": 0.02,
+  "verdict": "PASS",
+  "arms": {
+    "coder_tc": {
+      "mean_eog_lift_rank": 0.46467071611253197,
+      "delta_vs_reference": 0.0
+    },
+    "coderx_p24": {
+      "mean_eog_lift_rank": 0.46846121057118506,
+      "delta_vs_reference": 0.003790494458653093
+    }
+  }
+}
