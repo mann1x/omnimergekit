@@ -66,7 +66,7 @@ python runhost/eog_keepset_gate.py \
     --reference coder_tc --max-drop 0.02
 ```
 
-### Result on Ornith: NEGATIVE — record this before re-hypothesising
+### Result on Ornith: INCONCLUSIVE — the replay does not cover the failure regime
 
 ```
 mean EOG-lift rank01 over keep set (higher = retains more terminator mass)
@@ -75,16 +75,46 @@ mean EOG-lift rank01 over keep set (higher = retains more terminator mass)
 EOG_KEEPSET_GATE PASS
 ```
 
-Measured over 1,482 emit positions, 40 layers × 256 experts. **CoderX does not shed
-terminator experts — it retains marginally more than Coder.** The 960-expert
-reallocation is EOG-neutral.
+**Do not read this as "CoderX retains terminator mass."** The arithmetic is sound
+(`EMIT_MASK_OK`: emit routings == emit_pos x K x L exactly), but the *corpus* is the
+wrong replay for the defect it was built to investigate. Coverage audit of the 807-doc
+router-calibration corpus:
 
-This matches the same cross-check on Qwen3.6-35B-A3B (2026-08-20), which likewise found
-no EOG-lift signal separating `p12` from `p24`. **Two models, two negatives.** The gate
-is kept because it is cheap and the failure it screens for is genuinely invisible in the
-score — but a passing gate proves only the absence of *this* defect, not termination
-health. It runs report-only; add `--fail-on-regression` only if a model ever justifies
-hard-gating.
+| category | docs | tokens | truncated | emit (all) | emit (kept) | ends with EOG |
+|---|---:|---:|---:|---:|---:|---:|
+| targeted_lcb | 94 | 937,059 (84%) | **54** | 188 | **136** | **0** |
+| targeted_mpe | 123 | 43,828 | 0 | 246 | 246 | 0 |
+| gpqa_diamond | 80 | 29,189 | 0 | 160 | 160 | 0 |
+| *(7 short cats)* | 510 | 109,172 | 0 | 940 | 940 | 0 |
+| **TOTAL** | **807** | **1,119,248** | **54** | **1,534** | **1,482** | **0** |
+
+Three compounding defects:
+
+1. **Truncation cost emit positions.** `--max-tokens 4096` keeps the tail, so the *last*
+   terminator per doc survives — but `targeted_lcb` still lost 52 of 188 (28%), and only
+   479,128 of 1,119,248 corpus tokens (43%) were seen at all.
+2. **The long-CoT regime is 9% of the map.** Every doc yields ~2 emit positions
+   regardless of length, so `targeted_lcb` — 84% of the corpus by tokens — contributes
+   136/1,482 positions. The map is **91% short-document turn boundaries.**
+3. **No document ends with an EOG token** (`endsEOG = 0`, every category). The captured
+   positions are *internal turn boundaries*, not "a long generation completed and the
+   model chose to stop."
+
+The observed defect appears after 13k+ tokens of thinking. This map measures short-context
+turn boundaries. It therefore cannot confirm or refute EOG depletion in the failing
+regime, and the PASS above is not evidence of termination health.
+
+**What a valid EOG replay requires** (not yet built):
+
+- documents that *end* the way the model ends a real generation — full CoT followed by the
+  terminator — so `endsEOG` is non-zero;
+- complete capture of each such document, windowed rather than truncated, so no emit
+  position is discarded;
+- emit positions dominated by the long-generation regime, not by short-doc turn
+  boundaries; report the per-category census alongside the score.
+
+The earlier Qwen3.6 cross-check (2026-08-20) that also returned negative was built on the
+same corpus shape and inherits the same limitation.
 
 ## Open defect — CoderX empty completions (2026-09-07, UNRESOLVED)
 
