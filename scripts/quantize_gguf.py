@@ -757,8 +757,23 @@ def auto_ngl(model_size_gb: float, n_layers: int = None, layer_sizing=None) -> i
 
 
 def compute_imatrix(tools: dict, f16_gguf: Path, cal_data: Path,
-                    output: Path, ngl: int = None) -> Path:
-    """Compute importance matrix from F16 GGUF using calibration data."""
+                    output: Path, ngl: int = None, chunks: int = 128,
+                    parse_special: bool = True) -> Path:
+    """Compute importance matrix from F16 GGUF using calibration data.
+
+    parse_special: pass --parse-special to llama-imatrix. llama-imatrix defaults
+        parse_special to FALSE, which tokenises chat markup as literal
+        punctuation. For a chat-rendered corpus (AtomicChat calib-corpora and
+        anything like it) that silently voids the agentic + reasoning slices —
+        the model never sees its own control-token ids during calibration.
+        Harmless for plain-text corpora (calibration_datav5.txt has no special
+        tokens), so it defaults ON.
+    chunks: llama-imatrix chunk budget (512 tokens each). NOTE 128 chunks is
+        only ~65k tokens. AtomicChat measured per-tensor convergence at ~8500
+        chunks / 4.3M tokens; a 5M-token corpus is ~1.3% consumed at 128.
+        Left at 128 by DEFAULT so existing imatrices stay comparable — raising
+        it rebases every imatrix built with it. Set explicitly per build.
+    """
     imatrix_bin = tools.get("imatrix")
     if not imatrix_bin:
         print("  WARNING: llama-imatrix not found, imatrix quants may have reduced quality", flush=True)
@@ -790,8 +805,11 @@ def compute_imatrix(tools: dict, f16_gguf: Path, cal_data: Path,
         "-f", str(cal_data),
         "-o", str(imatrix_file),
         "-ngl", str(ngl),
-        "--chunks", "128",
+        "--chunks", str(chunks),
     ]
+    if parse_special:
+        cmd.append("--parse-special")
+    print(f"  imatrix: chunks={chunks} parse_special={parse_special}", flush=True)
     run(cmd, desc="imatrix computation", timeout=7200)
     print(f"  imatrix saved: {imatrix_file} ({imatrix_file.stat().st_size / 1024:.0f} KB)", flush=True)
     return imatrix_file
@@ -2032,10 +2050,180 @@ def upload_worker(upload_queue: Queue, repo_id: str, stop_event: Event,
         upload_queue.task_done()
 
 
+# ── Gemma-4 EOG normalisation ────────────────────────────────────────────
+# WHY THIS EXISTS
+# ---------------
+# `convert_hf_to_gguf.py` reads `eos_token_id` from config/generation_config,
+# which for Gemma 4 is a LIST — `[1, 106]` / `[1, 106, 50]` — and takes the
+# FIRST element. So every Gemma-4 GGUF is born declaring
+# `tokenizer.ggml.eos_token_id = 1 (<eos>)` with NO `eot_token_id` at all.
+# The real turn terminator is **106 `<turn|>`**.
+#
+# llama.cpp masks this: it overrides control-token types at load, so served
+# evals terminate normally and the defect is invisible there. **ollama's
+# `PARSER gemma4` does not** — it reads `eot_token_id`, finds none, and never
+# recognises the turn boundary, so reasoning is classified as content and
+# control tokens leak into the answer.
+#
+# This was previously fixed ONLY downstream, by scripts/gguf_retag_republish.py
+# rewriting already-published HF repos (the v7-coder cohort). That correction was
+# never folded back here, so the NEXT Gemma-4 build reproduced it verbatim
+# (bprime/Arm B, 2026-09-07). Fixing the producer is the point: every tier is
+# quantized FROM the base GGUF, so stamping it here fixes all of them at once.
+#
+# eos/eot are unambiguous for this family and are applied automatically.
+# The chat template is NOT auto-picked: 17466 / 18051 / 18683 / 19177-byte
+# variants coexist, and guessing silently ships a third version. It is opt-in
+# via --chat-template-file and must be pinned with --chat-template-sha256.
+GEMMA4_EOS = 106   # <turn|>
+GEMMA4_EOT = 1     # <eos>
+
+
+def _gguf_eog(path: Path) -> dict:
+    """Read the EOG-relevant KVs out of a GGUF header."""
+    from gguf import GGUFReader
+    r = GGUFReader(str(path))
+    f = {x.name: x for x in r.fields.values()}
+
+    def scalar(key):
+        fl = f.get(key)
+        if fl is None:
+            return None
+        try:
+            return fl.parts[fl.data[0]].tolist()[0]
+        except Exception:
+            return None
+
+    tpl = None
+    fl = f.get("tokenizer.chat_template")
+    if fl is not None:
+        try:
+            tpl = bytes(fl.parts[fl.data[0]]).decode("utf-8", "replace")
+        except Exception:
+            tpl = None
+    return {
+        "model": (lambda v: v)(scalar("tokenizer.ggml.model")),
+        "eos": scalar("tokenizer.ggml.eos_token_id"),
+        "eot": scalar("tokenizer.ggml.eot_token_id"),
+        "tpl": tpl,
+        "ntensor": len(r.tensors),
+    }
+
+
+def normalize_gemma4_eog(base_gguf: Path, template_file=None, template_sha=None) -> bool:
+    """Stamp eos=106 / eot=1 (and optionally a PINNED chat template) into a
+    Gemma-4 base GGUF, in place. No-op for other architectures and for a file
+    that is already correct. Returns True if the file was rewritten.
+
+    Verified after the rewrite — eos, eot, template sha and tensor count are all
+    re-read from the NEW file. A rewrite that loses tensors or produces an
+    unparseable header is discarded and raises; it must never reach quantization.
+    """
+    import hashlib
+    import subprocess as _sp
+
+    try:
+        before = _gguf_eog(base_gguf)
+    except Exception as e:
+        print(f"  EOG check: cannot parse {base_gguf}: {e}", flush=True)
+        return False
+
+    arch_is_gemma4 = False
+    try:
+        from gguf import GGUFReader
+        r = GGUFReader(str(base_gguf))
+        for x in r.fields.values():
+            if x.name in ("tokenizer.ggml.model", "general.architecture"):
+                try:
+                    v = bytes(x.parts[x.data[0]]).decode("utf-8", "replace")
+                except Exception:
+                    continue
+                if "gemma4" in v or "gemma-4" in v:
+                    arch_is_gemma4 = True
+    except Exception:
+        pass
+    if not arch_is_gemma4:
+        return False
+
+    target_tpl_sha = None
+    if template_file:
+        tpl_bytes = Path(template_file).read_bytes()
+        target_tpl_sha = hashlib.sha256(tpl_bytes).hexdigest()
+        if template_sha and not target_tpl_sha.startswith(template_sha.lower()):
+            raise RuntimeError(
+                f"chat template sha mismatch: {template_file} is {target_tpl_sha[:16]}, "
+                f"--chat-template-sha256 pinned {template_sha}. REFUSING — an unpinned "
+                f"template silently ships a variant."
+            )
+
+    cur_tpl_sha = (hashlib.sha256(before["tpl"].encode()).hexdigest()
+                   if before["tpl"] else None)
+    eog_ok = (before["eos"] == GEMMA4_EOS and before["eot"] == GEMMA4_EOT)
+    tpl_ok = (target_tpl_sha is None) or (cur_tpl_sha == target_tpl_sha)
+    if eog_ok and tpl_ok:
+        print(f"  Gemma-4 EOG already correct (eos={before['eos']} eot={before['eot']})",
+              flush=True)
+        return False
+
+    print(f"\n=== Normalising Gemma-4 EOG metadata ===", flush=True)
+    print(f"  eos {before['eos']} -> {GEMMA4_EOS}   eot {before['eot']} -> {GEMMA4_EOT}",
+          flush=True)
+    if target_tpl_sha:
+        print(f"  chat_template {(cur_tpl_sha or 'none')[:12]} -> {target_tpl_sha[:12]}",
+              flush=True)
+
+    tmp = Path(str(base_gguf) + ".eog.tmp")
+    if tmp.exists():
+        tmp.unlink()
+    cmd = [sys.executable, "-m", "gguf.scripts.gguf_new_metadata",
+           "--special-token-by-id", "eos", str(GEMMA4_EOS),
+           "--special-token-by-id", "eot", str(GEMMA4_EOT)]
+    if template_file:
+        cmd += ["--chat-template-file", str(template_file)]
+    cmd += ["--force", str(base_gguf), str(tmp)]
+    r = _sp.run(cmd, capture_output=True, text=True, timeout=14400)
+    if r.returncode != 0 or not tmp.exists():
+        if tmp.exists():
+            tmp.unlink()
+        raise RuntimeError("gguf_new_metadata failed: "
+                           + (r.stderr or r.stdout).strip()[-300:])
+
+    after = _gguf_eog(tmp)
+    problems = []
+    if after["eos"] != GEMMA4_EOS or after["eot"] != GEMMA4_EOT:
+        problems.append(f"eog(eos={after['eos']} eot={after['eot']})")
+    if after["ntensor"] != before["ntensor"]:
+        problems.append(f"tensors({before['ntensor']}->{after['ntensor']})")
+    if target_tpl_sha:
+        new_sha = (hashlib.sha256(after["tpl"].encode()).hexdigest()
+                   if after["tpl"] else None)
+        if new_sha != target_tpl_sha:
+            problems.append(f"tpl({(new_sha or 'none')[:12]}!={target_tpl_sha[:12]})")
+    if problems:
+        tmp.unlink()
+        raise RuntimeError("EOG rewrite FAILED verification: " + ", ".join(problems))
+
+    tmp.replace(base_gguf)
+    print(f"  EOG normalised and verified (eos={after['eos']} eot={after['eot']}, "
+          f"{after['ntensor']} tensors unchanged)", flush=True)
+    return True
+
+
+
+
 # ── Main pipeline ────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="GGUF Quantization Pipeline")
+    parser.add_argument("--chat-template-file", default=None,
+                        help="Gemma-4 only: stamp this chat template into the base GGUF. "
+                             "MUST be dumped from an already-fixed shipped tier "
+                             "(gguf_probe_header.py --out-template), not a stray local file.")
+    parser.add_argument("--chat-template-sha256", default=None,
+                        help="Pin --chat-template-file by sha256 prefix; refuses on mismatch.")
+    parser.add_argument("--no-eog-normalise", action="store_true",
+                        help="Skip the Gemma-4 eos=106/eot=1 normalisation (NOT recommended: "
+                             "ollama's gemma4 parser needs eot_token_id).")
     parser.add_argument("--model", required=True,
                         help="HF repo ID (e.g. google/gemma-4-26B-A4B-it) or local path")
     parser.add_argument("--repo", default=None,
@@ -2438,6 +2626,14 @@ def main():
             verify_mtp_in_gguf(base_gguf, mtp_info, tools)
     else:
         print(f"\n  Base GGUF exists: {base_gguf}", flush=True)
+
+    # Normalise Gemma-4 EOG metadata BEFORE imatrix/quantization so every tier
+    # inherits it. Runs on the pre-existing base GGUF too — a rerun that reuses
+    # an already-converted F16 must not silently keep the defective KV block.
+    if not args.no_eog_normalise and base_gguf.exists():
+        normalize_gemma4_eog(base_gguf,
+                             template_file=args.chat_template_file,
+                             template_sha=args.chat_template_sha256)
 
     # Delete HF weights to free disk after base GGUF is created
     if model_path and not args.keep_local and base_gguf.exists():
