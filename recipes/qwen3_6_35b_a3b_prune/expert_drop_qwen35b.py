@@ -32,6 +32,11 @@ RE_EXPERT     = re.compile(r"^model\.language_model\.layers\.(\d+)\.mlp\.experts
 RE_GATE       = re.compile(r"^model\.language_model\.layers\.(\d+)\.mlp\.gate\.weight$")
 RE_MTP_EXPERT = re.compile(r"^mtp\.layers\.(\d+)\.mlp\.experts\.(gate_up_proj|down_proj)$")
 RE_MTP_GATE   = re.compile(r"^mtp\.layers\.(\d+)\.mlp\.gate\.weight$")
+# Ornith-1.5-35B-A3B stores its MTP experts UNPACKED and UNFUSED, one tensor per
+# expert per projection (256 x 3 = 768), unlike the trunk's packed fused pair.
+# Qwen3.6-35B-A3B does not; both layouts must work, so this is purely additive.
+RE_MTP_EXPERT_UNPACKED = re.compile(
+    r"^mtp\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
 
 
 def parse_args():
@@ -89,29 +94,78 @@ def main():
     for key, shard in weight_map.items():
         shard_keys[shard].append(key)
 
+    # original index -> new contiguous index, for the unpacked MTP layout
+    mtp_renumber = {orig: new for new, orig in enumerate(mtp_keep)}
+
     def slice_expert(key, tensor):
+        """Return (out_key, tensor, kind).
+
+        out_key is None when the tensor must be DROPPED entirely — which only
+        happens for the unpacked MTP layout, where an evicted expert is its own
+        set of tensors rather than a slice of a packed one.
+        """
         m = RE_EXPERT.match(key)
-        if m:   return tensor[keep_map[int(m.group(1))]], "expert"
+        if m:   return key, tensor[keep_map[int(m.group(1))]], "expert"
         m = RE_GATE.match(key)
-        if m:   return tensor[keep_map[int(m.group(1))]], "router"
-        if RE_MTP_EXPERT.match(key): return tensor[mtp_keep], "mtp-expert"
-        if RE_MTP_GATE.match(key):   return tensor[mtp_keep], "mtp-router"
-        return tensor, None
+        if m:   return key, tensor[keep_map[int(m.group(1))]], "router"
+        if RE_MTP_EXPERT.match(key): return key, tensor[mtp_keep], "mtp-expert"
+        if RE_MTP_GATE.match(key):   return key, tensor[mtp_keep], "mtp-router"
+        m = RE_MTP_EXPERT_UNPACKED.match(key)
+        if m:
+            li, ei, proj = int(m.group(1)), int(m.group(2)), m.group(3)
+            new_i = mtp_renumber.get(ei)
+            if new_i is None:
+                return None, None, "mtp-expert-unpacked-dropped"
+            # RENUMBER: survivors must be contiguous 0..K-1 or the router's
+            # sliced rows no longer address them.
+            return (f"mtp.layers.{li}.mlp.experts.{new_i}.{proj}.weight",
+                    tensor, "mtp-expert-unpacked")
+        return key, tensor, None
 
     # dry-run: validate a representative set, report shapes + projected size
     if args.dry_run:
+        # Probe list is LAYOUT-ADAPTIVE. The trunk names are fixed, but the MTP
+        # head is packed on Qwen3.6 and unpacked on Ornith-1.5; a hardcoded
+        # packed name KeyErrors on Ornith. Detect, then probe what exists.
         probe = ["model.language_model.layers.0.mlp.experts.gate_up_proj",
                  "model.language_model.layers.0.mlp.experts.down_proj",
-                 "model.language_model.layers.0.mlp.gate.weight",
-                 "mtp.layers.0.mlp.experts.gate_up_proj",
-                 "mtp.layers.0.mlp.gate.weight"]
+                 "model.language_model.layers.0.mlp.gate.weight"]
+        mtp_unpacked = [k for k in weight_map if RE_MTP_EXPERT_UNPACKED.match(k)]
+        mtp_packed   = [k for k in weight_map if RE_MTP_EXPERT.match(k)]
+        if mtp_packed:
+            layout = "packed"
+            probe += sorted(mtp_packed)[:2]
+        elif mtp_unpacked:
+            layout = "unpacked"
+            # first and last surviving + one that will be dropped, to exercise both paths
+            probe += [f"mtp.layers.0.mlp.experts.{mtp_keep[0]}.gate_proj.weight",
+                      f"mtp.layers.0.mlp.experts.{mtp_keep[-1]}.down_proj.weight"]
+            dropped = sorted(set(range(num_experts_orig)) - set(mtp_keep))
+            if dropped:
+                probe.append(f"mtp.layers.0.mlp.experts.{dropped[0]}.gate_proj.weight")
+        else:
+            layout = "ABSENT"
+        probe += [k for k in weight_map if RE_MTP_GATE.match(k)][:1]
+        print(f"  MTP expert layout: {layout} "
+              f"(packed={len(mtp_packed)}, unpacked={len(mtp_unpacked)})")
+        if layout == "ABSENT":
+            raise SystemExit("refusing: no MTP expert tensors found in either layout — "
+                             "the head would be silently passed through unsliced")
+
         opened = {}
         for k in probe:
+            if k not in weight_map:
+                raise SystemExit(f"refusing: probe key absent from index: {k}")
             sh = weight_map[k]
             opened.setdefault(sh, safe_open(str(source_dir / sh), framework="pt", device="cpu"))
             t = opened[sh].get_tensor(k)
-            nt, kind = slice_expert(k, t)
-            print(f"  [{kind}] {k}\n      {tuple(t.shape)} -> {tuple(nt.shape)}")
+            nk, nt, kind = slice_expert(k, t)
+            if nk is None:
+                print(f"  [{kind}] {k}\n      {tuple(t.shape)} -> DROPPED")
+            else:
+                arrow = "" if nk == k else f"\n      key -> {nk}"
+                print(f"  [{kind}] {k}\n      {tuple(t.shape)} -> {tuple(nt.shape)}{arrow}")
+
         # projected total params (all tensors)
         counts = defaultdict(int)
         tot_new = 0
@@ -119,21 +173,39 @@ def main():
             sf = safe_open(str(source_dir / sh), framework="pt", device="cpu")
             for k in keys:
                 t = sf.get_tensor(k)
-                nt, kind = slice_expert(k, t)
+                nk, nt, kind = slice_expert(k, t)
                 counts[kind or "keep"] += 1
-                tot_new += nt.numel()
+                if nk is not None:
+                    tot_new += nt.numel()
         print(f"  tensor classes: {dict(counts)}")
-        print(f"  projected total params: {tot_new/1e9:.2f} B  (target ~26 B)")
+        print(f"  projected total params: {tot_new/1e9:.2f} B")
+        # ---- MTP head gate: router rows and expert count must agree ----
+        if layout == "unpacked":
+            kept = counts.get("mtp-expert-unpacked", 0)
+            drop = counts.get("mtp-expert-unpacked-dropped", 0)
+            n_proj = 3   # gate_proj + up_proj + down_proj
+            exp_keep, exp_drop = target_experts * n_proj, drop_count * n_proj
+            print(f"  MTP head: kept {kept} (expect {exp_keep}), "
+                  f"dropped {drop} (expect {exp_drop})")
+            if (kept, drop) != (exp_keep, exp_drop):
+                raise SystemExit(
+                    f"refusing: MTP expert tensor census {kept}/{drop} != "
+                    f"expected {exp_keep}/{exp_drop} — the head would be inconsistent "
+                    f"with its {target_experts}-row router")
         print("  DRY-RUN OK — no files written.")
         return
 
     # real run: stream shards, slice, re-shard at 5GB
     new_weight_map, current_shard, current_size, shard_idx = {}, {}, 0, 1
-    max_shard = int(5 * 1024**3); total_size = 0; n_sliced = 0
+    max_shard = int(5 * 1024**3); total_size = 0; n_sliced = 0; n_dropped = 0
     for shard_name in tqdm(sorted(shard_keys), desc="Processing"):
         sf = safe_open(str(source_dir / shard_name), framework="pt", device="cpu")
         for key in shard_keys[shard_name]:
-            tensor, kind = slice_expert(key, sf.get_tensor(key))
+            out_key, tensor, kind = slice_expert(key, sf.get_tensor(key))
+            if out_key is None:
+                n_dropped += 1
+                continue
+            key = out_key
             if kind: n_sliced += 1
             tsz = tensor.numel() * tensor.element_size()
             if current_size + tsz > max_shard and current_shard:
@@ -164,7 +236,8 @@ def main():
                "preprocessor_config.json", "video_preprocessor_config.json", "vocab.json", "merges.txt"]:
         src = source_dir / fn
         if src.exists(): shutil.copy2(src, output_dir / fn)
-    print(f"Done: {n_sliced} tensors sliced, total {total_size/1e9:.1f} GB bf16 -> {output_dir}")
+    print(f"Done: {n_sliced} tensors sliced, {n_dropped} dropped (unpacked MTP experts), "
+          f"total {total_size/1e9:.1f} GB bf16 -> {output_dir}")
 
 
 if __name__ == "__main__":
