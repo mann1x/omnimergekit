@@ -1,0 +1,58 @@
+# DERIVED probe, NOT a canonical bench. Re-runs ONLY the 4 problems on which
+# Ornith Arm A (184e Coder) hit finish_reason=length at the 32k ceiling in the
+# lcb_v6_77q cell, with the ceiling raised to 48k.
+#
+# Question it answers: were those 4 losses CAPACITY or CEILING? Evidence they
+# may be ceiling: all four terminated at exactly 32768 with truncation-shaped
+# errors (IndentationError: unexpected inden…, NameError: 'total_with' is no…),
+# i.e. cut off mid-code rather than wrong algorithms.
+#
+# Reference behaviour on the same 4, base 256e: 3402 PASSED in 6247 tok; 3562 /
+# 3648 / 3801 FAILED with COMPLETE answers (finish=stop, ~13k tok, wrong output).
+# So at most 1 of the 4 is a problem the base itself can solve, and the realistic
+# upside for Arm A is +1..+4 problems (0.7273 -> 0.7792 at best).
+#
+# NEVER tabulate this beside a full 77q cell: n=4, and a 48k cap is a DIFFERENT
+# basis from the 32k cohort. It is a footnote for the model card, not a score.
+# Everything except n, task_ids and max_gen_toks is lcb_v6_77q verbatim.
+name: lcb_v6_77q_cap4_48k
+backend: lcb_custom
+task: livecodebench
+n: 4
+selection:
+  type: filter
+  task_ids:
+    - lcb/leetcode/3402
+    - lcb/leetcode/3562
+    - lcb/leetcode/3648
+    - lcb/leetcode/3801
+  difficulty: hard
+  min_date: "2024-01-01"
+  testtype: functional
+generation:
+  max_gen_toks: 49152   # RAISED from 32768 -- the whole point of this probe
+  thinking_token_budget: 12288
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 2400    # 48k of generation needs a longer per-request budget
+scoring:
+  scorer: lcb_helpers
+  validated_against: lcb_runner.evaluation.testing_util.grade_call_based
+backend_args:
+  apply_chat_template: true
+  llama_ctx: 262144      # /parallel 2 = 131072 per slot, ample for 48k gen + prompt
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: lcb_v6_77q_cap4_48k
+reports:
+  token_stats: true
+dependencies:
+  python_modules: [datasets]
+backend_overrides:
+  llama:
+    backend_args:
+      llama_extra_replace: true
+      llama_extra: ["--reasoning-format", "deepseek", "--reasoning-budget", "12288"]
