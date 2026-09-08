@@ -626,6 +626,26 @@ M("general", "follow-the-search",
   AFTER_SEARCH)
 
 
+# ---------------------------------------------------------------------------
+# THE 2026-09-08 MINED BLOCK (77 items).
+#
+# Built on a stronger design than the block above: every run on BOTH sides of every
+# split is a run the oracle passed. The groups differ only in cost -- 46 cheap
+# successes at a median 22 actions against 46 expensive successes at 144, a 6.7x
+# gap for an identical verified outcome. omnimerge-v4 and v6 appear on BOTH sides,
+# so no item can be answered by guessing which model produced it.
+#
+# This is the "better, not good/bad" contrast. A survey of Hugging Face on the same
+# day found no public dataset carrying it for agentic coding: the efficiency
+# literature (DAST, Ada-R1, OThink-R1, O1-Pruner, DEPO, COMPASS, AgentPRM) ships
+# methods and weights, not pairs, and the agentic preference sets that look right
+# (e.g. rmems/tool-use-preference-pairs) turn out to be correct-vs-incorrect.
+# ---------------------------------------------------------------------------
+from scripts.gepo_efficiency_items_v2 import ITEMS_V2 as _ITEMS_V2  # noqa: E402
+
+ITEMS.extend(_ITEMS_V2)
+
+
 def build(seed: int, length_lambda: float, budget: int | None,
           think: bool = True) -> list[dict]:
     rng = random.Random(seed)

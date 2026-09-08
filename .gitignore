@@ -137,6 +137,16 @@ eval/replay/gepo_mixed_pool.jsonl
 # The router calib corpus is NOT gepo work and is the one that nearly slipped: it is a
 # router-calibration corpus whose `text` field holds the fully rendered chat prompt for
 # every row, GPQA Diamond included. Rebuild it from its builder rather than committing it.
+# 2026-09-08, second pass: the 60/40 run pool built from the 128-row driver is the
+# SAME hazard -- 128 driver rows are original work, but its 85 replay rows include
+# 43 gpqa_main_minus_diamond with plaintext question+answer. It was staged for this
+# public repo before the check above caught it. Rebuild it from its builder:
+#   python3 -m scripts.build_gepo_mixed_pool \
+#     --efficiency-pool eval/efficiency/gepo_efficiency_pool_v2.jsonl \
+#     --efficiency 128 --lcb 0 --gpqa-nothink 43 --mbpp-nothink 42 --mbpp-think 0 \
+#     --out eval/efficiency/gepo_full_efficiency_pool.jsonl
+# The DRIVER-only pools stay tracked: they are 100% manic-arm-contrast, our own work.
+eval/efficiency/gepo_full_efficiency_pool.jsonl
 eval/efficiency/gepo_mixed_with_efficiency.jsonl
 eval/efficiency/gepo_light_efficiency_pool.jsonl
 recipes/qwen3_6_35b_a3b_prune/results/router_calib_corpus_ornith.jsonl
