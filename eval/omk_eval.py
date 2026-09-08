@@ -2150,17 +2150,24 @@ def _check_dependencies(template: dict) -> None:
         log(f"  missing modules: {missing}")
         log(f"  required: {required}")
         # Best-effort install hint based on known mappings
+        # ALWAYS spell the interpreter. A bare `pip` is how the 2026-09-08 pod
+        # incident happened: `pip install lm-eval[api,ifeval,math]==0.4.11` ran
+        # the SYSTEM pip, so lm_eval+extras landed in
+        # /usr/local/lib/python3.10/dist-packages while omk_eval ran from
+        # /workspace/venv-omk (built without --system-site-packages) and saw
+        # none of it. The command was right; the interpreter was not.
+        PIP = f"{sys.executable} -m pip"
         hints = []
         if any(m in missing for m in ("sympy", "math_verify", "antlr4")):
-            hints.append("pip install 'lm-eval[math]' sympy math_verify antlr4-python3-runtime==4.11")
+            hints.append(f"{PIP} install 'lm-eval[math]' sympy math_verify antlr4-python3-runtime==4.11")
         if any(m in missing for m in ("langdetect", "immutabledict", "nltk")):
-            hints.append("pip install 'lm-eval[ifeval]' langdetect immutabledict nltk")
+            hints.append(f"{PIP} install 'lm-eval[ifeval]' langdetect immutabledict nltk")
         if "lm_eval" in missing:
-            hints.append("pip install 'lm-eval[api,math,ifeval]==0.4.11'")
+            hints.append(f"{PIP} install -r <omk>/requirements-eval.txt")
         for h in hints:
             log(f"  hint: {h}")
         fatal(6, f"dependency pre-flight failed: missing {missing}")
-    log(f"dep check OK ({len(required)} modules): {required}")
+    log(f"dep check OK ({len(required)} modules) on {sys.executable}: {required}")
 
 
 def _check_ruler_native(template: dict) -> None:
@@ -2431,6 +2438,11 @@ def main() -> None:
     ap.add_argument("--spec-n", type=int, default=2,
                     help="llamafile MTP: max draft tokens per step "
                          "(--spec-draft-n-max). Only used with --mtp-head.")
+    ap.add_argument("--preflight-only", action="store_true",
+                    help="Resolve the template, run the dependency pre-flight, then exit "
+                         "(0 = runnable, 6 = missing modules). Launches no server and "
+                         "touches no GPU, so a suite driver can validate EVERY template "
+                         "up front instead of discovering a broken one hours in.")
     ap.add_argument("--print-serve-plan", action="store_true",
                     help="Resolve the template for --backend (+ any --sampler overlay "
                     "and --metadata) and print the serving budget it needs as shell "
@@ -2548,6 +2560,9 @@ def main() -> None:
 
     # Pre-flight: dependency check BEFORE launching any server.
     _check_dependencies(template)
+    if args.preflight_only:
+        log(f"preflight OK: template={args.template} interpreter={sys.executable}")
+        sys.exit(0)
     # ruler_native needs its own preflight (RULER clone + synthetic-generator
     # modules + nltk punkt + the task's haystack/qa corpus) — the generic check
     # above can't see data-file deps. No-op for every other backend.

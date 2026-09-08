@@ -208,6 +208,46 @@ trap '
     pkill -KILL -f "llama-server.*--port $PORT" 2>/dev/null || true
 ' EXIT INT TERM
 
+# ── suite-wide dependency pre-flight ────────────────────────────────────
+# Validate EVERY selected template's python deps BEFORE any GPU work.
+# omk_eval already pre-flights each template, but inside the loop that means a
+# broken bench is discovered hours in. 2026-09-08, pod 20804: ifeval_100,
+# math500_100 and aime_30 each aborted rc=6 on missing langdetect /
+# immutabledict / math_verify / antlr4 -- but only AFTER gpqa (7086s), arc
+# (2170s), gsm8k, humaneval, humaneval+ and lcb_medium_55 had already run.
+# Three benches were lost from that cohort for want of a 3-second check.
+#
+# This also catches the INTERPRETER SPLIT that caused it: the deps had been
+# installed correctly, with the right extras, but by a bare `pip` into system
+# python, while the suite runs $OMK_PY out of a venv built without
+# --system-site-packages. Because this check executes under $OMK_PY itself, it
+# can only pass if the env the suite actually uses is the env that has them.
+if [ "${OMK_SKIP_PREFLIGHT:-0}" != "1" ]; then
+    PF_DIR=$(dirname "$SUITE_LOG")
+    log "===== dependency pre-flight ($OMK_PY, ${#selected[@]} templates) ====="
+    pf_bad=()
+    for t in "${selected[@]}"; do
+        if "$OMK_PY" "$OMK/eval/omk_eval.py" \
+                --backend "$BACKEND" --template "$t" --quant "$QUANT" \
+                --model "$GGUF" --tokenizer "$TOKENIZER" \
+                --served-name "$SERVED_NAME" --port "$PORT" \
+                --results-dir "$RESULTS_DIR" --preflight-only \
+                >"$PF_DIR/preflight_${t}.log" 2>&1; then
+            log "  preflight OK    $t"
+        else
+            log "  preflight FAIL  $t :: $(grep -m1 'missing modules' "$PF_DIR/preflight_${t}.log" 2>/dev/null || echo 'see preflight_'"$t"'.log')"
+            pf_bad+=("$t")
+        fi
+    done
+    if [ ${#pf_bad[@]} -gt 0 ]; then
+        log "[FATAL] ${#pf_bad[@]}/${#selected[@]} templates fail the dependency pre-flight: ${pf_bad[*]}"
+        log "[FATAL] the hint lines in $PF_DIR/preflight_<t>.log name the interpreter to install into."
+        log "[FATAL] override with OMK_SKIP_PREFLIGHT=1 to run the healthy subset anyway."
+        exit 7
+    fi
+    log "  preflight: all ${#selected[@]} templates runnable"
+fi
+
 # ── main loop ───────────────────────────────────────────────────────────
 declare -A SCORES
 declare -A DURS
