@@ -1,13 +1,27 @@
+# MultiPL-E-targeted CALIBRATION generation template — NOT an eval template, do not tabulate.
+#
+# The DISJOINT TAIL of each MultiPL-E split. The canonical eval template
+# (multipl_e_100.yaml) takes the FIRST 100 problems per language, so problems
+# 100..end are untouched by any eval cell: rs 56 + java 58 + js 61 = 175 problems,
+# ZERO overlap with the eval basis. Names taken verbatim from the HF splits
+# (nuprl/MultiPL-E humaneval-{rs,java,js}); the list also lives in
+# eval/multipl_e/mpe_calib_tail.json.
+#
+# Recipe is byte-for-byte the frozen eval recipe (mode chat, max_gen_toks 1024,
+# GREEDY) so the teacher's trajectory here is the same one the eval measures.
+# The nuprl harness labels every problem PASS/FAIL and `raw_completions` (bug-607)
+# carries the untransformed CoT into <name>.results.json;
+# harvest_mpe_calib_corpus.py keeps the PASS subset as the `targeted_mpe`
+# competence channel — the MultiPL-E analogue of targeted_lcb.
+#
+# NOTE: dependencies list no docker image on purpose — the calib run is a pod run
+# with MPE_MODE=native (eval/multipl_e/install_mpe_toolchains_native.sh).
 name: multipl_e_calib
 backend: multipl_e
 task: multipl_e
-n: 100
+n: 175
 selection:
-  type: langs
-  langs:
-  - rs
-  - java
-  - js
+  type: problems
   problems:
     rs:
     - HumanEval_105_by_length
@@ -200,6 +214,7 @@ scoring:
   aggregate: macro_mean_over_langs
 backend_args:
   llama_ctx: 16384
+  num_concurrent: 4
 cache:
   sqlite_prefix: mpe_calib
 reports:
@@ -209,5 +224,3 @@ sanity:
 dependencies:
   python_modules:
   - datasets
-  docker_images:
-  - ghcr.io/nuprl/multipl-e-evaluation
