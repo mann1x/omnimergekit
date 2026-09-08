@@ -29,6 +29,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+import gepo_reward_v2 as R  # noqa: E402
 from gepo_reward_v2 import make_gepo_reward_v2  # noqa: E402
 
 MAXC = 12288
@@ -155,6 +156,45 @@ try:
     check("9 raises on unknown reward_kind", False, "returned instead of raising")
 except ValueError as e:
     check("9 raises on unknown reward_kind", "REFUSE" in str(e), str(e)[:70])
+
+# ---------------------------------------------------------------- arm 10
+# length_lambda as a MAGNITUDE. Under the older reading any lambda > 0 applied the
+# full term, so 0.25 and 1.0 were indistinguishable and a pool could not ask for a
+# gentler pull. These assertions are what separate the two readings; without them the
+# semantics could be switched back and nothing would notice.
+print("\n=== arm 10: length_lambda scales the length term (magnitude mode) ===")
+ANS = "The correct answer is (A)"
+def lam_rewards(lam):
+    r = build(set())
+    comps = [" ".join(["x"] * n) + " " + ANS for n in (10, 20, 30, 40)]
+    return r(completions=comps, prompts=["q"] * 4,
+             meta=[{"reward_kind": "mc_letter", "length_lambda": lam}] * 4,
+             gold=["A"] * 4)
+
+if R.LAMBDA_MODE == "magnitude":
+    full, part, tiny = lam_rewards(1.0), lam_rewards(0.7), lam_rewards(0.25)
+    span = lambda o: max(o) - min(o)
+    check("10a lambda=1.0 reproduces the gate reading exactly",
+          all(abs(a - b) < 1e-9 for a, b in zip(full, [1.0, 0.8, 0.4, 0.2])),
+          str([round(x, 6) for x in full]))
+    check("10b a smaller lambda pulls less", span(tiny) < span(part) < span(full),
+          f"{span(tiny):.2f} < {span(part):.2f} < {span(full):.2f}")
+    check("10c the span scales linearly with lambda",
+          abs(span(part) - 0.7 * span(full)) < 1e-9
+          and abs(span(tiny) - 0.25 * span(full)) < 1e-9,
+          f"part={span(part):.3f} tiny={span(tiny):.3f} full={span(full):.3f}")
+    # The invariant the whole band exists to protect: shortening is worth something,
+    # but never worth as much as being right.
+    check("10d ORDERING holds at every lambda: worst passer still beats a failure",
+          min(min(full), min(part), min(tiny)) > 0.0,
+          f"min={min(min(full), min(part), min(tiny)):.3f}")
+    check("10e lambda<=0 is still correctness-only, not a zero-width band",
+          all(abs(x - 1.0) < 1e-9 for x in lam_rewards(0.0)),
+          str(lam_rewards(0.0)))
+else:
+    same = lam_rewards(0.25) == lam_rewards(1.0)
+    check("10f gate mode: lambda magnitude is inert, as documented", same,
+          f"{lam_rewards(0.25)} vs {lam_rewards(1.0)}")
 
 print(f"\n{'REWARD_V2_OK' if fails == 0 else f'REWARD_V2_FAIL ({fails} failing)'}")
 sys.exit(1 if fails else 0)

@@ -36,7 +36,13 @@ statistic:
     mad  = median(|len_i - med|)            # robust; a single outlier cannot set the scale
     scale= max(mad, MAD_FLOOR_FRAC*med, 1)  # floor: converged lengths => small signal, by design
     s_i  = clip((med - len_i)/scale, -1, +1)          # +1 shortest, -1 longest
-    r_i  = BASE + ALPHA*s_i     (i in P)  |  0.0  (otherwise)
+    lam  = clip(meta.length_lambda, 0, 1)   # "magnitude" mode; 1.0 in "gate" mode
+    r_i  = BASE + ALPHA*lam*s_i (i in P)  |  0.0  (otherwise)
+
+`lam` is how hard the length term pulls, and lam<=0 short-circuits to the
+correctness-only tier before any of this runs, so replay is unaffected either way.
+Mode is GEPO_LENGTH_LAMBDA_MODE and defaults to "magnitude"; see LAMBDA_MODE for what
+that changes about a pool written under the older reading.
 
 BASE=0.6, ALPHA=0.4 -> passers span [0.2, 1.0], failures 0.0. Two invariants this
 preserves, both asserted in the selftest:
@@ -79,6 +85,28 @@ RANK = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
 BASE = 0.6            # reward of a median-length passing rollout
 ALPHA = 0.4           # half-range of the length term among passers
 MAD_FLOOR_FRAC = 0.02  # scale floor as a fraction of the group median
+
+# HOW meta.length_lambda IS READ.
+#
+# "gate"      -- the original behaviour: <=0 means correctness-only, and ANY value
+#                above 0 applies the full length term. 0.05 and 0.7 and 1.0 are
+#                indistinguishable, because the number never multiplies anything.
+# "magnitude" -- lambda scales the length term: r_i = BASE + ALPHA*lambda*s_i.
+#                lambda <= 0 still means correctness-only, so replay tiers are
+#                untouched, and lambda = 1.0 reproduces "gate" exactly.
+#
+# READ THIS BEFORE SWITCHING. build_gepo_mixed_pool writes 0.7 on the lcb_exec tier,
+# which under "gate" got the FULL term. Under "magnitude" that same pool gets 70% of
+# it -- a 30% weakening of the one objective the tier exists to carry, applied to a
+# pool that was tuned under the other reading. Set those rows to 1.0 if the intent
+# was full strength, and re-price the run rather than assuming it carries over.
+LAMBDA_MODE = os.environ.get("GEPO_LENGTH_LAMBDA_MODE", "magnitude").strip().lower()
+if LAMBDA_MODE not in ("gate", "magnitude"):
+    raise ValueError(f"GEPO_LENGTH_LAMBDA_MODE must be 'gate' or 'magnitude', "
+                     f"got {LAMBDA_MODE!r}")
+# Above 1.0 would push a passer past BASE+ALPHA and break the ORDERING invariant that
+# the worst passer still beats the best failure, so it is clamped rather than trusted.
+LAMBDA_MAX = 1.0
 MC_RE = re.compile(r"correct answer is[^A-Da-d]*\(?([A-Da-d])\)?")
 FENCE_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.S)
 
@@ -170,7 +198,13 @@ def make_gepo_reward_v2(tokenizer, lcb_verifier, max_completion: int,
                         base: float = BASE, alpha: float = ALPHA,
                         log_every: int = 0):
     tk = getattr(tokenizer, "tokenizer", tokenizer)
-    state = {"n": 0, "pass": 0, "tok": 0, "clip": 0, "byk": {}}
+    # Announced once, positively, at construction. A reward whose reading of the pool
+    # changed silently is the failure that is only diagnosable in hindsight -- the run
+    # log has to be able to answer "which semantics was this trained under".
+    print(f">>> gepo_reward_v2: length_lambda mode = {LAMBDA_MODE} "
+          f"({'lambda scales the length term' if LAMBDA_MODE == 'magnitude' else 'any lambda > 0 applies it in full'}), "
+          f"BASE={base} ALPHA={alpha}", flush=True)
+    state = {"n": 0, "pass": 0, "tok": 0, "clip": 0, "byk": {}, "lam_seen": set()}
 
     def ntoks(text: str, cid) -> int:
         if cid is not None:
@@ -240,6 +274,7 @@ def make_gepo_reward_v2(tokenizer, lcb_verifier, max_completion: int,
             tier_f[i] = kind_f[i] + (
                 "/T" if m.get("think", kind_f[i] == "lcb_exec") else "/N")
             lam_f[i] = float(m.get("length_lambda", 1.0))
+            state["lam_seen"].add(round(lam_f[i], 3))
             text = completion_text(comp)
             len_f[i] = ntoks(text, cids[i])
             clip_f[i] = len_f[i] >= max_completion
@@ -272,6 +307,11 @@ def make_gepo_reward_v2(tokenizer, lcb_verifier, max_completion: int,
             med = st.median(lens)
             mad = st.median([abs(x - med) for x in lens])
             scale = max(mad, MAD_FLOOR_FRAC * med, 1.0)
+            # In "magnitude" mode a group's lambda scales the length term. It is a
+            # per-ROW field but constant within a group (one pool row, G rollouts), so
+            # the group's value is taken from a passer rather than averaged -- an
+            # average would invent a lambda no row actually carries.
+            lam_g = min(max(lam_f[P[0]], 0.0), LAMBDA_MAX) if LAMBDA_MODE == "magnitude" else 1.0
             for i in P:
                 if clip_f[i]:
                     # STRICTLY below the uncapped band, not merely at its floor. Setting
@@ -284,7 +324,7 @@ def make_gepo_reward_v2(tokenizer, lcb_verifier, max_completion: int,
                     rewards[i] = (base - alpha) / 2.0
                     continue
                 s_i = max(-1.0, min(1.0, (med - len_f[i]) / scale))
-                rewards[i] = base + alpha * s_i
+                rewards[i] = base + alpha * lam_g * s_i
 
         state["n"] += n
         state["pass"] += sum(ok_f)

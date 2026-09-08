@@ -63,8 +63,28 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 # Measured tokens per rollout, G=8. Used only to PRICE a composition up front, so an
 # unaffordable pool is rejected before the run rather than discovered 20 h in.
 TOK = {("lcb_exec", True): 6000, ("mc_letter", False): 1595,
-       ("mbpp_exec", True): 3400, ("mbpp_exec", False): 205}
-RATE = 307_000  # tokens/hour, from run2: 128 LCB problems, ~6.14M tokens, ~20 h
+       ("mbpp_exec", True): 3400, ("mbpp_exec", False): 205,
+       # The efficiency tier is mc_letter, so no-think reuses that measured figure.
+       # The THINKING figure is a placeholder and is flagged as such at build time:
+       # these items are far shorter than GPQA, but nobody has measured them, and a
+       # pool priced on a guess is how a run discovers it is unaffordable 20 h in.
+       ("efficiency", False): 1595, ("efficiency", True): 2500}
+# A tok/h rate DOES NOT TRANSFER BETWEEN POOLS, and this constant used to pretend it
+# did. r9_gepo_run4.sh measured both and says so plainly:
+#
+#     run2  1024 rollouts, mean_tok 5780, LCB-only  -> 296k tok/h
+#     run4  6792 rollouts, mean_tok ~1860, 4 tiers  -> 187k tok/h  (at step 77)
+#
+# The old value here was 307k, which is neither of those. Priced with it, the 849-row
+# pool that actually shipped for run4 came out at 41.2 h against a 32 h budget and this
+# script REFUSED to build it -- the guard rejecting the one composition known to work.
+# A guard that refuses correct configurations teaches people to pass --hours-budget and
+# stop reading it, which is worse than no guard.
+#
+# So the rate is now a flag, defaulted to the mixed-pool measurement rather than the
+# LCB-only one, and the docstring above no longer claims a single number is portable.
+# Take elapsed/steps from a run's own first ~20 steps and pass --rate; never tqdm's s/it.
+DEFAULT_RATE = 187_000  # tokens/hour, run4 mixed pool measured at step 77
 
 
 def main() -> int:
@@ -73,12 +93,25 @@ def main() -> int:
     ap.add_argument("--replay-pool",
                     default=str(REPO / "eval/replay/gepo_replay_pool.jsonl"))
     ap.add_argument("--out", default=str(REPO / "eval/replay/gepo_mixed_pool.jsonl"))
-    ap.add_argument("--lcb", type=int, default=96)
+    ap.add_argument("--lcb", type=int, default=128)
     ap.add_argument("--gpqa-nothink", type=int, default=250)
-    ap.add_argument("--mbpp-nothink", type=int, default=300)
-    ap.add_argument("--mbpp-think", type=int, default=150)
+    ap.add_argument("--mbpp-nothink", type=int, default=371)
+    ap.add_argument("--mbpp-think", type=int, default=100)
+    ap.add_argument("--efficiency-pool",
+                    default=str(REPO / "eval/efficiency/gepo_efficiency_pool.jsonl"))
+    ap.add_argument("--efficiency", type=int, default=0,
+                    help="Rows from the efficiency tier (troubleshooting decision "
+                         "policy, mined from the manic harness arm contrast). Default "
+                         "0: it is opt-in because the tier is small, and a small tier "
+                         "repeated to fill a quota is correlated rows, not more data.")
     ap.add_argument("-G", "--group", type=int, default=8)
-    ap.add_argument("--hours-budget", type=float, default=32.0)
+    ap.add_argument("--rate", type=float, default=DEFAULT_RATE,
+                    help="Generation rate in tokens/hour for the hours estimate. "
+                         "Measure it on the pool you are actually running.")
+    ap.add_argument("--hours-budget", type=float, default=72.0,
+                    help="Refuse above this. Default admits the 849-row run4 pool "
+                         "(67.7 h at the measured mixed-pool rate), which the previous "
+                         "default of 32 h rejected.")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
 
@@ -100,10 +133,28 @@ def main() -> int:
         rng.shuffle(v)
     rng.shuffle(lcb)
 
+    eff = []
+    if a.efficiency:
+        ep = pathlib.Path(a.efficiency_pool)
+        if not ep.exists():
+            sys.exit(f"REFUSE: --efficiency {a.efficiency} but no pool at {ep}. "
+                     "Build it with build_gepo_efficiency_pool.py first.")
+        eff = [json.loads(l) for l in ep.read_text().splitlines() if l.strip()]
+        if a.efficiency > len(eff):
+            sys.exit(f"REFUSE: asked for {a.efficiency} efficiency rows but the pool "
+                     f"holds {len(eff)}. Sampling with replacement would put the same "
+                     "prompt in one epoch twice and silently double its weight; write "
+                     "more items instead.")
+        rng.shuffle(eff)
+
     want = [("lcb_exec", True, a.lcb, lcb),
             ("mc_letter", False, a.gpqa_nothink, by.get("mc_letter", [])),
             ("mbpp_exec", False, a.mbpp_nothink, by.get("mbpp_exec", [])),
-            ("mbpp_exec", True, a.mbpp_think, by.get("mbpp_exec", []))]
+            ("mbpp_exec", True, a.mbpp_think, by.get("mbpp_exec", [])),
+            # Its rows already carry reward_kind mc_letter; the label here is only for
+            # the cost table and the composition print, so the tier is visible rather
+            # than hidden inside the GPQA count.
+            ("efficiency", None, a.efficiency, eff)]
 
     # mbpp think/no-think must be DISJOINT problems. The same problem in both modes
     # would put two correlated rows in one epoch and quietly double its weight.
@@ -120,21 +171,51 @@ def main() -> int:
             if kind == "mbpp_exec":
                 used_mbpp.add(r["id"])
             m = dict(r["meta"])
-            m["reward_kind"] = kind
-            m["think"] = think
+            # The efficiency tier keeps the reward_kind and think flag its own builder
+            # chose. Overwriting them here would silently re-price a tier that was
+            # written deliberately, and reward_kind must stay mc_letter or the
+            # dispatch has no verifier for it.
+            if kind != "efficiency":
+                m["reward_kind"] = kind
+                m["think"] = think
             m.setdefault("length_lambda", 0.7 if kind == "lcb_exec" else 0.0)
             rows.append({"id": f"{r['id']}#{'T' if think else 'N'}",
                          "source": r.get("source", kind),
                          "prompt": r["prompt"], "gold": str(r.get("gold") or ""),
                          "meta": m})
-        cost += n * a.group * TOK[(kind, think)]
+        # The efficiency tier carries its own think flag per row, so the cost is
+        # looked up from what the rows actually say rather than from a tuple field
+        # this tier deliberately leaves unset.
+        think_for_cost = (bool(pool[0]["meta"].get("think", True))
+                          if kind == "efficiency" else think)
+        cost += n * a.group * TOK[(kind, think_for_cost)]
+        if kind == "efficiency" and think_for_cost:
+            print("NOTE: the efficiency tier is priced at a PLACEHOLDER 2,500 tok with "
+                  "thinking on -- that figure is not measured. Measure the tier's real "
+                  "completion length before trusting the hours estimate below.")
 
     rng.shuffle(rows)
-    hours = cost / RATE
+    hours = cost / a.rate
+    # DRIVER vs REPLAY, not lcb vs everything-else. A driver is any tier under length
+    # pressure -- the thing the run is trying to move. Everything else is there to hold
+    # capability while it moves. Reporting the efficiency tier as "replay" because it is
+    # not LCB is how a pool comes to be 5% driver without anyone noticing: run4 carried
+    # 128 driver rows in 849 and its pool-wide mean_length moved +1.3% over 93 rounds,
+    # a number that says nothing either way about the tier it was meant to measure.
+    n_driver = sum(1 for r in rows if float(r["meta"].get("length_lambda", 0)) > 0)
     n_lcb = sum(1 for r in rows if r["meta"]["reward_kind"] == "lcb_exec")
     n_think = sum(1 for r in rows if r["meta"]["think"])
-    print(f"rows: {len(rows)}  (lcb {n_lcb} = {100*n_lcb/len(rows):.0f}%, "
-          f"replay {len(rows)-n_lcb} = {100*(len(rows)-n_lcb)/len(rows):.0f}%)")
+    share = 100 * n_driver / len(rows)
+    print(f"rows: {len(rows)}  (lcb {n_lcb} = {100*n_lcb/len(rows):.0f}%)")
+    print(f"DRIVER (length_lambda > 0): {n_driver} = {share:.0f}%  |  "
+          f"replay (correctness-only): {len(rows)-n_driver} = {100-share:.0f}%")
+    if 0 < share < 25:
+        print(f"  WARNING: a {share:.0f}% driver is easy to dilute past the point of "
+              "measurement. run4 ran at 15% and could not tell whether its driver tier "
+              "moved at all. Read the PER-TIER numbers, never the pool-wide mean.")
+    if n_driver == 0:
+        print("  WARNING: no row carries length_lambda > 0, so nothing in this pool is "
+              "under length pressure. It will hold capability and move nothing.")
     print(f"thinking rows: {n_think} = {100*n_think/len(rows):.0f}%  |  "
           f"no-think: {len(rows)-n_think}")
     comp: dict[str, int] = {}
@@ -143,7 +224,7 @@ def main() -> int:
             comp.get(f"{r['meta']['reward_kind']}/{'think' if r['meta']['think'] else 'nothink'}", 0) + 1
     print("composition:", dict(sorted(comp.items())))
     print(f"PRICED at G={a.group}: {cost/1e6:.2f}M tokens -> ~{hours:.1f} h "
-          f"at run2's realised {RATE//1000}k tok/h")
+          f"at {a.rate/1000:.0f}k tok/h")
     if hours > a.hours_budget:
         sys.exit(f"REFUSE: {hours:.1f} h exceeds --hours-budget {a.hours_budget}. "
                  "An unaffordable pool must be rejected here, not discovered 20 h into "
