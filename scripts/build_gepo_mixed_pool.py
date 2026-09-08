@@ -65,10 +65,12 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 TOK = {("lcb_exec", True): 6000, ("mc_letter", False): 1595,
        ("mbpp_exec", True): 3400, ("mbpp_exec", False): 205,
        # The efficiency tier is mc_letter, so no-think reuses that measured figure.
-       # The THINKING figure is a placeholder and is flagged as such at build time:
-       # these items are far shorter than GPQA, but nobody has measured them, and a
-       # pool priced on a guess is how a run discovers it is unaffordable 20 h in.
-       ("efficiency", False): 1595, ("efficiency", True): 2500}
+       # The THINKING figure was a 2,500 placeholder until 2026-09-08, when all 51
+       # driver rows were run against gemma4-98e-jprimep3_tb:Q4_K_M over the ollama
+       # HTTP API: median 1315 completion tokens (p75 2275, p90 2914, max 6409,
+       # mean 1810) at 42/51 = 82.4% pass. The placeholder was ~2x too high, so
+       # every composition priced before that date OVERSTATES its hours.
+       ("efficiency", False): 1595, ("efficiency", True): 1315}
 # A tok/h rate DOES NOT TRANSFER BETWEEN POOLS, and this constant used to pretend it
 # did. r9_gepo_run4.sh measured both and says so plainly:
 #
@@ -178,7 +180,22 @@ def main() -> int:
             if kind != "efficiency":
                 m["reward_kind"] = kind
                 m["think"] = think
-            m.setdefault("length_lambda", 0.7 if kind == "lcb_exec" else 0.0)
+            # A DRIVER tier must never fall back to 0.0. lambda <= 0 short-circuits
+            # gepo_reward_v2 to correctness-only, so defaulting the driver to 0.0
+            # does not weaken the brevity pressure -- it deletes it, silently, and
+            # the pool still reports the right row count. That is exactly how the
+            # 880-row mix shipped with all 41 of its driver rows inert. Refuse.
+            if kind == "efficiency":
+                lam = m.get("length_lambda")
+                if lam is None or float(lam) <= 0:
+                    sys.exit(
+                        f"REFUSE: efficiency row {r['id']} carries length_lambda="
+                        f"{lam!r}. The efficiency tier is the DRIVER; a lambda of 0 "
+                        "or missing makes the reward correctness-only and the tier "
+                        "teaches nothing about brevity. Rebuild the pool with "
+                        "build_gepo_efficiency_pool.py --length-lambda.")
+            else:
+                m.setdefault("length_lambda", 0.7 if kind == "lcb_exec" else 0.0)
             rows.append({"id": f"{r['id']}#{'T' if think else 'N'}",
                          "source": r.get("source", kind),
                          "prompt": r["prompt"], "gold": str(r.get("gold") or ""),
@@ -190,9 +207,10 @@ def main() -> int:
                           if kind == "efficiency" else think)
         cost += n * a.group * TOK[(kind, think_for_cost)]
         if kind == "efficiency" and think_for_cost:
-            print("NOTE: the efficiency tier is priced at a PLACEHOLDER 2,500 tok with "
-                  "thinking on -- that figure is not measured. Measure the tier's real "
-                  "completion length before trusting the hours estimate below.")
+            print("NOTE: the efficiency tier is priced at 1,315 tok with thinking on "
+                  "-- measured 2026-09-08 over all 51 driver rows on "
+                  "gemma4-98e-jprimep3_tb:Q4_K_M (median; p90 2,914). Re-measure if "
+                  "the target model changes: this is a per-model figure.")
 
     rng.shuffle(rows)
     hours = cost / a.rate

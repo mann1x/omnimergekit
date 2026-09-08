@@ -140,5 +140,62 @@ fired, msg = refuses(gb.apply_difficulty, [dict(r) for r in rows],
                      prof_file(p8, "p8"), G, str(POOL))
 check("8 REFUSES when the filter erases the mbpp THINKING slice alone", fired, msg)
 
+# ---------------------------------------------------------------------------
+# 9-10  THE DRIVER-LAMBDA GUARD, end to end through the builder's CLI.
+#
+# The 880-row mix shipped with all 41 of its driver rows at length_lambda 0.0,
+# which short-circuits gepo_reward_v2 to correctness-only: the tier was inert and
+# the pool still reported the right row count and the right driver share. Nothing
+# in the output said so. These arms drive the builder as the run host drives it.
+# ---------------------------------------------------------------------------
+print("\n=== arms 9-10: the efficiency tier must refuse an inert lambda ===")
+import subprocess
+
+BUILDER = pathlib.Path(__file__).resolve().parent / "build_gepo_mixed_pool.py"
+EFF = pathlib.Path(__file__).resolve().parents[1] / "eval/efficiency/gepo_efficiency_pool.jsonl"
+
+
+def eff_pool(lam, name):
+    """A copy of the real driver pool with every row forced to `lam`."""
+    rs = [json.loads(l) for l in EFF.open()]
+    for r in rs:
+        if lam is None:
+            r["meta"].pop("length_lambda", None)
+        else:
+            r["meta"]["length_lambda"] = lam
+    f = TMP / f"{name}.jsonl"
+    f.write_text("".join(json.dumps(r) + "\n" for r in rs))
+    return str(f)
+
+
+def build(pool_path):
+    """Run the builder on a tiny composition; return (refused, message)."""
+    out = TMP / "arm_out.jsonl"
+    r = subprocess.run(
+        [sys.executable, str(BUILDER), "--efficiency-pool", pool_path,
+         "--efficiency", "8", "--lcb", "0", "--gpqa-nothink", "0",
+         "--mbpp-nothink", "0", "--mbpp-think", "0", "--out", str(out),
+         "--seed", "1"],
+        capture_output=True, text=True)
+    return r.returncode != 0, (r.stdout + r.stderr).strip().splitlines()[-1] if (r.stdout + r.stderr).strip() else ""
+
+
+if not EFF.exists():
+    check("9-10 SKIPPED", False, f"no driver pool at {EFF}")
+else:
+    # 9  lambda 0.0 -- the exact defect that shipped -- must REFUSE, not emit.
+    fired, msg = build(eff_pool(0.0, "eff_lam0"))
+    check("9 REFUSES a driver tier whose length_lambda is 0.0", fired, msg)
+
+    # 9b A MISSING lambda must refuse too. The old code reached this case through
+    #    setdefault(..., 0.0), so absence and inertness produced the same silent pool.
+    fired, msg = build(eff_pool(None, "eff_lamNone"))
+    check("9b REFUSES a driver tier with no length_lambda at all", fired, msg)
+
+    # 10 CONTROL: the same call with a real lambda must SUCCEED. Without this the
+    #    two refusals above would also pass on a builder that refuses everything.
+    fired, msg = build(eff_pool(0.3, "eff_lam03"))
+    check("10 ACCEPTS the same composition at length_lambda 0.3", not fired, msg)
+
 print(f"\n{'MIXED_POOL_OK' if fails == 0 else f'MIXED_POOL_FAIL ({fails} failing)'}")
 sys.exit(1 if fails else 0)
