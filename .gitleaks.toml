@@ -16,4 +16,9 @@ regexes = [
     '''\*\*\*REMOVED-DEAD-HF-TOKEN\*\*\*''',   # the post-scrub marker left in history
     '''hf_(xxx+|XXX+|placeholder|your_token_here)''',
     '''\$\{HF_TOKEN[:?-]''',                    # env-var indirection is NOT a secret
+    # transformers auto/model class names are high-entropy CamelCase and trip
+    # generic-api-key on plain `from transformers import ...` lines. A class
+    # identifier cannot be a credential. Added 2026-09-08 after
+    # Gemma4ForConditionalGeneration blocked recipes/gemma4/ream/.
+    '''\b[A-Z][A-Za-z0-9]*For(CausalLM|ConditionalGeneration|SequenceClassification|TokenClassification|MaskedLM|QuestionAnswering)\b''',
 ]
