@@ -66,17 +66,42 @@ class Gemma4GateShim(nn.Linear):
     in-place `gate.weight.data = gate.weight.data[keep]` prunes the real router.
     """
 
-    def __init__(self, router):
+    def __init__(self, router, raw_holder=None):
         n_exp, hidden = router.proj.weight.shape
         super().__init__(hidden, n_exp, bias=False)
         object.__setattr__(self, "_router", router)
+        # Gemma-4 feeds the ROUTER the raw residual and the EXPERTS
+        # pre_feedforward_layernorm_2(residual) -- two DIFFERENT tensors. Our hook
+        # sits on .experts, so x here is already LN2'd. Gemma4MoEView captures the
+        # raw residual into this holder; see forward().
+        object.__setattr__(self, "_raw_holder",
+                           raw_holder if raw_holder is not None else {})
         # share the Parameter object (not a copy) so REAM's slicing writes through
         del self._parameters["weight"]
         self._parameters["weight"] = router.proj.weight
 
     def forward(self, x):
         r = self._router
-        h = r.norm(x)
+        # The real Gemma4TextDecoderLayer does:
+        #     _, w, idx = self.router(hidden_states_flat)                    <- RAW residual
+        #     hs2       = self.pre_feedforward_layernorm_2(hidden_states_flat)
+        #     hs2       = self.experts(hs2, idx, w)                          <- LN2'd
+        # Our hook target is .experts, so `x` is LN2(residual). Applying r.norm(x)
+        # on top would compute proj(norm(LN2(residual))) instead of the router's
+        # proj(norm(residual)) -- double-normalised gate logits, which corrupt REAP
+        # saliency AND pseudo-group similarity, i.e. every merge decision downstream.
+        src = self._raw_holder.get("residual")
+        if src is None:
+            raise RuntimeError(
+                "Gemma4GateShim: raw residual was not captured. Refusing to fall back "
+                "to the experts' LN2'd input -- that silently double-normalises the "
+                "gate logits and corrupts the whole merge. Ensure Gemma4MoEView "
+                "installed its pre_feedforward_layernorm_2 pre-hook.")
+        if src.shape != x.shape:
+            raise RuntimeError(
+                f"Gemma4GateShim: captured residual {tuple(src.shape)} does not match "
+                f"the experts' input {tuple(x.shape)} -- stale capture, refusing to guess.")
+        h = r.norm(src)
         h = h * r.scale * r.scalar_root_size
         return F.linear(h, self.weight)
 
@@ -111,9 +136,22 @@ class Gemma4MoEView:
 
     def __init__(self, layer, layer_ind, top_k):
         self.layer = layer
-        self.gate = Gemma4GateShim(layer.router)
+        # Capture the RAW residual -- pre_feedforward_layernorm_2's INPUT -- which is
+        # exactly what the real router is fed. Without this the gate shim would see
+        # the experts' already-normalised input. See Gemma4GateShim.forward().
+        self._raw_holder = {}
+        holder = self._raw_holder
+        self._ln2_handle = layer.pre_feedforward_layernorm_2.register_forward_pre_hook(
+            lambda _m, inputs: holder.__setitem__("residual", inputs[0]))
+        self.gate = Gemma4GateShim(layer.router, holder)
         self.top_k = top_k
         self._layer_ind = layer_ind
+
+    def release_hooks(self):
+        h = getattr(self, "_ln2_handle", None)
+        if h is not None:
+            h.remove()
+            self._ln2_handle = None
 
     @property
     def experts(self):
