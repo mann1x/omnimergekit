@@ -1,0 +1,35 @@
+# Google gemma-4 template re-test: STOCK vs 2026-07-09 update, on the frozen
+# loop-prone fixtures x 48 seeds. Template is the ONLY variable per cell -> the
+# loop fail-rate difference IS the Jul-9 template effect. Answers lgusm directly.
+model:
+  gguf: /mnt/sdc/ml/eval_gguf/128e-Q6_K.gguf   # template-isolation; quant-invariant, parallel-8 fits 96GB
+  chat_template:
+    - { name: stock-google_main,   path: templates/google_main.jinja }        # pre-fix (what looped in June)
+    - { name: g0709-2026-07-09,     path: templates/google_20260709.jinja }    # Googles Jul-9 update (under test)
+    - { name: reinject-off-ref,     path: templates/v7_reinject_disabled.jinja } # our June fix = known-good 0%
+server:
+  backend: llama
+  llama_server_bin: /mnt/sdc/ml/llama.cpp-latest/build/bin/llama-server   # b10088
+  gpu: 1
+  port: 8082
+  alias: g0709-retest
+  n_gpu_layers: 99
+  parallel: 8
+  ctx_size: 192000
+  flash_attn: true
+  cache_type_k: q8_0
+  cache_type_v: q8_0
+  reasoning_format: deepseek
+  reasoning_budget: 16384
+  extra_args: []
+sampling:
+  matrix: matrices/gemma4_card.json     # Google-official deployment sampler (temp1/top_k64/top_p0.95)
+run:
+  fixtures:
+    - fixtures/solar_build_start.json
+    - fixtures/threejs_build.json
+    - fixtures/agentic_filewrite_v1.json
+  seeds: { start: 1000, end: 1047 }     # 48 seeds = project loop gate
+  max_tokens: 16384
+  timeout_s: 1800
+  out_dir: results/g0709_retest

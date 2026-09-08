@@ -76,3 +76,52 @@ runs/
 
 # generated code-graph output (regenerable)
 graphify-out/
+
+# aime_100 lm-eval task yaml: GENERATED per host, because dataset_kwargs.data_files
+# must be an ABSOLUTE path (HF datasets resolves relative paths against CWD and
+# lm-eval does not chdir to the task dir). Committing one host's copy guarantees a
+# stale pointer on every other host. The DATA (aime_100.jsonl) and the build report
+# ARE committed and are byte-identical across hosts.
+# Materialise with: python eval/build_aime100_dataset.py --yaml-only
+eval/lm_eval_tasks/aime100_chat/aime100_chat.yaml
+
+# RL / replay PROMPT POOLS. Policy: everything publishable IS committed; exactly
+# one file is withheld, and only because it is not ours to redistribute.
+#
+#   scripts/build_lcb_rl_pool.py       -> eval/lcb/lcb_rl_pool.jsonl        COMMITTED
+#   scripts/build_gepo_replay_pool.py  -> eval/replay/gepo_replay_pool.jsonl WITHHELD
+#   scripts/build_replay_manifest.py   -> .MANIFEST.json + .mbpp.jsonl       COMMITTED
+#
+# LCB is public and ungated (problems come from public contests), so the LCB RL
+# pool is committed in full.
+#
+# The GEPO replay pool is NOT, and this is the whole of the reason: this repo is
+# PUBLIC, and that file embeds 250 GPQA questions together with their correct
+# answers in plaintext. GPQA is a GATED dataset that ships a canary string
+# precisely so its questions do not end up in web crawls and leak into future
+# pretraining sets. Publishing them would contaminate GPQA for everyone, not just
+# for us, and it is not ours to redistribute.
+#
+# The pool is still RECORDED here rather than merely asserted, because a training
+# basis nobody can inspect is a basis nobody can check:
+#   * eval/replay/gepo_replay_pool.mbpp.jsonl     — the MBPP tier IN FULL (471
+#     rows, CC-BY-4.0, already public).
+#   * eval/replay/gepo_replay_pool.MANIFEST.json  — the GPQA tier by IDENTITY only
+#     (Record ID + gold letter + question sha256, no question or answer text),
+#     plus the full pool's sha256 and per-tier counts.
+# Anyone with legitimate GPQA access rebuilds the full pool byte-for-byte from the
+# committed deterministic builder and checks it against that sha256.
+#
+# The REBALANCED MIXED POOL (run4 onward) is one file carrying all four tiers, so the
+# same rule applies to it, with one difference: its LCB tier is publishable too, so the
+# open file holds 599 rows (128 lcb_exec + 471 mbpp_exec) rather than mbpp alone.
+#   scripts/build_gepo_mixed_pool.py   -> eval/replay/gepo_mixed_pool.jsonl   WITHHELD
+#   scripts/build_replay_manifest.py   -> .MANIFEST.json + .open.jsonl        COMMITTED
+# Reproduce:
+#   python scripts/build_gepo_mixed_pool.py --lcb 128 --gpqa-nothink 250 \
+#       --mbpp-nothink 371 --mbpp-think 100 -G 8 --hours-budget 45
+#   python scripts/build_replay_manifest.py --pool eval/replay/gepo_mixed_pool.jsonl \
+#       --builder scripts/build_gepo_mixed_pool.py
+# then check the result against pool_sha256 in the committed manifest.
+eval/replay/gepo_replay_pool.jsonl
+eval/replay/gepo_mixed_pool.jsonl
