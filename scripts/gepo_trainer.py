@@ -78,7 +78,7 @@ import trl
 from trl import GRPOTrainer
 from trl.trainer.grpo_trainer import nanmax, nanmin
 
-_EXPECTED_TRL = "1.9.0"
+_EXPECTED_TRL = "1.12.0"
 
 # The exact upstream sequence-branch BODY this port replaces. Kept as data so the
 # import-time gate can prove the ONLY thing we changed is these lines.
@@ -505,12 +505,17 @@ class GEPOTrainer(GRPOTrainer):
             policy_loss = loss.detach()
             loss = loss / normalizer
         elif self.loss_type in ["cispo", "dapo", "vespo"]:
+            # `num_items_in_batch` spans the generation batch, so rescale it to one accumulation window
             normalizer = inputs["num_items_in_batch"].clamp(min=1.0) / self.accelerator.num_processes
+            if mode == "train":  # in eval, the batch is neither split across steps nor accumulated
+                normalizer = normalizer * self.current_gradient_accumulation_steps / self.args.steps_per_generation
             loss = (per_token_loss * mask).sum() / normalizer
             policy_loss = loss.detach()
         elif self.loss_type == "luspo":
-            # Unless importance_sampling_level="token" (not recommended here), per_token_loss is expected to be (B, 1)
-            loss = (per_token_loss * mask.sum(1, keepdim=True)).mean()
+            # `per_token_loss` is (B, 1) only in the recommended sequence-level setup; importance_sampling_level=
+            # "token" (the config default), the KL term, token-level vLLM IS ratios, and the entropy mask all
+            # broadcast it to (B, T), so mask before aggregating.
+            loss = (per_token_loss * mask).sum(-1).mean()
             normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0
             policy_loss = loss.detach()
             loss = loss / normalizer
@@ -525,18 +530,14 @@ class GEPOTrainer(GRPOTrainer):
             # tokens. Use the same effective mask for the entropy bonus so it acts on the same tokens.
             effective_mask = mask if entropy_mask is None else mask * entropy_mask
             # Entropy bonus = mean per-token entropy H (the documented objective L = L_policy - coef * H), so
-            # H does not depend on how each loss type normalizes its policy term. The term is computed so that
-            # it accumulates to H over the optimizer step for every loss type and matches world_entropy below.
-            # The only wrinkle is the normalizer: most loss types divide by the gradient accumulation step
-            # count, but cispo/dapo/vespo divide by a global token count.
-            if self.loss_type in ["cispo", "dapo", "vespo"]:
-                # normalizer is a global token count, so summing the entropies (instead of averaging them
-                # again) makes the term accumulate over the optimizer step to the global mean per-token
-                # entropy, like the other loss types.
-                entropy_loss = (entropies * effective_mask).sum() / normalizer
-            else:
-                # Mean per-token entropy of active tokens, scaled for gradient accumulation.
-                entropy_loss = (entropies * effective_mask).sum() / effective_mask.sum().clamp(min=1.0) / normalizer
+            # H does not depend on how each loss type normalizes its policy term. The bonus is a mean over the
+            # tokens it acts on (effective_mask), scaled only for gradient accumulation, never by a loss-type-
+            # specific policy normalizer. (The adaptive controller below tracks a window-global token-weighted mean,
+            # which can differ from this per-micro-batch mean when token counts vary across micro-batches.)
+            accumulation_factor = self.current_gradient_accumulation_steps if mode == "train" else 1.0
+            entropy_loss = (
+                (entropies * effective_mask).sum() / effective_mask.sum().clamp(min=1.0) / accumulation_factor
+            )
 
             # Apply the coefficient and gating from the end of the previous optimizer step, so that every
             # micro-batch in the current accumulation window applies the same entropy bonus. The adaptive
@@ -626,8 +627,6 @@ class GEPOTrainer(GRPOTrainer):
             self._metrics[mode]["vespo/phi_seq_mean"].append(global_masked_mean(phi_seq))
 
         return loss
-
-
 # ---------------------------------------------------------------------- import-time gate
 def _norm(src: str) -> list[str]:
     """Dedent + drop blank lines so the diff is about code, not indentation churn."""

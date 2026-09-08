@@ -116,6 +116,58 @@ LORA_REGEX = (
 )
 N_LORA_TARGETS = 10 * 4 + 30 * 5 + 40 * 3   # = 310
 
+# ---------------------------------------------------------------------------
+# A SECOND ARCHITECTURE. The regex above describes armJ (Qwen3.6 hybrid: some
+# layers self_attn, some linear_attn, a shared expert beside the routed ones).
+# Gemma-4 MoE names nothing the same way, so on that family the regex matches
+# ZERO modules and the count guard below fires -- correctly. The fix is a second
+# scope, NOT a loosened regex.
+#
+# The scope is chosen to mean the same thing it means on armJ: every attention
+# projection and the per-layer dense MLP, and nothing else. Explicitly NOT
+# trained, verified by the exclusion assert:
+#   * model.vision_tower.*  -- 189 Linears. This is a text RL objective; the
+#     vision tower has no gradient path from the reward and training it would
+#     be pure drift.
+#   * layers.N.router.proj  -- 30. Router training is --router-lora's job and
+#     is opt-in for the reasons argued above; it must not arrive by accident.
+#   * lm_head, embed_vision, patch_embedder.
+#
+# The expected count is DERIVED from the loaded model, not hardcoded, because
+# Gemma-4 is heterogeneous per layer: on Jprime-p3, layers 5/11/17/23/29 carry
+# no v_proj at all (num_key_value_heads is a per-layer attribute), so the naive
+# layers*7 is wrong and a hardcoded 205 would refuse every sibling prune. The
+# invariant actually worth asserting is "the regex matched exactly the modules
+# this scope describes and nothing outside it", and that is what is checked.
+GEMMA4_LORA_REGEX = (
+    r"model\.language_model\.layers\.\d+\."
+    r"(self_attn\.[qkvo]_proj"
+    r"|mlp\.(gate|up|down)_proj)"
+)
+
+
+def lora_scope_for(model):
+    """(regex, expected_count, description) for the architecture actually loaded.
+
+    Returns the reviewed armJ scope unchanged when its regex matches, so run1/run2
+    stay bit-for-bit reproducible; otherwise falls through to the Gemma-4 scope.
+    Refuses rather than guessing if neither matches.
+    """
+    import torch                      # imported inside main(), not at module level
+    lin = [n for n, m in model.named_modules() if isinstance(m, torch.nn.Linear)]
+    if any(re.fullmatch(LORA_REGEX, n) for n in lin):
+        return LORA_REGEX, N_LORA_TARGETS, "armJ (Qwen3.6 hybrid)"
+    hit = [n for n in lin if re.fullmatch(GEMMA4_LORA_REGEX, n)]
+    if hit:
+        # Derive the count from the structure rather than trusting a constant.
+        layers = {int(re.search(r"layers\.(\d+)\.", n).group(1)) for n in hit}
+        n_v = sum(1 for n in hit if n.endswith("self_attn.v_proj"))
+        expected = len(layers) * 6 + n_v      # q,k,o + gate,up,down always; v varies
+        return GEMMA4_LORA_REGEX, expected, (
+            f"Gemma-4 MoE ({len(layers)} layers, {n_v} with v_proj)")
+    sys.exit("REFUSE: no known LoRA scope matches this model's module naming. "
+             "Add a scope for it deliberately; do not relax an existing regex.")
+
 # The router: one [num_experts, hidden] nn.Parameter per layer.
 ROUTER_PARAM_RE = re.compile(r"model\.layers\.\d+\.mlp\.gate\.weight")
 ROUTER_PARAMS = ["mlp.gate.weight"]
@@ -275,6 +327,90 @@ def validate_entropy_args(args):
             "be strictly below alpha_low.")
 
 
+# ------------------------------------------------------------------------- wandb
+# The API key IS the switch. On solidPC it lives in ~/.netrc (machine api.wandb.ai),
+# on the pods it is exported as WANDB_API_KEY; a run launched over ssh inherits
+# neither unless someone remembers to forward it, which is how the 2026-04-29 v6F
+# run trained for hours with no telemetry. Resolving both sources here means a key
+# that exists anywhere on the box is a key that gets used.
+WANDB_HOST = "api.wandb.ai"
+
+
+def resolve_wandb_key() -> tuple[str, str]:
+    """Return (key, source). ("", "") when no credential exists anywhere."""
+    key = os.environ.get("WANDB_API_KEY", "").strip()
+    if key:
+        return key, "env:WANDB_API_KEY"
+    try:
+        import netrc
+        auth = netrc.netrc().authenticators(WANDB_HOST)
+        if auth and auth[2]:
+            return auth[2].strip(), f"netrc:{WANDB_HOST}"
+    except Exception:
+        pass
+    return "", ""
+
+
+def setup_wandb(args, run_config: dict) -> list[str]:
+    """Enable wandb iff a key is resolvable. Returns the `report_to` list.
+
+    Explicit and implicit requests fail differently ON PURPOSE. If the operator
+    named a project/entity/name they asked for telemetry, and silently training
+    without it wastes the run -- so a missing key or a missing package refuses.
+    Auto-detection is a convenience; it must never be able to kill a training run,
+    so every failure on that path is a loud warning and the run continues.
+    """
+    explicit = bool(args.wandb_project or args.wandb_name or args.wandb_entity)
+    if args.no_wandb:
+        print(">>> WANDB off (--no-wandb)", flush=True)
+        return []
+
+    key, source = resolve_wandb_key()
+    if not key:
+        msg = (f"no wandb key: WANDB_API_KEY unset and no {WANDB_HOST} entry in "
+               f"~/.netrc")
+        if explicit:
+            sys.exit(f"REFUSE: --wandb-* was requested but {msg}.")
+        print(f">>> WANDB off ({msg})", flush=True)
+        return []
+
+    try:
+        import wandb
+    except ImportError:
+        msg = "wandb key found but the wandb package is not installed (pip install wandb)"
+        if explicit:
+            sys.exit(f"REFUSE: {msg}.")
+        print(f">>> WANDB off -- {msg}", flush=True)
+        return []
+
+    # Only rank 0 talks to wandb; the other ranks would open duplicate runs.
+    if int(os.environ.get("RANK", "0")) != 0:
+        return ["wandb"]
+
+    os.environ["WANDB_API_KEY"] = key
+    project = args.wandb_project or os.environ.get("WANDB_PROJECT") or "gepo-brevity"
+    name = args.wandb_name or f"{Path(args.out).name}-{time.strftime('%Y%m%d-%H%M%S')}"
+    entity = args.wandb_entity or os.environ.get("WANDB_ENTITY") or None
+
+    # Init here rather than leaving it to transformers' WandbCallback: the callback
+    # only knows TrainingArguments, so the fields that actually distinguish two GEPO
+    # runs -- reward version, pool, lambda, the GEPO switches -- would never reach the
+    # UI. The callback reuses an existing run (integration_utils.py: `if
+    # self._wandb.run is None`), so pre-initing adds config without losing metrics.
+    try:
+        run = wandb.init(project=project, name=name, entity=entity,
+                         config=run_config, resume="allow")
+    except Exception as exc:                       # network/auth: never fatal on auto
+        if explicit:
+            sys.exit(f"REFUSE: wandb.init failed: {exc}")
+        print(f">>> WANDB off -- wandb.init failed: {exc}", flush=True)
+        return []
+
+    print(f">>> WANDB on key={source} project={project} name={name} url={run.url}",
+          flush=True)
+    return ["wandb"]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -386,6 +522,16 @@ def main() -> int:
                          "--dropout 0: lora.ParamWrapper refuses nonzero dropout. "
                          "OFF by default so run1/run2 stay reproducible.")
     ap.add_argument("--seed", type=int, default=0)
+    # --- wandb ---------------------------------------------------------------
+    ap.add_argument("--wandb-project", default="",
+                    help="wandb project. Naming any --wandb-* flag makes telemetry "
+                         "REQUIRED: a missing key or package then refuses instead of "
+                         "silently training blind.")
+    ap.add_argument("--wandb-name", default="",
+                    help="wandb run name (default: <out basename>-<timestamp>)")
+    ap.add_argument("--wandb-entity", default="")
+    ap.add_argument("--no-wandb", action="store_true",
+                    help="disable wandb even when a key is present")
     ap.add_argument("--save-steps", type=int, default=20)
     ap.add_argument("--preflight", action="store_true",
                     help="build everything, gate everything, then stop before train()")
@@ -437,6 +583,16 @@ def main() -> int:
     from trl import GRPOConfig
 
     from scripts.gepo_trainer import GEPOTrainer
+
+    # A verbatim copy of upstream's _compute_loss rots silently: a TRL bump can change
+    # normalization or the KL term and the copy keeps training on the old math while
+    # reporting success. The gate re-extracts upstream and diffs; it existed but was
+    # only reachable via `python3 gepo_trainer.py`, so nothing on the TRAINING path
+    # ever ran it -- which is exactly how the 1.9.0 copy survived the move to 1.12.0.
+    import trl as _trl
+    trl_version = _trl.__version__
+    from scripts.gepo_trainer import assert_only_sequence_branch_differs
+    print(">>> " + assert_only_sequence_branch_differs(), flush=True)
 
     tok = AutoTokenizer.from_pretrained(args.model)
     if args.reward == "v2":
@@ -618,7 +774,13 @@ def main() -> int:
             "declare meta.think=false")
     if args.replay_no_think or not all(row_think):
         probe = [{"role": "user", "content": "probe"}]
-        d_on = tok.apply_chat_template(probe, add_generation_prompt=True, tokenize=False)
+        # BOTH sides pass the kwarg EXPLICITLY. Omitting it on the "on" side does not
+        # mean "thinking on", it means "whatever this template defaults to" -- and
+        # Jprime-p3's template defaults it to FALSE (chat_template.jinja:186,
+        # `enable_thinking | default(false)`). Probing default-vs-false therefore
+        # compared off against off and refused a template that works perfectly.
+        d_on = tok.apply_chat_template(probe, add_generation_prompt=True, tokenize=False,
+                                       enable_thinking=True)
         d_off = tok.apply_chat_template(probe, add_generation_prompt=True, tokenize=False,
                                         enable_thinking=False)
         # A template that ignores enable_thinking would render identically and hand the
@@ -636,7 +798,12 @@ def main() -> int:
             # (lcb thinks, replay does not) so pools predating the field still work.
             think = r["meta"].get("think",
                                   r["meta"].get("reward_kind", "lcb_exec") == "lcb_exec")
-            kw = {} if think else {"enable_thinking": False}
+            # EXPLICIT on both branches, for the same reason the probe is. `{}` asks
+            # the template for its default, and a template defaulting to false renders
+            # every thinking row WITHOUT thinking while meta.think still says true.
+            # The census/renderer cross-check below cannot catch that: both sides read
+            # meta.think, and the divergence is in what the renderer actually emitted.
+            kw = {"enable_thinking": bool(think)}
             return tok.apply_chat_template([{"role": "user", "content": r["prompt"]}],
                                            add_generation_prompt=True, tokenize=False,
                                            **kw)
@@ -736,17 +903,27 @@ def main() -> int:
     if getattr(model.config, "router_aux_loss_coef", 0):
         model.config.router_aux_loss_coef = 0.0
 
+    lora_regex, n_targets, scope_desc = lora_scope_for(model)
     hit = [n for n, m in model.named_modules()
-           if isinstance(m, torch.nn.Linear) and re.fullmatch(LORA_REGEX, n)]
-    if len(hit) != N_LORA_TARGETS:
+           if isinstance(m, torch.nn.Linear) and re.fullmatch(lora_regex, n)]
+    if len(hit) != n_targets:
         sys.exit(f"REFUSE: LORA_REGEX matched {len(hit)} modules, expected "
-                 f"{N_LORA_TARGETS}. The module naming changed; fix the regex, do "
+                 f"{n_targets}. The module naming changed; fix the regex, do "
                  f"not train a different scope than the one that was reviewed.")
-    log(f"LORA_TARGETS_OK {len(hit)} modules")
+    # The count alone cannot prove the scope: a regex that dropped an attention
+    # projection and picked up a router would still total right. Assert the
+    # forbidden families are absent by name.
+    forbidden = [n for n in hit
+                 if "vision_tower" in n or "router" in n or n.endswith("lm_head")]
+    if forbidden:
+        sys.exit(f"REFUSE: the LoRA scope reached {len(forbidden)} module(s) it must "
+                 f"never train, e.g. {forbidden[:3]}. Router training is --router-lora "
+                 "and the vision tower has no gradient path from this reward.")
+    log(f"LORA_TARGETS_OK {len(hit)} modules -- scope: {scope_desc}")
 
     lora_kwargs = dict(r=args.r, lora_alpha=args.alpha, lora_dropout=args.dropout,
                        bias="none", task_type="CAUSAL_LM",
-                       target_modules=LORA_REGEX)
+                       target_modules=lora_regex)
     dropout_used = args.dropout
     if args.router_lora:
         # Gate the router the same way the Linear scope is gated: count the real
@@ -771,8 +948,69 @@ def main() -> int:
 
     peft_cfg = LoraConfig(**lora_kwargs)
 
+    # ------------------------------------------------------- generation stop set
+    # TRL does NOT use model.generation_config for sampling. It builds its own
+    # GenerationConfig (trl/trainer/grpo_trainer.py:1122-1137) with
+    #     "eos_token_id": self._tokenizer.eos_token_id
+    # -- a SCALAR -- and passes it explicitly to generate() (line 1909), which
+    # overrides whatever the model declared. For Gemma-4 the tokenizer's eos is
+    # <eos>=1, but the chat template ends every model turn with <turn|>=106 (and
+    # agentic tool turns with <|tool_response>=50). So generation never stops at
+    # the turn boundary: it runs to max_completion and the completion carries the
+    # real answer followed by whatever the model kept emitting.
+    #
+    # That is not merely slow, it CORRUPTS THE OBJECTIVE. gepo_reward_v2 scores
+    # length; measured here, len_p50_passing was 1058 while mean_tok was 6128, so
+    # the brevity term was scoring how long the model rambled AFTER finishing
+    # rather than how long its answer was. TRL knows about this format (it says so
+    # in a comment at grpo_trainer.py:1970) and still uses the tokenizer's single
+    # EOS.
+    #
+    # Take the stop set from what the MODEL declares, not from a hardcoded list,
+    # so this ports to the rest of the family; refuse if it declares nothing,
+    # because silently falling back to the scalar is the bug we are fixing.
+    _eos = getattr(model.generation_config, "eos_token_id", None)
+    if _eos is None:
+        sys.exit("REFUSE: the model declares no eos_token_id, so generation would "
+                 "fall back to the tokenizer's single EOS and never stop at a turn "
+                 "boundary. Set generation_config.eos_token_id on the model.")
+    _eos = sorted({int(t) for t in ([_eos] if isinstance(_eos, int) else _eos)})
+    log(f"GEN_STOP_SET {_eos} -> "
+        f"{[tok.convert_ids_to_tokens(t) for t in _eos]} "
+        f"(tokenizer alone would give {tok.eos_token_id})")
+    if tok.eos_token_id is not None and _eos == [int(tok.eos_token_id)]:
+        log("WARNING: the model's stop set is exactly the tokenizer's EOS. If this "
+            "template ends turns with a different token, generation will not stop "
+            "at the turn boundary and the length term will measure trailing text.")
+
     # ---------------------------------------------------------------- config
+    # Telemetry is decided BEFORE the config is built so report_to/run_name are set
+    # once, in one place. The config dict is what makes two runs distinguishable in
+    # the UI -- TrainingArguments alone cannot say which reward or pool was used.
+    _run_config = {
+        "model": args.model, "pool": args.pool, "out": args.out,
+        "reward": args.reward, "length_budget": args.length_budget,
+        "length_lambda": args.length_lambda,
+        "num_generations": args.num_generations, "grad_accum": args.grad_accum,
+        "max_completion": args.max_completion, "max_prompt": args.max_prompt,
+        "lr": args.lr, "beta": args.beta, "epochs": args.epochs,
+        "temperature": args.temperature, "top_p": args.top_p, "top_k": args.top_k,
+        "epsilon_low": args.epsilon_low, "epsilon_high": args.epsilon_high,
+        "gepo": not args.no_gepo, "gepo_entropy": args.gepo_entropy,
+        "lora_r": args.r, "lora_alpha": args.alpha, "lora_dropout": args.dropout,
+        "router_lora": args.router_lora, "seed": args.seed,
+        "replay_pool": args.replay_pool, "replay_n": args.replay_n,
+        "eos_token_id": _eos, "n_train_rows": len(ds),
+        "trl": trl_version, "world_size": _world,
+    }
+    _wandb_name = args.wandb_name or None
+    _report_to = setup_wandb(args, _run_config)
+    if _report_to and not _wandb_name:
+        import wandb as _wb
+        _wandb_name = _wb.run.name if _wb.run is not None else None
+
     cfg = GRPOConfig(
+        generation_kwargs={"eos_token_id": _eos},
         output_dir=args.out,
         seed=args.seed,
         per_device_train_batch_size=1,   # [1, 16384, 248320] bf16 logits = 8.1 GiB
@@ -825,7 +1063,8 @@ def main() -> int:
         logging_steps=1,
         save_steps=args.save_steps,
         save_total_limit=None,           # results/adapters are never deleted
-        report_to=[],
+        report_to=_report_to,
+        run_name=_wandb_name,
     )
 
     trainer = GEPOTrainer(

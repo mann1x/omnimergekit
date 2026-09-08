@@ -391,6 +391,25 @@ def make_gepo_reward_v2(tokenizer, lcb_verifier, max_completion: int,
                   f"mean_tok={state['tok']/state['n']:.0f} "
                   f"clipped={state['clip']/state['n']:.3f} | TIERS {tiers}",
                   flush=True)
+            # TERM_PROBE. Separates a stop-set CONFIG fault from a model CAPABILITY
+            # fault, and it is free -- it runs inside the reward that already executes.
+            # The decoded text cannot answer this: TRL decodes with
+            # skip_special_tokens=True, so <turn|> is invisible in the string. Only
+            # the raw ids show it.
+            #   a clipped rollout with first_106 well below the cap
+            #       -> generation continued PAST a terminator = config fault
+            #   first_106 == -1 on every clipped rollout
+            #       -> the model never emits it = capability fault, and no stop-set
+            #          change will move clipped_ratio
+            probe = [c for c in cids if c is not None]
+            if probe:
+                def _first(seq, tid):
+                    return seq.index(tid) if tid in seq else -1
+                print(f">>> TERM_PROBE rank={RANK} n={len(probe)} "
+                      f"len={[len(c) for c in probe]} "
+                      f"first_106={[_first(c, 106) for c in probe]} "
+                      f"first_50={[_first(c, 50) for c in probe]} "
+                      f"first_1={[_first(c, 1) for c in probe]}", flush=True)
         return rewards
 
     gepo_reward_v2.verifier = lcb_verifier
