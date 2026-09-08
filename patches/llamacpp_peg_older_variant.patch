@@ -1,0 +1,40 @@
+diff --git a/common/chat.cpp b/common/chat.cpp
+index ef15169..a3bf855 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -2598,6 +2598,35 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
+             }
+             return msg;
+         }
++        // A full-parse failure must not DISCARD a complete generation. The server turns
++        // this throw into HTTP 500 and a coherent answer the model already produced is
++        // lost -- or, if the client runs out of retries, the whole run dies. Observed
++        // triggers: a model-emitted bare "<think>" with no close, and invalid UTF-8 from
++        // a split multi-byte emoji token; the text itself is fine in both cases.
++        // Degrade to content, mirroring the no-parser-definition default.
++        // Set LLAMA_CHAT_PEG_STRICT=1 to restore the throw.
++        {
++            const char * peg_strict = getenv("LLAMA_CHAT_PEG_STRICT");
++            if (!(peg_strict && peg_strict[0] == '1')) {
++                common_chat_msg fallback_msg;
++                fallback_msg.role = "assistant";
++                static const std::string think_close = "</think>";
++                const size_t close_at = effective_input.find(think_close);
++                if (close_at != std::string::npos) {
++                    size_t reason_from = 0;
++                    static const std::string think_open = "<think>";
++                    if (effective_input.compare(0, think_open.size(), think_open) == 0) {
++                        reason_from = think_open.size();
++                    }
++                    fallback_msg.reasoning_content = effective_input.substr(reason_from, close_at - reason_from);
++                    fallback_msg.content = effective_input.substr(close_at + think_close.size());
++                } else {
++                    fallback_msg.content = effective_input;
++                }
++                fprintf(stderr, "common_chat_peg_parse: returning unparsed output as content (%zu bytes); set LLAMA_CHAT_PEG_STRICT=1 to throw instead\n", effective_input.size());
++                return fallback_msg;
++            }
++        }
+         throw std::runtime_error(std::string("Failed to parse input at pos ") + std::to_string(result.end) + ": " +
+                                  effective_input.substr(result.end));
+     }

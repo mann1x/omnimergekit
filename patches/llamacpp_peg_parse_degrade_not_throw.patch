@@ -1,0 +1,69 @@
+diff --git a/common/chat.cpp b/common/chat.cpp
+index 743ecde0a..fcc033aa5 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -3877,6 +3877,41 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
+         }
+         LOG_WRN("%s: unparsed %s output: %s\n", __func__, common_chat_format_name(params.format), effective_input.substr(result.end).c_str());
+         LOG_DBG("%s: full %s output triggering error:\n=== BEGIN ===\n%s\n=== END ===\n", __func__, common_chat_format_name(params.format), effective_input.c_str());
++
++        // A full-parse failure must not DISCARD a complete generation. The server
++        // turns this throw into HTTP 500, lm-eval stores an empty completion, and a
++        // coherent answer that the model already produced scores as a fail -- or, if
++        // the retries run out, kills the whole benchmark. Observed triggers are a
++        // model-emitted bare "<think>" with no close, and invalid UTF-8 from a split
++        // multi-byte emoji token; in both cases the text itself is fine.
++        //
++        // Degrade to content instead, mirroring the no-parser-definition default
++        // (p.content(p.rest())). If a "</think>" is present, honour it so reasoning
++        // still lands in reasoning_content rather than polluting the answer.
++        // Set LLAMA_CHAT_PEG_STRICT=1 to restore the throw (tests rely on it).
++        {
++            const char * peg_strict = getenv("LLAMA_CHAT_PEG_STRICT");
++            if (!(peg_strict && peg_strict[0] == '1')) {
++                common_chat_msg fallback_msg;
++                fallback_msg.role = "assistant";
++                static const std::string think_close = "</think>";
++                const size_t close_at = effective_input.find(think_close);
++                if (close_at != std::string::npos) {
++                    size_t reason_from = 0;
++                    static const std::string think_open = "<think>";
++                    if (effective_input.compare(0, think_open.size(), think_open) == 0) {
++                        reason_from = think_open.size();
++                    }
++                    fallback_msg.reasoning_content = effective_input.substr(reason_from, close_at - reason_from);
++                    fallback_msg.content = effective_input.substr(close_at + think_close.size());
++                } else {
++                    fallback_msg.content = effective_input;
++                }
++                LOG_WRN("%s: returning unparsed output as content (%zu bytes); set LLAMA_CHAT_PEG_STRICT=1 to throw instead\n",
++                        __func__, effective_input.size());
++                return fallback_msg;
++            }
++        }
+         throw std::runtime_error(std::string("The model produced output that does not match the expected ") + common_chat_format_name(params.format) + " format");
+     }
+ 
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index 7918f0ffc..edfcc9fb7 100644
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -4448,6 +4448,10 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+             bool got_runtime_error = false;
+             bool got_out_of_range = false;
+             std::string error_msg;
++            // The throw is now opt-in: a full-parse failure degrades to content by
++            // default so a served generation is never discarded. This test asserts
++            // the strict path, so it must ask for it.
++            setenv("LLAMA_CHAT_PEG_STRICT", "1", /*overwrite=*/1);
+             try {
+                 common_chat_peg_parse(arena, bad_input, /*is_partial=*/false, pp);
+             } catch (const std::out_of_range & e) {
+@@ -4459,6 +4463,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+             }
+             GGML_ASSERT(!got_out_of_range && "throw path crashed with out_of_range (input.substr in effective_input space)");
+             GGML_ASSERT(got_runtime_error  && "throw path should produce std::runtime_error with parse position");
++            unsetenv("LLAMA_CHAT_PEG_STRICT");
+         }
+     }
+ 
