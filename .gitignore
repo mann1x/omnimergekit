@@ -125,3 +125,18 @@ eval/lm_eval_tasks/aime100_chat/aime100_chat.yaml
 # then check the result against pool_sha256 in the committed manifest.
 eval/replay/gepo_replay_pool.jsonl
 eval/replay/gepo_mixed_pool.jsonl
+
+# SAME RULE, three more generated artifacts that carry the GATED GPQA tier as
+# plaintext question+answer. Found 2026-09-08 while committing untracked work;
+# all three would otherwise have been published to this PUBLIC repo.
+#   eval/efficiency/gepo_mixed_with_efficiency.jsonl   - 250 gpqa_main_minus_diamond rows
+#   eval/efficiency/gepo_light_efficiency_pool.jsonl   -  17 gpqa_main_minus_diamond rows
+#   recipes/qwen3_6_35b_a3b_prune/results/router_calib_corpus_ornith.jsonl
+#                                                      -  80 gpqa_DIAMOND rows, i.e. the
+#                                                         eval split itself, not a train tier
+# The router calib corpus is NOT gepo work and is the one that nearly slipped: it is a
+# router-calibration corpus whose `text` field holds the fully rendered chat prompt for
+# every row, GPQA Diamond included. Rebuild it from its builder rather than committing it.
+eval/efficiency/gepo_mixed_with_efficiency.jsonl
+eval/efficiency/gepo_light_efficiency_pool.jsonl
+recipes/qwen3_6_35b_a3b_prune/results/router_calib_corpus_ornith.jsonl
