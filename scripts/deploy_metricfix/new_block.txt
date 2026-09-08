@@ -1,0 +1,49 @@
+    want_filter = scoring.get("filter", "")
+
+    # Metric-name ALIASES. The same quantity is spelled differently by different
+    # lm-eval task variants: stock `humaneval` emits "pass_at_1,build_predictions"
+    # while our `humaneval_chat` custom task emits "pass@1,extract_chat". A
+    # template declaring one spelling must still match the other, or the lookup
+    # falls through to the last resort below. (2026-09-08: it did exactly that
+    # and reported humaneval = 164.0 -- the sample COUNT -- for a run whose real
+    # pass@1 was 0.8963.)
+    _ALIASES = {
+        "pass_at_1": ["pass_at_1", "pass@1"],
+        "pass@1": ["pass@1", "pass_at_1"],
+    }
+    cand_metrics = _ALIASES.get(want_metric, [want_metric])
+
+    for wm in cand_metrics:
+        fk = f"{wm},{want_filter}" if want_filter else None
+        if fk and fk in score_dict:
+            return score_dict[fk], score_dict
+    preferred_filters = ["flexible-extract", "math_verify", "extract_chat",
+                         "remove_whitespace", "none", "strict-match"]
+    for wm in cand_metrics:
+        matches = [k for k in score_dict if k.startswith(f"{wm},")]
+        if not matches:
+            continue
+        # Prefer canonical extractors over generic "none" / "strict-match".
+        for pf in preferred_filters:
+            ck = f"{wm},{pf}"
+            if ck in score_dict:
+                return score_dict[ck], score_dict
+        return score_dict[matches[0]], score_dict
+
+    # LAST RESORT. Never hand back an arbitrary key: lm-eval mixes bookkeeping
+    # entries ("sample_len" = row count) into the same dict, and returning the
+    # first one produces a number that LOOKS like a score and is not. A wrong
+    # plausible score is far worse than a missing one -- it lands in a table.
+    _NON_SCORE = {"sample_len", "samples", "n", "alias", "num_samples"}
+    usable = {k: v for k, v in score_dict.items()
+              if k.split(",")[0] not in _NON_SCORE
+              and isinstance(v, (int, float)) and 0.0 <= float(v) <= 1.0}
+    if not usable:
+        return None, {"error": "no score-like metric found "
+                               f"(declared metric={want_metric!r} filter={want_filter!r}; "
+                               f"available={sorted(score_dict)})",
+                      **score_dict}
+    fk = next(iter(usable))
+    log(f"WARNING: declared metric {want_metric!r} not found; "
+        f"falling back to {fk!r} (available: {sorted(score_dict)})")
+    return usable[fk], score_dict
