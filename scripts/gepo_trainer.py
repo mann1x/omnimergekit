@@ -103,6 +103,86 @@ class GEPOTrainer(GRPOTrainer):
     gepo = True
 
     # ---------------------------------------------------------------- group expectation
+    def _generate_single_turn(self, prompt_ids, images, multimodal_fields, has_tool_images=False):
+        """Trim completions at the model's REAL end-of-generation set, not the tokenizer's.
+
+        Upstream cuts each completion at the first `self._tokenizer.eos_token_id`, a
+        SCALAR (`<eos>`=1). Gemma-4 ends every turn with `<turn|>`=106 and agentic tool
+        turns with `<|tool_response>`=50, and measured here token 1 appears in 0 of 64
+        completions. So `is_eos.any()` is False for every row, nothing is trimmed, and
+        each completion keeps the full padded batch width.
+
+        Three things break, none of them loudly:
+
+        1. Every rollout in a group reports the SAME length (measured: 64/64 at exactly
+           2928, then 64/64 at exactly 4096, while the median real end was token 787).
+           gepo_reward_v2 lengths via `len(cid)`, so the brevity term becomes constant
+           within the group and GEPO's group-relative advantage cancels it exactly --
+           the run trains on correctness alone, which is the one failure the module
+           docstring says this pool must avoid.
+        2. `completion_mask` is rebuilt from these lists, so PAD tokens enter the policy
+           gradient and the logps.
+        3. `clipped_ratio` compares a padded width to the cap and reports a batch
+           maximum, not a truncation rate.
+
+        Trimming here, at the seam that produces the lists, fixes all three: TRL rebuilds
+        the mask and the padded tensors from what this returns.
+        """
+        completion_ids, logprobs = super()._generate_single_turn(
+            prompt_ids, images, multimodal_fields, has_tool_images
+        )
+        eog = getattr(self, "gepo_eog_ids", None)
+        if not eog:
+            return completion_ids, logprobs
+        eog = set(int(t) for t in eog)
+
+        trimmed, trimmed_lp = [], None if logprobs is None else []
+        for i, ids in enumerate(completion_ids):
+            cut = len(ids)
+            for j, tok in enumerate(ids):
+                if int(tok) in eog:
+                    cut = j + 1        # keep the terminator, drop the padding after it
+                    break
+            trimmed.append(ids[:cut])
+            if trimmed_lp is not None:
+                trimmed_lp.append(logprobs[i][:cut])
+
+        # Log the full length SHAPE, every generation, not just the first.
+        #
+        # Decode runs until the LONGEST sequence in the batch finishes, so the cost of
+        # `--max-completion` is set by the upper tail while the benefit of lowering it is
+        # set by how much mass sits above the candidate cap. Summary stats (min/median/max)
+        # cannot answer "what would truncate at 2048?" -- only the quantiles can, and
+        # answering it from a finished run is otherwise a fresh GPU probe. So emit them.
+        after = [len(c) for c in trimmed]
+        if after:
+            before = [len(c) for c in completion_ids]
+            q = sorted(after)
+
+            def _p(f):
+                return q[min(len(q) - 1, int(f * len(q)))]
+
+            gen = getattr(self, "_gepo_trim_gen", 0) + 1
+            self._gepo_trim_gen = gen
+            # what a lower cap would have cost, priced off THIS batch
+            caps = [1024, 1536, 2048, 3072]
+            would = " ".join(
+                f"@{c}:trunc={sum(1 for x in after if x > c) / len(after):.3f}"
+                f",decode={min(c, max(after)) / max(after):.2f}x"
+                for c in caps
+            )
+            print(
+                f">>> GEPO_EOG_TRIM gen={gen} eog={sorted(eog)} n={len(after)} "
+                f"before: distinct={len(set(before))} max={max(before)} | "
+                f"after: distinct={len(set(after))} min={min(after)} "
+                f"p25={_p(.25)} p50={_p(.50)} p75={_p(.75)} p90={_p(.90)} "
+                f"p95={_p(.95)} p99={_p(.99)} max={max(after)} | "
+                f"straggler_waste={1 - sum(after) / (len(after) * max(after)):.3f} | "
+                f"IF_CAPPED {would}",
+                flush=True,
+            )
+        return trimmed, (trimmed_lp if trimmed_lp is not None else logprobs)
+
     def _require_old_logps(self, inputs) -> torch.Tensor:
         old = inputs.get("old_per_token_logps")
         if old is None:

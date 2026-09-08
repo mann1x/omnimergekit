@@ -1074,6 +1074,12 @@ def main() -> int:
     )
     # Both refusals already fired in validate_entropy_args() above, before the model
     # was loaded. What is left here is the wiring itself.
+    # The SAME stop set that generation uses must also drive completion TRIMMING.
+    # TRL trims at the tokenizer's scalar EOS, which this model never emits, so
+    # without this every rollout keeps the full padded batch width and the brevity
+    # term goes constant within the group. See GEPOTrainer._generate_single_turn.
+    trainer.gepo_eog_ids = list(_eos)
+    log(f"EOG_TRIM_SET {trainer.gepo_eog_ids} (completions trimmed at the first of these)")
     trainer.gepo_entropy = bool(args.gepo_entropy)
     if args.gepo_entropy:
         trainer.gepo_alpha_low = args.gepo_alpha_low
