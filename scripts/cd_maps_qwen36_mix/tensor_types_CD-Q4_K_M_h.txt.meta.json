@@ -1,0 +1,34 @@
+{
+  "generated_from_imatrix_sha256": "3a116ed118b19cd17a9f676d18a61f88a5be59450fbe1fbcd976347d87acaac3",
+  "importance_source": "imatrix",
+  "importance_file_sha256": null,
+  "importance_file_name": null,
+  "generated_at": "2026-07-15T06:38:01+00:00",
+  "tier_profile": "CD-Q4_K_M_h",
+  "tiers": {
+    "top": "Q5_K",
+    "mid": "Q4_K",
+    "low": "Q4_K"
+  },
+  "file_base_ftype": "Q4_K_M",
+  "body_tensor_roles": [
+    "attn_q.weight",
+    "attn_k.weight",
+    "attn_output.weight",
+    "ffn_gate.weight",
+    "ffn_up.weight",
+    "ffn_gate_up_exps.weight"
+  ],
+  "heuristic_protected_tensors": [
+    "attn_v.weight",
+    "ffn_down.weight",
+    "ffn_down_exps.weight",
+    "ffn_down_exps.scale",
+    "ffn_gate_inp.weight",
+    "ffn_gate_inp.scale",
+    "token_embd.weight",
+    "output.weight"
+  ],
+  "num_layers": 40,
+  "mode": "mix"
+}

@@ -1,0 +1,35 @@
+# Re-injection KILLED on the STOCK templates (google_main + g0709), via the SAME `false and`
+# gate op as the June v7 fix — but on the actual stock templates, NOT the v7-lineage hack.
+# Isolates: does disabling the multi-turn thinking re-injection change the loop/THINK_EXPLODE
+# rate on the REAL stock templates? Same fixtures x48 seeds, Google-official sampler, A4B(128e).
+model:
+  gguf: /mnt/sdc/ml/eval_gguf/128e-Q6_K.gguf
+  chat_template:
+    - { name: gmain-reinject-off,  path: templates/google_main_noreinject.jinja }
+    - { name: g0709-reinject-off,  path: templates/google_20260709_noreinject.jinja }
+server:
+  backend: llama
+  llama_server_bin: /mnt/sdc/ml/llama.cpp-latest/build/bin/llama-server
+  gpu: 1
+  port: 8082
+  alias: reinject-off-stock
+  n_gpu_layers: 99
+  parallel: 8
+  ctx_size: 192000
+  flash_attn: true
+  cache_type_k: q8_0
+  cache_type_v: q8_0
+  reasoning_format: deepseek
+  reasoning_budget: 16384
+  extra_args: []
+sampling:
+  matrix: matrices/gemma4_card.json
+run:
+  fixtures:
+    - fixtures/solar_build_start.json
+    - fixtures/threejs_build.json
+    - fixtures/agentic_filewrite_v1.json
+  seeds: { start: 1000, end: 1047 }
+  max_tokens: 16384
+  timeout_s: 1800
+  out_dir: results/reinject_off_stock
