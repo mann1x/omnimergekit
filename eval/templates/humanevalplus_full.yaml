@@ -19,7 +19,7 @@ generation:
   top_k: 0
   do_sample: false
 scoring:
-  metric: pass_at_1
+  metric: pass@1
   validated_against: evalplus/humanevalplus
   validation_date: "2026-05-12"
 backend_args:

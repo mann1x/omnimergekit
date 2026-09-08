@@ -39,8 +39,8 @@ generation:
   top_k: 0
   do_sample: false
 scoring:
-  metric: pass_at_1
-  filter: build_predictions     # the lm-eval humaneval task's standard filter
+  metric: pass@1
+  filter: extract_chat        # humaneval_chat custom task emits pass@1,extract_chat
   validated_against: openai/human-eval
   validation_date: "2026-05-12"
 backend_args:
