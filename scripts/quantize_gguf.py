@@ -763,7 +763,8 @@ def auto_ngl(model_size_gb: float, n_layers: int = None, layer_sizing=None) -> i
 
 def compute_imatrix(tools: dict, f16_gguf: Path, cal_data: Path,
                     output: Path, ngl: int = None, chunks: int = 128,
-                    parse_special: bool = True) -> Path:
+                    parse_special: bool = True, save_frequency: int = None,
+                    timeout: int = 7200) -> Path:
     """Compute importance matrix from F16 GGUF using calibration data.
 
     parse_special: pass --parse-special to llama-imatrix. llama-imatrix defaults
@@ -778,6 +779,14 @@ def compute_imatrix(tools: dict, f16_gguf: Path, cal_data: Path,
         chunks / 4.3M tokens; a 5M-token corpus is ~1.3% consumed at 128.
         Left at 128 by DEFAULT so existing imatrices stay comparable — raising
         it rebases every imatrix built with it. Set explicitly per build.
+        Pass -1 for llama.cpp's own default of ALL chunks.
+    save_frequency: emit an imatrix checkpoint every N chunks. AtomicChat's
+        convergence criterion is the per-tensor cosine between successive
+        checkpoints, so one run with this set yields the whole convergence
+        curve for free instead of needing a second run at 2N.
+    timeout: seconds. The 2h default is sized for a 128-chunk run. A full
+        ~9.7k-chunk corpus on a 27B takes far longer; raise it explicitly or
+        the run is killed mid-way and the partial imatrix is lost.
     """
     imatrix_bin = tools.get("imatrix")
     if not imatrix_bin:
@@ -814,8 +823,24 @@ def compute_imatrix(tools: dict, f16_gguf: Path, cal_data: Path,
     ]
     if parse_special:
         cmd.append("--parse-special")
-    print(f"  imatrix: chunks={chunks} parse_special={parse_special}", flush=True)
-    run(cmd, desc="imatrix computation", timeout=7200)
+    if save_frequency:
+        cmd += ["--save-frequency", str(save_frequency)]
+    print(f"  imatrix: chunks={chunks} parse_special={parse_special} "
+          f"save_frequency={save_frequency} timeout={timeout}s", flush=True)
+
+    # run() captures output, which leaves a multi-hour imatrix completely blind
+    # until it ends. Stream to a log next to the artifact so progress is
+    # observable while it runs.
+    log_path = output / "imatrix_run.log"
+    print(f"  streaming progress -> {log_path}", flush=True)
+    with open(log_path, "w") as log:
+        log.write(" ".join(cmd) + "\n\n")
+        log.flush()
+        proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT,
+                              timeout=timeout)
+    if proc.returncode != 0:
+        tail = "".join(open(log_path).readlines()[-15:])
+        raise RuntimeError(f"imatrix computation failed (rc={proc.returncode}):\n{tail}")
     print(f"  imatrix saved: {imatrix_file} ({imatrix_file.stat().st_size / 1024:.0f} KB)", flush=True)
     return imatrix_file
 
@@ -2170,7 +2195,7 @@ def normalize_gemma4_eog(base_gguf: Path, template_file=None, template_sha=None)
               flush=True)
         return False
 
-    print(f"\n=== Normalising Gemma-4 EOG metadata ===", flush=True)
+    print("\n=== Normalising Gemma-4 EOG metadata ===", flush=True)
     print(f"  eos {before['eos']} -> {GEMMA4_EOS}   eot {before['eot']} -> {GEMMA4_EOT}",
           flush=True)
     if target_tpl_sha:
@@ -2259,6 +2284,23 @@ def main():
                         help="Don't upload to HF, just quantize locally")
     parser.add_argument("--no-imatrix", action="store_true",
                         help="Skip imatrix computation")
+    parser.add_argument("--imatrix-only", action="store_true",
+                        help="Compute the imatrix and STOP. No quantization, no "
+                             "upload. For building a calibration artifact on its own.")
+    parser.add_argument("--imatrix-chunks", type=int, default=128,
+                        help="llama-imatrix chunk budget, 512 tokens each "
+                             "(default: 128; -1 = ALL chunks, llama.cpp's own "
+                             "default). 128 is only ~65k tokens: a 5M-token "
+                             "corpus is ~1.3%% consumed. Raising this REBASES "
+                             "every imatrix built with it, so it is an explicit "
+                             "per-build choice, never a silent global change.")
+    parser.add_argument("--imatrix-save-frequency", type=int, default=None,
+                        help="Emit an imatrix checkpoint every N chunks, giving "
+                             "the per-tensor convergence curve from a single run.")
+    parser.add_argument("--imatrix-timeout", type=int, default=7200,
+                        help="Seconds before the imatrix run is killed (default "
+                             "7200, sized for 128 chunks). A full-corpus run on a "
+                             "27B needs far more.")
     parser.add_argument("--force-imatrix", action="store_true",
                         help="Apply imatrix to ALL _K/IQ tiers, overriding IMATRIX_EXCLUDE. "
                              "IMATRIX_EXCLUDE is empty by default, so this is a no-op unless that "
@@ -2688,9 +2730,33 @@ def main():
             if cal_data and cal_data.exists():
                 print("\n=== Computing imatrix ===", flush=True)
                 print(f"  Calibration data: {cal_data} ({cal_data.stat().st_size / 1024:.0f} KB)", flush=True)
-                imatrix_file = compute_imatrix(tools, base_gguf, cal_data, output_dir, ngl=args.ngl)
+                imatrix_file = compute_imatrix(
+                    tools, base_gguf, cal_data, output_dir, ngl=args.ngl,
+                    chunks=args.imatrix_chunks,
+                    save_frequency=args.imatrix_save_frequency,
+                    timeout=args.imatrix_timeout)
             else:
                 print("  WARNING: No calibration data found, skipping imatrix", flush=True)
+
+    # ── imatrix-only: stop here ───────────────────────────────────────────
+    if args.imatrix_only:
+        if not imatrix_file or not Path(imatrix_file).exists():
+            print("\n=== imatrix-only: FAILED — no imatrix was produced ===", flush=True)
+            return 1
+        import hashlib
+        imf = Path(imatrix_file)
+        sha = hashlib.sha256(imf.read_bytes()).hexdigest()
+        print("\n=== imatrix-only: done, stopping before quantization ===", flush=True)
+        print(f"  {imf}", flush=True)
+        print(f"  {imf.stat().st_size} bytes  sha256={sha}", flush=True)
+        # Checkpoints from --imatrix-save-frequency, for the convergence curve.
+        ckpts = sorted(imf.parent.glob("imatrix*.dat"))
+        if len(ckpts) > 1:
+            print(f"  {len(ckpts)} checkpoints for the convergence curve:", flush=True)
+            for c in ckpts:
+                print(f"    {c.name}  {c.stat().st_size} bytes", flush=True)
+        print("  IMATRIX_ONLY_DONE", flush=True)
+        return 0
 
     # ── Step 2b: Auto-generate CD tensor-type maps from imatrix ───────────
     # If the queue includes any CD-* quants and we have a fresh imatrix.dat, derive
