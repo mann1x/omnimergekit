@@ -12,7 +12,11 @@ M="${OMK_TB_MODELS:?OMK_TB_MODELS must point at the GGUF directory}"
 export HF_HUB_DISABLE_XET=1        # xet has stalled mid-file on this host
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
-# repo|upstream_file|expected_bytes|local_name
+# repo|upstream_file|expected_bytes|local_name[|sha256]
+#
+# The 5th field is OPTIONAL. When present the file is verified by CONTENT, not
+# just length, both on download and when already present. Use it whenever two
+# files in the table can share a byte count.
 #
 # NOTE the Qwen3.6-27B row. unsloth publishes that model in TWO repos under the
 # IDENTICAL upstream filename `Qwen3.6-27B-Q4_K_M.gguf`:
@@ -28,14 +32,31 @@ JOBS=(
  "unsloth/Qwen3.6-27B-MTP-GGUF|Qwen3.6-27B-Q4_K_M.gguf|17106773120|Qwen3.6-27B-MTP-Q4_K_M.gguf"
  "bartowski/Ornith-1.5-35B-A3B-GGUF|Ornith-1.5-35B-A3B-IQ4_XS.gguf|19278554784|Ornith-1.5-35B-A3B-IQ4_XS.gguf"
  "bartowski/Qwen_Qwen3.6-35B-A3B-GGUF|Qwen_Qwen3.6-35B-A3B-IQ4_XS.gguf|19699553920|Qwen_Qwen3.6-35B-A3B-IQ4_XS.gguf"
+ # Ornith-1.5-27B-A3B Coder / CoderX, added 2026-09-09.
+ # These two carry a 5th SHA256 field, and they are the reason the field exists:
+ # both files are EXACTLY 14222050848 bytes, so the size check alone cannot tell
+ # them apart. A swapped pair would pass size verification silently and be graded
+ # under the wrong model name. IQ4_XS (not the cohort's 27B Q4_K_M) because CoderX
+ # publishes no Q4_K_M -- IQ4_XS is the only tier where both exist and are matched.
+ "ManniX-ITA/Ornith-1.5-27B-A3B-Coder-MTP-GGUF|Ornith-1.5-27B-A3B-Coder-IQ4_XS.gguf|14222050848|Ornith-1.5-27B-A3B-Coder-IQ4_XS.gguf|e75c5925cfcf136255f33c4ce44a263ed476eac526d0f56662a7a1c62a249dd3"
+ "ManniX-ITA/Ornith-1.5-27B-A3B-CoderX-MTP-GGUF|Ornith-1.5-27B-A3B-CoderX-IQ4_XS.gguf|14222050848|Ornith-1.5-27B-A3B-CoderX-IQ4_XS.gguf|a2e80c8c7b9709a45b96ac94e19c20f82fdd3400cc97625cb08af8be0a138a4b"
 )
 rc=0
 for j in "${JOBS[@]}"; do
-  IFS='|' read -r repo file exp dest <<<"$j"
+  IFS='|' read -r repo file exp dest sha <<<"$j"
   dest="${dest:-$file}"
   if [ -f "$M/$dest" ]; then
     sz=$(stat -c%s "$M/$dest")
-    [ "$sz" -eq "$exp" ] && { echo "OK        $dest (already present)"; continue; }
+    if [ "$sz" -eq "$exp" ]; then
+      if [ -n "${sha:-}" ]; then
+        got=$(sha256sum "$M/$dest" | cut -d" " -f1)
+        if [ "$got" != "$sha" ]; then
+          echo "** SHA_MISMATCH $dest got=$got want=$sha -- WRONG FILE under this name"; rc=1; continue
+        fi
+        echo "OK        $dest (already present, sha verified)"; continue
+      fi
+      echo "OK        $dest (already present)"; continue
+    fi
     echo "** WRONG SIZE $dest got=$sz want=$exp -- remove it and re-run"; rc=1; continue
   fi
   for i in 1 2 3 4 5 6; do
@@ -47,7 +68,13 @@ for j in "${JOBS[@]}"; do
   if [ -f "$src" ]; then
     sz=$(stat -c%s "$src")
     if [ "$sz" -eq "$exp" ]; then
-      mv -f "$src" "$M/$dest"; rm -rf "$M/.dl_$dest"; echo "OK        $dest"
+      if [ -n "${sha:-}" ]; then
+        got=$(sha256sum "$src" | cut -d" " -f1)
+        if [ "$got" != "$sha" ]; then
+          echo "** SHA_MISMATCH $dest got=$got want=$sha -- NOT promoted"; rc=1; continue
+        fi
+      fi
+      mv -f "$src" "$M/$dest"; rm -rf "$M/.dl_$dest"; echo "OK        $dest${sha:+ (sha verified)}"
     else
       echo "** SIZE_MISMATCH $dest got=$sz want=$exp -- NOT promoted"; rc=1
     fi

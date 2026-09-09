@@ -37,6 +37,10 @@ BENCH_URL = "github.com/SeraphimSerapis/tool-eval-bench"
 FAMILY = {  # colour by provenance
     "omnimerge-v4": "ours", "omnimerge-v6": "ours",
     "a3b-coder": "ours", "a3b-coderx": "ours",
+    # Ornith-1.5-27B-A3B Coder/CoderX are in-house builds (ManniX-ITA), added
+    # 2026-09-09. NOTE ornith-1.5-35b is deliberately NOT here: that row is
+    # bartowski's quant of a third-party model, carried as an external anchor.
+    "ornith-27b-coder": "ours", "ornith-27b-coderx": "ours",
 }
 
 
@@ -162,7 +166,7 @@ def main():
                 textcoords="offset points", fontsize=8.8, color="#64748b")
 
     handles = [
-        Line2D([], [], marker="o", ls="", color=C["ours"], ms=8, label="ours (Omnimerge / A3B)"),
+        Line2D([], [], marker="o", ls="", color=C["ours"], ms=8, label="ours (Omnimerge / A3B / Ornith-27B)"),
         Line2D([], [], marker="o", ls="", color=C["base"], ms=8, label="vendor / third-party base"),
         Line2D([], [], marker="|", ls="", color="#94a3b8", ms=11, mew=2,
                label="r/LocalLLaMA published (256k, v2.6.0 — NOT comparable)"),

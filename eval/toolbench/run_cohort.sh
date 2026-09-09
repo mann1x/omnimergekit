@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# tool-eval-bench 64k cohort — 7 models x 3 seeds, HARDMODE (88 scen / 176 pts)
+# tool-eval-bench 64k cohort — 10 models x 5 seeds, HARDMODE (88 scen / 176 pts)
 #
 # BASIS (constant across every cell):
 #   harness  tool-eval-bench HEAD cf54b4b (v2.6.0-45)   <- latest, per user
@@ -12,6 +12,8 @@
 #            -c 65536 --parallel 1
 #   seeds    42 43 44 45 46  (PAIRED across models; n=5 -> t=2.776)
 #   quants   27B = Q4_K_M ; 35B = IQ4_XS (matched to each other)
+#            EXCEPT ornith-27b-coder / ornith-27b-coderx, added 2026-09-09 at
+#            IQ4_XS because CoderX ships no Q4_K_M. See the MODELS entry.
 #
 # NOT comparable to the r/LocalLLaMA thread (64k vs 256k, HEAD vs 2.6.0 scorer,
 # MTP on, different quants). Ornith-1.5 / Qwen3.8-27B / Qwen3.6-35B-A3B are
@@ -87,6 +89,15 @@ MODELS=(
   "qwen3.8-27b|Qwen3.8-27B-UD-Q4_K_M.gguf"
   "ornith-1.5-35b|Ornith-1.5-35B-A3B-IQ4_XS.gguf"
   "qwen3.6-35b-a3b|Qwen_Qwen3.6-35B-A3B-IQ4_XS.gguf"
+  # Added 2026-09-09. QUANT DEVIATION, deliberate and flagged: every other 27B in
+  # this cohort is Q4_K_M, these two are IQ4_XS. CoderX publishes NO Q4_K_M at all
+  # (Q4_K_L -> Q4_K_S), so IQ4_XS is the only tier where Coder and CoderX both exist
+  # AND are byte-matched to each other (14222050848 both). Holding the Coder/CoderX
+  # pair matched to each other was judged more important than matching them to the
+  # other 27B rows, since that pair is the comparison being asked for. Read their
+  # two cells against EACH OTHER first; against the Q4_K_M rows only with this caveat.
+  "ornith-27b-coder|Ornith-1.5-27B-A3B-Coder-IQ4_XS.gguf"
+  "ornith-27b-coderx|Ornith-1.5-27B-A3B-CoderX-IQ4_XS.gguf"
 )
 
 log(){ echo "[$(date +%H:%M:%S)] $*"; }
