@@ -47,6 +47,16 @@ Supporting tables / data:
   pass-trace extraction + per-head / per-neuron competence maps + Fisher
   blending.
 
+## RL post-training
+
+* [`METHOD_grpo_efficiency.md`](METHOD_grpo_efficiency.md) — GRPO efficiency
+  tuning: the driver/replay pool design, the per-row budget reward, the
+  group-census failure modes, and the config traps (`grad_accum`,
+  `mask_truncated_completions`, Gemma-4 EOG, `--liger`). **Living document —
+  keep it updated as the journey continues.** Companion to
+  `scripts/train_grpo_efficiency.py`, `scripts/grpo_reward_efficiency.py`,
+  `scripts/build_grpo_pool_v4.py`, `scripts/run_grpo_an_anchored.sh`.
+
 ## Methodology / infrastructure
 
 * [`METHOD_omnimerge_v2.md`](METHOD_omnimerge_v2.md) — omnimerge V2 recipe

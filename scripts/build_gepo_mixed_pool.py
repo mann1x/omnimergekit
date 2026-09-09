@@ -145,7 +145,26 @@ def main() -> int:
         bp = pathlib.Path(a.budgets)
         if not bp.is_file():
             sys.exit(f"REFUSE: --budgets {bp} does not exist.")
-        budgets = {k: int(v) for k, v in json.loads(bp.read_text()).items()}
+        raw = json.loads(bp.read_text())
+        # ACCEPT BOTH SHAPES. `train_grpo_efficiency.py --measure-out` writes a NESTED
+        # file -- {"tiers": {...per-tier provenance...}, "budgets": {tier: int}} -- and
+        # that provenance (n, pass_rate, n_pass_lens) is worth keeping: a budget derived
+        # from 9 passing lengths is not the same object as one derived from 76, and the
+        # only way to know which you have is to carry the count alongside. Flattening the
+        # producer to satisfy this reader would throw that away, so the reader adapts.
+        # A flat {tier: int} file still works unchanged.
+        if isinstance(raw, dict) and "budgets" in raw and isinstance(raw["budgets"], dict):
+            prov = raw.get("tiers") or {}
+            budgets = {k: int(v) for k, v in raw["budgets"].items()}
+            for k in sorted(budgets):
+                t = prov.get(k) or {}
+                n_pass = t.get("n_pass_lens")
+                warn = ("  <-- THIN: budget is a quantile of very few samples"
+                        if isinstance(n_pass, int) and n_pass < 20 else "")
+                print(f"  budget {k:16s} = {budgets[k]:6d}  "
+                      f"from n_pass_lens={n_pass} pass_rate={t.get('pass_rate')}{warn}")
+        else:
+            budgets = {k: int(v) for k, v in raw.items()}
         print(f"budgets: {budgets}")
 
     def load(p):
