@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """GRPO efficiency run: the an-finetune method, on Jprime-p3, vLLM-colocate over 2 GPUs.
 
+Knowledge doc (READ FIRST, keep updated): docs/METHOD_grpo_efficiency.md
+
 METHOD PROVENANCE -- THIS IS NOT GEPO
 -------------------------------------
 The run that worked on an-finetune (`simpo/train_grpo_e2b.py`) is plain GRPO with TRL's
@@ -48,10 +50,15 @@ and asserted.  [[feedback_gemma4_double_terminator_trl_add_eos]]
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import pathlib
+import re
+import shutil
+import signal
 import sys
+import time
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
@@ -150,10 +157,44 @@ def main() -> int:
     ap.set_defaults(vllm_sleep=True)
     # --- optimisation (an-finetune values) ---
     ap.add_argument("--lr", type=float, default=1e-6)
+    ap.add_argument("--save-steps", type=int, default=1,
+                    help="Checkpoint every N optimiser steps. 1 = every step, so an "
+                         "interruption costs at most one step of GPU time.")
+    ap.add_argument("--save-total-limit", type=int, default=3,
+                    help="How many rolling checkpoints to keep in --output. A full "
+                         "checkpoint is adapter + optimiser + scheduler + RNG, so "
+                         "keeping all 450 would be hundreds of GB. Durable retention is "
+                         "--archive-every, which copies OUT of the rolling window.")
+    ap.add_argument("--archive-every", type=int, default=10,
+                    help="Copy every Nth checkpoint into --archive-dir, where "
+                         "save_total_limit can never delete it. 0 disables archiving.")
+    ap.add_argument("--archive-dir", default="",
+                    help="Durable checkpoint archive (default: <output>/archive).")
+    ap.add_argument("--resume", default="",
+                    help="'auto' = resume from the highest-numbered checkpoint-* in "
+                         "--output; or an explicit checkpoint path. Restores weights, "
+                         "optimiser, scheduler, RNG and the step counter.")
+    ap.add_argument("--stop-file", default="",
+                    help="Touch this path to stop cleanly AT THE NEXT STEP BOUNDARY, "
+                         "after a full checkpoint (default: <output>/STOP). SIGUSR1 and "
+                         "SIGTERM create it rather than killing the process, so an "
+                         "interrupted run is always resumable. Removed at startup.")
+    ap.add_argument("--max-grad-norm", type=float, default=1.0,
+                    help="Gradient-clipping ceiling, stated EXPLICITLY. HF's "
+                         "TrainingArguments default is also 1.0, but inheriting it "
+                         "silently is how the GEPO pilot's step-9 event (grad_norm 7.5, "
+                         "clipped 7.5x) went unnoticed, and the 2026-09-09 lensignal24 "
+                         "run clipped steps 20 (2.637) and 21 (1.135) without a word in "
+                         "its header. Set it, log it, own it.")
     ap.add_argument("--beta", type=float, default=0.04,
-                    help="KL leash to the frozen reference. TRL defaults to 0.0; "
-                         "an-finetune used 0.04 and that is the run that held "
-                         "capability. Changing it is a new arm, not a tweak.")
+                    help="KL leash to the frozen reference. TRL defaults to 0.0. "
+                         "CAUTION: 0.04 is an-finetune's grpo_v8_full (v1) -- the arm "
+                         "whose length went NOWHERE (OLS t=-0.36). The only AN arm that "
+                         "measurably shortened, grpo_v8_v2 (t=-2.43), ran beta=0.01. "
+                         "beta also caps how far a KL excursion can distort the loss: "
+                         "lensignal24 step 20 hit kl=545, which at 0.04 contributes "
+                         "~21.8 to the loss and at 0.01 contributes ~5.4. "
+                         "[[feedback_anchor_on_the_arm_that_worked_not_the_family]]")
     ap.add_argument("--epochs", type=float, default=1.0)
     ap.add_argument("--bsz", type=int, default=1,
                     help="Completions per device per micro-step. THE LOGITS TENSOR "
@@ -164,7 +205,23 @@ def main() -> int:
                          "95 GB card that already holds 39 GB of policy and ~26 GB of "
                          "vLLM. Keep B small and buy the effective batch back with "
                          "--grad-accum.")
-    ap.add_argument("--grad-accum", type=int, default=32)
+    ap.add_argument("--measure-only", action="store_true",
+                    help="Budget-derivation pass: TOLERATE rows with length_lambda>0 and "
+                         "no length_budget, scoring them on correctness alone so their "
+                         "passing lengths can be recorded for --measure-out. NEVER set "
+                         "this for a training run -- every driver tier whose budget is "
+                         "missing would train as pure correctness, silently. Was bound "
+                         "to --smoke until 2026-09-09, which disabled the refusal on "
+                         "every run this program has launched.")
+    ap.add_argument("--grad-accum", type=int, default=16,
+                    help="16, NOT 32. This sets how fast data becomes OPTIMISER "
+                         "UPDATES, which is what a short run is short of. AN's working "
+                         "arm ran batch 8x4x1 = 32 completions per update; at "
+                         "grad_accum 32 on 2 devices we were at 64 -- HALF AN's update "
+                         "rate for the same data, so a 2-epoch run bought only 62 "
+                         "steps and had no power. 16 restores AN's ratio (bsz 1 x 16 x "
+                         "2 = 32) and roughly halves step time, since generation "
+                         "dominates and the step generates half as many completions.")
     ap.add_argument("--lora-r", type=int, default=32)
     ap.add_argument("--lora-alpha", type=int, default=64)
     ap.add_argument("--warmup-steps", type=int, default=6,
@@ -190,6 +247,26 @@ def main() -> int:
                          "lengths so budgets can be derived rather than guessed.")
     ap.add_argument("--smoke-rows-per-tier", type=int, default=6)
     ap.add_argument("--smoke-steps", type=int, default=4)
+    ap.add_argument("--length-lambda", type=float, default=0.0,
+                    help="Override meta.length_lambda on EVERY row that already carries "
+                         "lambda>0, leaving lambda==0 replay tiers untouched. AN's only "
+                         "brevity arm that measurably shortened (grpo_v8_v2, t=-2.43) "
+                         "ran a single lambda=0.8; its FLAT sibling ran 0.5. Our pool "
+                         "ships 0.1/0.1/0.3. This flattens the per-tier weighting on "
+                         "purpose -- it is a different design, not a tweak.")
+    ap.add_argument("--budget-quantile", type=float, default=None,
+                    help="Quantile of PASSING lengths used to derive budgets in the "
+                         "measure path (default: grpo_reward_efficiency.BUDGET_QUANTILE "
+                         "= 0.35). AN's winning arm sat at budget ~0.82x its observed "
+                         "mean length; P35 puts us at 0.54x, i.e. MORE aggressive than "
+                         "the only configuration known to work. ~0.6 matches AN.")
+    ap.add_argument("--dump-rollouts", default="",
+                    help="Path PREFIX for a per-rollout JSONL dump (one file per rank: "
+                         "<prefix>.rank<N>.jsonl). Each row carries ntok, ok, r, lam, "
+                         "budget, the CLAMPED penalty applied and the UNCLAMPED ratio "
+                         "nt/budget, which is everything needed to re-score the same "
+                         "rollouts under a different penalty shape offline -- no "
+                         "regeneration, no GPU. Analyse with scripts/analyze_clamp.py.")
     ap.add_argument("--measure-out", default="",
                     help="Where the smoke writes measured lengths + derived budgets.")
     a = ap.parse_args()
@@ -251,6 +328,73 @@ def main() -> int:
 
     rows = load_pool(a.pool)
 
+    # ------------------------------------------------------------ BUDGET OVERLAY
+    # `--budgets` was DECLARED and GATED ON (the REFUSE above) but never actually
+    # READ. A real run could pass --budgets, satisfy the guard, and then train on
+    # whatever meta.length_budget the pool happened to carry -- including None, the
+    # exact condition the guard exists to prevent. A gate that checks a flag instead
+    # of the thing the flag promises is not a gate.
+    #
+    # Accepts BOTH shapes: the nested {"tiers":..., "budgets":...} that
+    # --measure-out writes, and a flat {tier: int}.
+    if a.budgets:
+        bp = pathlib.Path(a.budgets)
+        if not bp.is_file():
+            sys.exit(f"REFUSE: --budgets {bp} does not exist.")
+        raw = json.loads(bp.read_text())
+        prov = raw.get("tiers") or {} if isinstance(raw, dict) else {}
+        flat = raw["budgets"] if isinstance(raw, dict) and isinstance(
+            raw.get("budgets"), dict) else raw
+        table = {k: int(v) for k, v in flat.items()}
+        n = 0
+        for r in rows:
+            m = r.setdefault("meta", {})
+            if float(m.get("length_lambda") or 0) <= 0:
+                continue                       # replay tier: correctness only, by design
+            k = f"{m.get('reward_kind')}/{'T' if m.get('think') else 'N'}"
+            if k not in table:
+                sys.exit(f"REFUSE: pool tier {k} carries length_lambda>0 but "
+                         f"--budgets has no entry for it. Measure it; do not guess.")
+            m["length_budget"] = table[k]
+            n += 1
+        print(f">>> budgets overlaid onto {n} rows from {bp}", flush=True)
+        for k in sorted(table):
+            t = prov.get(k) or {}
+            npl = t.get("n_pass_lens")
+            thin = "  <-- THIN (<20 passing samples)" if isinstance(npl, int) and npl < 20 else ""
+            print(f"      {k:16s} budget={table[k]:6d}  n_pass_lens={npl}{thin}", flush=True)
+
+    # ---------------------------------------------------------- LAMBDA OVERRIDE
+    # Applied AFTER the budget overlay so the provenance print above still shows the
+    # budgets as measured. Rows with lambda==0 (replay) are deliberately untouched:
+    # they exist to hold capability and must stay pure correctness.
+    if a.length_lambda > 0:
+        n_over = 0
+        for r in rows:
+            m = r.get("meta") or {}
+            if float(m.get("length_lambda") or 0) > 0:
+                m["length_lambda"] = float(a.length_lambda)
+                n_over += 1
+        print(f">>> LAMBDA OVERRIDE: {n_over} rows set to lambda={a.length_lambda} "
+              f"(replay rows with lambda==0 untouched)", flush=True)
+
+    # A lambda>0 row with no budget is the failure this whole path exists to stop.
+    # Check the ROWS, not the flag -- for a real run it is fatal.
+    missing = [r for r in rows
+               if float((r.get("meta") or {}).get("length_lambda") or 0) > 0
+               and not (r.get("meta") or {}).get("length_budget")]
+    if missing and not a.smoke:
+        sys.exit(f"REFUSE: {len(missing)}/{len(rows)} rows carry length_lambda>0 with no "
+                 "length_budget. Those tiers would train as pure correctness while the "
+                 "pool calls them drivers.")
+    if missing:
+        print(f">>> NOTE {len(missing)}/{len(rows)} lambda>0 rows have no budget "
+              "(measure-only smoke: they score correctness and length_share will be 0)",
+              flush=True)
+    else:
+        print(f">>> all {len(rows)} rows carry a length_budget where lambda>0 "
+              "-- the length term IS active", flush=True)
+
     if a.smoke:
         bytier: dict[str, list] = {}
         for r in rows:
@@ -294,11 +438,22 @@ def main() -> int:
             except Exception as e:
                 return False, repr(e)
 
-    # The smoke measures the lengths a budget is derived from, so it necessarily runs
-    # BEFORE any budget exists. A real run keeps the hard refusal.
+    # allow_unset_budget is bound to --measure-only, NOT to --smoke. A budget-derivation
+    # pass necessarily runs before any budget exists and must tolerate unset budgets; a
+    # REAL RUN must keep the hard refusal, because a row that reaches the reward with
+    # lambda>0 and no budget trains as pure correctness and the length objective is
+    # silently absent from that tier.
+    #
+    # These were coupled until 2026-09-09. Every arm in this program passes --smoke
+    # (it is how the whole pool is selected, via --smoke-rows-per-tier), so the refusal
+    # was disabled on every run that has ever been launched here. Same overload that
+    # caused bug-698, where --smoke also decided save_strategy and nothing was ever
+    # checkpointed. --smoke selects rows and caps steps. It decides NOTHING else.
+    # [[feedback_never_skip_silently]] [[feedback_an_unchecked_case_is_silent]]
     reward = make_efficiency_reward(tok, lcb_verifier, a.max_completion_len,
                                     log_every=a.log_every,
-                                    allow_unset_budget=a.smoke)
+                                    allow_unset_budget=a.measure_only,
+                                    dump_rollouts=(a.dump_rollouts or None))
 
     cfg = GRPOConfig(
         output_dir=a.output,
@@ -345,7 +500,22 @@ def main() -> int:
         max_completion_length=a.max_completion_len,
         vllm_max_model_length=a.max_prompt_len + a.max_completion_len,
         temperature=a.temperature,
-        mask_truncated_completions=True,
+        # FALSE, matching an-finetune's grpo_v8_v2 -- the ONLY brevity arm in this
+        # house with a significant length slope (OLS t=-2.43 over 446 steps). It never
+        # set this flag, so it ran at TRL's default False, with clipped_ratio 0.53-0.69:
+        # more than half of every batch truncated, each one scoring 0 and staying in the
+        # gradient as a NEGATIVE example. That -- not the lenpen term -- is the strongest
+        # brevity pressure that config had, and True cancels it: our reward computes
+        # r=0.0 for a censored rollout and the mask then deletes the row.
+        #
+        # It also removes a dependency on a known-broken check. TRL's truncation test is
+        # is_eos = completion_ids == eos_token_id, a SCALAR compare that cannot represent
+        # Gemma-4's EOG set {1, 106, 50}, so it miscounts any completion ending on 1 or
+        # 50. Our reward decides censoring from the TOKEN COUNT (nt >= max_completion)
+        # and is correct either way; only the mask rode on the broken compare.
+        # [[feedback_anchor_on_the_arm_that_worked_not_the_family]]
+        # [[feedback_a_fully_masked_run_reports_constants_not_measurements]]
+        mask_truncated_completions=False,
         use_vllm=True,
         vllm_mode="colocate",
         vllm_tensor_parallel_size=a.vllm_tp,
@@ -370,6 +540,7 @@ def main() -> int:
         learning_rate=a.lr,
         lr_scheduler_type="constant_with_warmup",
         warmup_steps=(1 if a.smoke else a.warmup_steps),
+        max_grad_norm=a.max_grad_norm,
         num_train_epochs=a.epochs,
         per_device_train_batch_size=a.bsz,
         gradient_accumulation_steps=a.grad_accum,
@@ -378,8 +549,18 @@ def main() -> int:
         optim="adamw_8bit",
         max_steps=(a.smoke_steps if a.smoke else -1),
         logging_steps=1,
-        save_strategy=("no" if a.smoke else "steps"),
-        save_steps=75,
+        # SAVING IS NEVER DISABLED. It used to read `"no" if a.smoke else "steps"`,
+        # and since every arm in this program runs --smoke, NOTHING WAS EVER SAVED --
+        # grpo_lensignal24/ held only measured.json after 24 steps and 2.5 h of GPU.
+        # --smoke selects a row subsample and allow_unset_budget; it must not also
+        # decide durability.  [[feedback_always_checkpoint_long_runs]]
+        save_strategy="steps",
+        save_steps=a.save_steps,
+        save_total_limit=a.save_total_limit,
+        # False is the default, but state it: True would write the adapter WITHOUT the
+        # optimiser/scheduler/RNG, which resumes to a DIFFERENT trajectory while looking
+        # like a resume. Everything needed to continue must be in the checkpoint.
+        save_only_model=False,
         seed=a.seed,
         # TRL raises if Liger is combined with an lm_head adapter, prompt-learning
         # PEFT, off-policy masking, top_entropy_quantile<1, an entropy bonus, or an
@@ -467,8 +648,165 @@ def main() -> int:
     trainer = GRPOTrainer(model=a.model, args=cfg, train_dataset=ds,
                           reward_funcs=[reward], peft_config=peft_cfg,
                           processing_class=tok)
+    class KLProbe(TrainerCallback):
+        """Print kl/grad_norm PERCENTILES per interval, not just the step value.
+
+        A single-step `kl` of 545 next to neighbours of 0.01 reads as a mystery number
+        in the log. What matters is the DISTRIBUTION: AN's brevity arm that worked ran
+        p50 3.9e-5 -> 0.0036 -> 0.069 -> 0.255 by quarter, i.e. a policy steadily
+        moving, with spikes riding on top. The arm with no spikes at all is the arm
+        where nothing happened. So an excursion is only readable against its own p50.
+        Also flags every step whose grad_norm exceeded the clipping ceiling, since a
+        clipped update is a SCALED update and that never appears in the step dict.
+        """
+
+        def __init__(self, clip_at: float, every: int = 8):
+            self.kl, self.gn, self.every = [], [], every
+            self.clip_at, self.n_clipped, self.seen = clip_at, 0, 0
+
+        def on_log(self, args, state, control, logs=None, **kw):
+            if not logs or "kl" not in logs:
+                return
+            self.seen += 1
+            try:
+                self.kl.append(float(logs["kl"]))
+                g = float(logs.get("grad_norm", 0.0))
+            except (TypeError, ValueError):
+                return
+            self.gn.append(g)
+            if g > self.clip_at:
+                self.n_clipped += 1
+                print(f">>> KLPROBE step={self.seen} CLIPPED grad_norm={g:.4g} > "
+                      f"max_grad_norm={self.clip_at:g} (update scaled by "
+                      f"{self.clip_at / g:.3f}x)", flush=True)
+            if self.seen % self.every == 0:
+                k = sorted(self.kl[-self.every:])
+                gg = sorted(self.gn[-self.every:])
+                q = lambda v, f: v[min(int(len(v) * f), len(v) - 1)]  # noqa: E731
+                print(f">>> KLPROBE last {self.every} steps: "
+                      f"kl p50={q(k, .5):.4g} p90={q(k, .9):.4g} max={k[-1]:.4g} | "
+                      f"grad_norm p50={q(gg, .5):.4g} max={gg[-1]:.4g} | "
+                      f"clipped {self.n_clipped}/{self.seen} steps so far", flush=True)
+
+    # ------------------------------------------------------- GRACEFUL STOP + ARCHIVE
+    # This run is expected to be interrupted: it trains overnight, is stopped during the
+    # day, and resumes. So an interruption must cost at most one step and must never
+    # produce a checkpoint that resumes to a different trajectory.
+    STOP_FILE = pathlib.Path(a.stop_file or (pathlib.Path(a.output) / "STOP"))
+    ARCHIVE = pathlib.Path(a.archive_dir or (pathlib.Path(a.output) / "archive"))
+
+    # A HF/PEFT checkpoint is only resumable if ALL of these are present. Verified, not
+    # assumed -- a missing optimizer.pt resumes silently onto a fresh Adam state.
+    # Verified against a real PEFT checkpoint (an-finetune e2b-an-v16-gepo/checkpoint-150):
+    # adapter_config.json, adapter_model.safetensors, optimizer.pt, scheduler.pt,
+    # rng_state.pth, trainer_state.json, training_args.bin.
+    REQUIRED = ("adapter_model.safetensors", "adapter_config.json",
+                "optimizer.pt", "scheduler.pt", "trainer_state.json")
+
+    def _rng_ok(d) -> bool:
+        """RNG file is rng_state.pth single-process but rng_state_<rank>.pth under DDP,
+        so match the family, not one name. Without it a resume replays a DIFFERENT
+        sampling stream while every other file says the resume was clean."""
+        d = pathlib.Path(d)
+        return bool(list(d.glob("rng_state*.pth")))
+
+    def _touch_stop(signum, _frame):
+        # Do NOT exit here. Killing mid-step loses the step and can leave a half-written
+        # checkpoint; the callback stops us at the next boundary, after a full save.
+        try:
+            STOP_FILE.parent.mkdir(parents=True, exist_ok=True)
+            STOP_FILE.write_text(f"signal {signum} at {time.strftime('%FT%TZ', time.gmtime())}\n")
+        except OSError:
+            pass
+        print(f">>> STOP REQUESTED (signal {signum}) -- will checkpoint and exit at the "
+              f"next step boundary", flush=True)
+
+    for _sig in (signal.SIGUSR1, signal.SIGTERM):
+        signal.signal(_sig, _touch_stop)
+
+    class Checkpointer(TrainerCallback):
+        """Stop-on-request at a step boundary; archive every Nth checkpoint."""
+
+        def __init__(self, is_main: bool):
+            self.is_main, self.announced = is_main, False
+
+        def on_step_end(self, args, state, control, **kw):
+            if STOP_FILE.exists():
+                if not self.announced:
+                    print(f">>> STOP FILE {STOP_FILE} seen at step {state.global_step} "
+                          f"-- saving a full checkpoint, then exiting cleanly. "
+                          f"Resume with --resume auto.", flush=True)
+                    self.announced = True
+                control.should_save = True
+                control.should_training_stop = True
+            return control
+
+        def on_save(self, args, state, control, **kw):
+            if not self.is_main:
+                return control
+            ck = pathlib.Path(args.output_dir) / f"checkpoint-{state.global_step}"
+            missing = [f for f in REQUIRED if not (ck / f).exists()]
+            if not _rng_ok(ck):
+                missing.append("rng_state*.pth")
+            if missing:
+                # Loud, but do NOT kill the run: a bad checkpoint is recoverable from an
+                # earlier one; a killed run is not.
+                print(f">>> CHECKPOINT WARNING step {state.global_step}: missing "
+                      f"{missing} in {ck} -- this checkpoint may NOT be resumable",
+                      flush=True)
+            if a.archive_every and state.global_step % a.archive_every == 0:
+                dst = ARCHIVE / ck.name
+                try:
+                    ARCHIVE.mkdir(parents=True, exist_ok=True)
+                    if dst.exists():
+                        shutil.rmtree(dst)
+                    shutil.copytree(ck, dst)
+                    sz = sum(f.stat().st_size for f in dst.rglob("*") if f.is_file())
+                    print(f">>> ARCHIVED {ck.name} -> {dst} ({sz / 1e9:.2f} GB, "
+                          f"{'complete' if not missing else 'INCOMPLETE'})", flush=True)
+                except OSError as e:
+                    print(f">>> ARCHIVE FAILED for {ck.name}: {e}", flush=True)
+            return control
+
+    _is_main = int(os.environ.get("RANK", "0")) == 0
+    if _is_main and STOP_FILE.exists():
+        # A stale STOP from the previous segment would halt this one at step 1.
+        print(f">>> clearing stale stop file {STOP_FILE}", flush=True)
+        STOP_FILE.unlink()
+
+    resume = None
+    if a.resume:
+        if a.resume == "auto":
+            cks = glob.glob(os.path.join(a.output, "checkpoint-*"))
+            cks = [c for c in cks if re.search(r"checkpoint-(\d+)$", c)]
+            if cks:
+                resume = max(cks, key=lambda c: int(re.search(r"(\d+)$", c).group(1)))
+        else:
+            resume = a.resume
+        if resume:
+            miss = [f for f in REQUIRED if not os.path.exists(os.path.join(resume, f))]
+            if not _rng_ok(resume):
+                miss.append("rng_state*.pth")
+            if miss:
+                sys.exit(f"REFUSE: --resume {resume} is missing {miss}. Resuming from an "
+                         "incomplete checkpoint silently restarts the optimiser state "
+                         "and produces a DIFFERENT trajectory that still looks like a "
+                         "resume. Point at a complete checkpoint or an archived one.")
+            done = json.load(open(os.path.join(resume, "trainer_state.json")))
+            print(f">>> RESUMING from {resume} at global_step="
+                  f"{done.get('global_step')} / max {a.smoke_steps if a.smoke else '-'}",
+                  flush=True)
+        else:
+            print(f">>> --resume {a.resume!r} found no checkpoint in {a.output}; "
+                  "starting from scratch", flush=True)
+
     trainer.add_callback(NanProbe(trainer.model))
-    trainer.train()
+    trainer.add_callback(KLProbe(a.max_grad_norm))
+    trainer.add_callback(Checkpointer(_is_main))
+    print(f">>> CHECKPOINTING: every {a.save_steps} step(s), keep {a.save_total_limit} "
+          f"rolling, archive every {a.archive_every} to {ARCHIVE}; stop file {STOP_FILE}",
+          flush=True)
+    trainer.train(resume_from_checkpoint=resume)
 
     if a.smoke:
         st = reward._state["byk"]
@@ -504,9 +842,15 @@ def main() -> int:
                 "mean_tok": b["tok"] / max(b["n"], 1),
                 "clipped": b["clip"] / max(b["n"], 1),
                 "lambda": b["lam"], "n_pass_lens": len(lens),
+                # The lengths themselves, not just their count: a budget is a QUANTILE
+                # of this list, so without it a published budget cannot be audited or
+                # re-derived at a different quantile without re-running the model.
+                "pass_lens": sorted(int(x) for x in lens),
             }
             if lens:
-                out["budgets"][k] = budget_from_lengths(lens)
+                out["budgets"][k] = (budget_from_lengths(lens, a.budget_quantile)
+                                     if a.budget_quantile is not None
+                                     else budget_from_lengths(lens))
         if not is_main:
             return 0
         print("\n=== SMOKE MEASUREMENT ===")
