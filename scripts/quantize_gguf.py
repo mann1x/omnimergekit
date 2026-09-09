@@ -192,6 +192,60 @@ def detect_mtp(model_path: Path) -> dict | None:
     }
 
 
+def detect_mtp_from_gguf(f16_gguf: Path) -> dict | None:
+    """Detect the MTP head from an EXISTING F16 GGUF's own metadata.
+
+    WHY THIS EXISTS. `detect_mtp` reads the HF safetensors index, which is not
+    present when an already-converted F16 is reused -- and the safetensors fallback
+    only fires when `--model` happens to be a local DIRECTORY. Passing a repo id
+    (`ManniX-ITA/...`) therefore left `mtp_info = None`, which silently dropped the
+    `blk.{N}.*` Q4_K floor. Measured consequence on the v6 AC rebuild (2026-09-09):
+      * IQ3_XS / IQ3_XXS / IQ2_M / IQ2_S -> llama-quantize BAILED
+        ("Missing importance matrix for tensor blk.64.attn_k.weight")
+      * Q2_K -> did NOT bail, built, and OVERWROTE a good file on HF with an
+        MTP head at Q2_K instead of the Q4_K floor. The silent one is the dangerous one.
+    The GGUF carries the fact itself (`<arch>.block_count`, `<arch>.nextn_predict_layers`),
+    so detection must not depend on the shape of an argument.
+    [[feedback_mtp_head_imatrix_missing]] [[feedback_provenance_ask_the_service_not_the_flag]]
+    """
+    if not f16_gguf or not Path(f16_gguf).is_file():
+        return None
+    try:
+        from gguf import GGUFReader
+    except ImportError:
+        return None
+    try:
+        r = GGUFReader(str(f16_gguf))
+    except Exception:
+        return None
+
+    def _kv(suffix):
+        for k, f in r.fields.items():
+            if k.endswith(suffix):
+                try:
+                    return int(f.parts[f.data[0]].tolist()[0])
+                except Exception:
+                    return None
+        return None
+
+    n_blocks = _kv(".block_count")
+    n_nextn = _kv(".nextn_predict_layers")
+    if not n_blocks or not n_nextn:
+        return None
+    idx = n_blocks - n_nextn
+    # Do not trust arithmetic alone -- require the block to actually be present.
+    present = [t.name for t in r.tensors if t.name.startswith(f"blk.{idx}.")]
+    if not present:
+        return None
+    return {
+        "mtp_block_idx": idx,
+        "mtp_tensor_count": len(present),
+        "num_hidden_layers": idx,
+        "mtp_num_hidden_layers": n_nextn,
+        "detected_from": "gguf_kv",
+    }
+
+
 def verify_mtp_in_gguf(f16_gguf: Path, mtp_info: dict, tools: dict) -> None:
     """Post-conversion: verify the F16 GGUF actually contains blk.{N}.*
     tensors where N = num_hidden_layers (the MTP block remap target).
@@ -2503,6 +2557,16 @@ def main():
         _mtp_src = Path(args.model)
     if not args.no_mtp_detect and _mtp_src is not None:
         mtp_info = detect_mtp(_mtp_src)
+    # LAST RESORT, and the one that actually holds when an F16 is reused: read the
+    # fact out of the GGUF itself. Never let MTP detection depend on whether --model
+    # was spelled as a path or a repo id.
+    if not args.no_mtp_detect and mtp_info is None and base_gguf and Path(base_gguf).is_file():
+        mtp_info = detect_mtp_from_gguf(Path(base_gguf))
+        if mtp_info:
+            print("\n=== MTP head detected from F16 GGUF metadata ===", flush=True)
+            print(f"  blk.{mtp_info['mtp_block_idx']}.* present "
+                  f"({mtp_info['mtp_tensor_count']} tensors), "
+                  f"nextn_predict_layers={mtp_info['mtp_num_hidden_layers']}", flush=True)
         if mtp_info:
             print("\n=== MTP head detected in source ===", flush=True)
             print(f"  mtp.* tensors in safetensors: {mtp_info['mtp_tensor_count']}",
