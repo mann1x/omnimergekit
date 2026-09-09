@@ -67,7 +67,6 @@ push_checked(){   # $1 = tag, $2 = logfile
 
 emit_params(){   # shared by text and vision so they can never drift apart
   cat <<'EOF'
-TEMPLATE {{ .Prompt }}
 RENDERER qwen3.5
 PARSER qwen3.5
 PARAMETER num_ctx 32768

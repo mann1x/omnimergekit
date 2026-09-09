@@ -34,11 +34,9 @@ TXT="${BASE}:pilot-${TIER}"
 VIS="${BASE}:pilot-vision-${TIER}"
 
 # ---- 1. text tag -----------------------------------------------------------
-# TEMPLATE {{ .Prompt }} + explicit RENDERER/PARSER is exactly what the shipped sibling
 # carries: the Go renderer supersedes, the passthrough template never renders.
 cat > "$WORK/Modelfile.txt" <<EOF
 FROM $GGUF
-TEMPLATE {{ .Prompt }}
 RENDERER qwen3.5
 PARSER qwen3.5
 PARAMETER num_ctx 32768

@@ -98,7 +98,17 @@ push_checked(){   # $1 = tag, $2 = logfile
 }
 
 emit_params(){   # shared by text and vision so the two can never drift apart
-  echo "TEMPLATE {{ .Prompt }}"
+  # DO NOT ADD A `TEMPLATE` LINE HERE. One was added in ca77bfe (2026-08-21) as
+  # `TEMPLATE {{ .Prompt }}`, on the mistaken belief that `ollama create` needs a
+  # template when a RENDERER is set. It does not, and it is not inert: every tag
+  # published through this script carried an invented passthrough template AND lost
+  # the `requires` version floor, while tags published by the older path kept it.
+  #     ornith:Q6_K   (this script)  template '{{ .Prompt }}'  requires None
+  #     coderx:Q4_K_M (this script)  template '{{ .Prompt }}'  requires None
+  #     omnimerge-v4  (older path)   template NONE             requires 0.30.0
+  # `requires` is what stops an older ollama pulling a tag that loads and then fails
+  # at render. The RENDERER is the chat format; a TEMPLATE alongside it is at best
+  # redundant and at worst overrides it. Removed 2026-09-09.
   echo "RENDERER $OL_RENDERER"
   echo "PARSER $OL_PARSER"
   echo "PARAMETER num_ctx $OL_NUM_CTX"
