@@ -52,7 +52,39 @@ import urllib.request
 
 NS = "mannix"
 OL = "/usr/local/bin/ollama"
-STORE = "/usr/share/ollama/.ollama/models"
+def _resolve_store():
+    """Where the DAEMON actually keeps models -- ask it, never assume.
+
+    A hardcoded path silently breaks the whole sweep: every pull succeeds, then
+    every manifest read comes back empty and each tag dies FAILPULL-nomodel-layer
+    (bs2, 2026-09-08: daemon runs OLLAMA_MODELS=/mnt/sdc/ollama/models while this
+    constant pointed at /usr/share/ollama/.ollama/models).
+
+    Order: our own env -> the running daemon's env -> daemon HOME -> legacy default.
+    """
+    env = os.environ.get("OLLAMA_MODELS")
+    if env and os.path.isdir(env):
+        return env
+    try:
+        pid = subprocess.run(["pgrep", "-x", "ollama"], capture_output=True,
+                             text=True, timeout=15).stdout.split()
+        if pid:
+            with open("/proc/%s/environ" % pid[0], "rb") as f:
+                envd = dict(
+                    kv.split("=", 1) for kv in
+                    f.read().decode("utf-8", "replace").split("\0") if "=" in kv)
+            m = envd.get("OLLAMA_MODELS")
+            if m and os.path.isdir(m):
+                return m
+            h = envd.get("HOME")
+            if h and os.path.isdir(os.path.join(h, ".ollama", "models")):
+                return os.path.join(h, ".ollama", "models")
+    except Exception:
+        pass
+    return "/usr/share/ollama/.ollama/models"
+
+
+STORE = _resolve_store()
 BLOBS = os.path.join(STORE, "blobs")
 REGISTRY = "https://registry.ollama.ai/v2"
 
@@ -148,6 +180,45 @@ def registry_config(model, tag):
         return {"_error": str(e)}
 
 
+def _blob_json(digest):
+    """Read a local blob by digest. Returns {} when absent or unparseable."""
+    b = os.path.join(BLOBS, digest.replace("sha256:", "sha256-"))
+    try:
+        with open(b) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def local_params(model, tag):
+    """The params dict ollama would apply, read from the local store."""
+    man = local_manifest(model, tag)
+    for d in layer_digests(man, ".image.params"):
+        return _blob_json(d)
+    return {}
+
+
+def registry_params(model, tag):
+    """The params dict the REGISTRY serves. Ask the service, never the flag."""
+    base = "%s/%s/%s" % (REGISTRY, NS, model)
+    try:
+        with urllib.request.urlopen("%s/manifests/%s" % (base, tag), timeout=60) as r:
+            man = json.load(r)
+        for lay in man.get("layers", []):
+            if lay["mediaType"].endswith(".image.params"):
+                with urllib.request.urlopen("%s/blobs/%s" % (base, lay["digest"]),
+                                            timeout=60) as r:
+                    return json.load(r)
+    except Exception:
+        pass
+    return {}
+
+
+def _params_match(have, want):
+    """Every requested key present with the requested value (string-compared)."""
+    return all(str(have.get(k)) == str(v) for k, v in want.items())
+
+
 def gc_blobs(protect):
     """Purge blobs no local manifest references. Builds the reference set from ALL
     manifests, so unrelated local models (v7test, gemma31b-q6-128k, ...) are safe."""
@@ -179,9 +250,14 @@ def gc_blobs(protect):
 
 
 # ---------------------------------------------------------------- per-tag work
-def process(model, tag, renderer, parser, workdir, done_dir, dry):
+def process(model, tag, renderer, parser, workdir, done_dir, dry, params=None):
     full = "%s/%s:%s" % (NS, model, tag)
-    marker = os.path.join(done_dir, "%s__%s.done" % (model, tag.replace("/", "_")))
+    params = params or {}
+    suffix = ""
+    if params:
+        suffix = "__" + "_".join("%s%s" % (k, v) for k, v in sorted(params.items()))
+    marker = os.path.join(done_dir,
+                          "%s__%s%s.done" % (model, tag.replace("/", "_"), suffix))
     if os.path.exists(marker):
         return "DONE-CACHED"
 
@@ -192,11 +268,15 @@ def process(model, tag, renderer, parser, workdir, done_dir, dry):
     if "_error" in pre:
         open(marker, "w").write("skip-missing %s\n" % pre["_error"])
         return "SKIP-MISSING"
-    if pre.get("renderer") == renderer and pre.get("parser") == parser:
+    pre_p = registry_params(model, tag) if params else {}
+    if (pre.get("renderer") == renderer and pre.get("parser") == parser
+            and (not params or _params_match(pre_p, params))):
         open(marker, "w").write("already-correct\n")
         return "ALREADY-CORRECT"
     if dry:
-        return "DRY (registry renderer=%r parser=%r)" % (pre.get("renderer"), pre.get("parser"))
+        return "DRY (registry renderer=%r parser=%r params=%r)" % (
+            pre.get("renderer"), pre.get("parser"),
+            {k: pre_p.get(k) for k in params} if params else None)
 
     r = run([OL, "pull", full])
     if r.returncode != 0:
@@ -214,6 +294,8 @@ def process(model, tag, renderer, parser, workdir, done_dir, dry):
         f.write("FROM %s\n" % full)
         f.write("RENDERER %s\n" % renderer)
         f.write("PARSER %s\n" % parser)
+        for k, v in params.items():
+            f.write("PARAMETER %s %s\n" % (k, v))
 
     r = run([OL, "create", full, "-f", mfp], to=3600)
     if r.returncode != 0:
@@ -228,8 +310,22 @@ def process(model, tag, renderer, parser, workdir, done_dir, dry):
         return "FAILVERIFY-model-layer-changed"       # weights were re-imported: STOP
     if layer_digests(new, ".image.projector") != src_proj:
         return "FAILVERIFY-projector-lost"            # vision capability dropped
-    if layer_digests(new, ".image.params") != src_params:
-        return "FAILVERIFY-params-changed"            # sampler defaults drifted
+    if not params:
+        if layer_digests(new, ".image.params") != src_params:
+            return "FAILVERIFY-params-changed"        # sampler defaults drifted
+    else:
+        # Params are being changed ON PURPOSE, so a digest match would mean the
+        # edit did NOT take. Assert the SHAPE instead: every requested key set to
+        # the requested value, and every pre-existing key carried over untouched.
+        src_p = _blob_json(src_params[0]) if src_params else {}
+        new_p = local_params(model, tag)
+        if not _params_match(new_p, params):
+            return "FAILVERIFY-param-not-applied %r" % (
+                {k: new_p.get(k) for k in params},)
+        dropped = {k: v for k, v in src_p.items()
+                   if k not in params and str(new_p.get(k)) != str(v)}
+        if dropped:
+            return "FAILVERIFY-params-dropped %r" % (dropped,)
 
     r = run([OL, "push", full])
     if r.returncode != 0:
@@ -237,17 +333,25 @@ def process(model, tag, renderer, parser, workdir, done_dir, dry):
 
     # --- verify at the REGISTRY: this is the only check that proves the fix ------
     post = {}
+    post_p = {}
     for _ in range(4):
         post = registry_config(model, tag)
-        if post.get("renderer") == renderer and post.get("parser") == parser:
+        post_p = registry_params(model, tag) if params else {}
+        if (post.get("renderer") == renderer and post.get("parser") == parser
+                and (not params or _params_match(post_p, params))):
             break
         time.sleep(6)
     if post.get("renderer") != renderer or post.get("parser") != parser:
         return "FAILREG: registry config renderer=%r parser=%r" % (
             post.get("renderer"), post.get("parser"))
+    if params and not _params_match(post_p, params):
+        return "FAILREG-params: registry serves %r, wanted %r" % (
+            {k: post_p.get(k) for k in params}, params)
 
-    open(marker, "w").write("ok renderer=%s parser=%s file_type=%s\n"
-                            % (renderer, parser, post.get("file_type")))
+    open(marker, "w").write("ok renderer=%s parser=%s params=%s file_type=%s\n"
+                            % (renderer, parser,
+                               {k: post_p.get(k) for k in params} if params else "-",
+                               post.get("file_type")))
     return "OK"
 
 
@@ -258,6 +362,10 @@ def main():
     ap.add_argument("--parser", required=True)
     ap.add_argument("--work", default="/srv/ml/ollama_renderer_fix")
     ap.add_argument("--only", default="", help="comma-separated tag subset (pilot runs)")
+    ap.add_argument("--param", action="append", default=[], metavar="KEY=VALUE",
+                    help="Modelfile PARAMETER to set on every tag, repeatable "
+                         "(e.g. --param draft_num_predict=3). Without it the "
+                         "params blob must stay byte-identical, as before.")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
@@ -273,8 +381,15 @@ def main():
         tags = [t for t in tags if t in want]
 
     log("=" * 78)
-    log("model=%s/%s  renderer=%s  parser=%s  dry=%s" % (NS, a.model, a.renderer,
-                                                         a.parser, a.dry_run))
+    params = {}
+    for kv in a.param:
+        if "=" not in kv:
+            sys.exit("--param must be KEY=VALUE, got %r" % kv)
+        k, v = kv.split("=", 1)
+        params[k.strip()] = v.strip()
+    log("model=%s/%s  renderer=%s  parser=%s  params=%s  dry=%s"
+        % (NS, a.model, a.renderer, a.parser, params or "-", a.dry_run))
+    log("store=%s" % STORE)
     log("tags from web: %d  |  candidate set: %d  |  free: %.0f GB"
         % (len(web), len(tags), free_gb()))
     log("order: %s" % ", ".join(tags))
@@ -284,7 +399,8 @@ def main():
     for i, tag in enumerate(tags, 1):
         log("---------- [%d/%d] %s ----------" % (i, len(tags), tag))
         try:
-            res = process(a.model, tag, a.renderer, a.parser, workdir, done_dir, a.dry_run)
+            res = process(a.model, tag, a.renderer, a.parser, workdir, done_dir,
+                          a.dry_run, params=params)
         except subprocess.TimeoutExpired as e:
             res = "TIMEOUT: %s" % e
         except Exception as e:                          # noqa: BLE001 - keep the sweep alive

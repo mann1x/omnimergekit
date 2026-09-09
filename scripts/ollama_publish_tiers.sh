@@ -63,7 +63,11 @@ GCPY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ollama_gc_orphans.py"
 mkdir -p "$WORK" "$STAGE"
 say(){ echo "[pub $(date -u +%H:%M:%SZ)] $*" | tee -a "$WORK/publish.log"; }
 
-[ -f "$MMPROJ" ] || { say "REFUSE: no mmproj at $MMPROJ"; exit 1; }
+if [ "$MMPROJ" = none ]; then
+  say "MMPROJ=none -- TEXT-ONLY campaign, no vision-<tier> tags will be built"
+else
+  [ -f "$MMPROJ" ] || { say "REFUSE: no mmproj at $MMPROJ"; exit 1; }
+fi
 # Refuse loudly rather than silently skipping the per-tier reclaim: `ollama rm` frees no
 # blobs, so without the GC the store grows by a full tier each pass and the loop stalls on
 # the disk floor mid-campaign (measured: 113G -> 207G over 10 tiers, 2026-08-21).
@@ -167,32 +171,36 @@ PYEOF
   fi
   [ "$ok" = 1 ] || { say "$T: GATE FAIL, not pushing"; continue; }   # keep $G for retry
 
-  { ollama show --modelfile "$TXT" | grep -v '^#'; echo "FROM $MMPROJ"; } > "$WORK/Modelfile.vis.$T"
-  ollama create "$VIS" -f "$WORK/Modelfile.vis.$T" >"$WORK/create.vis.$T.log" 2>&1 \
-      || { say "$T: create vision FAILED"; ok=0; }
-  if [ "$ok" = 1 ]; then
-    # `ollama show` can come back EMPTY while the daemon is still settling after a large
-    # create/push, which reads identically to a tag that genuinely lacks the capability.
-    # Retry, and NEVER 2>/dev/null -- swallowing stderr is what made that undiagnosable.
-    vshow=""; vmf=""
-    for try in 1 2 3 4 5; do
-      vshow=$(ollama show "$VIS" 2>&1)
-      vmf=$(ollama show --modelfile "$VIS" 2>&1)
-      grep -qi vision <<<"$vshow" && { [ "$DRAFT_N" = 0 ] || grep -q "^PARAMETER draft_num_predict $DRAFT_N" <<<"$vmf"; } && break
-      say "$T: vision probe attempt $try inconclusive, retrying"
-      sleep 10
-    done
-    grep -qi vision <<<"$vshow" || { say "$T: vision tag lacks vision cap; ollama show said:"; sed 's/^/      /' <<<"$vshow" | head -20; ok=0; }
-    if [ "$DRAFT_N" != 0 ]; then
-      grep -q "^PARAMETER draft_num_predict $DRAFT_N" <<<"$vmf" \
-        || { say "$T: vision tag lost draft_num_predict"; ok=0; }
+  if [ "$MMPROJ" != none ]; then
+    { ollama show --modelfile "$TXT" | grep -v '^#'; echo "FROM $MMPROJ"; } > "$WORK/Modelfile.vis.$T"
+    ollama create "$VIS" -f "$WORK/Modelfile.vis.$T" >"$WORK/create.vis.$T.log" 2>&1 \
+        || { say "$T: create vision FAILED"; ok=0; }
+    if [ "$ok" = 1 ]; then
+      # `ollama show` can come back EMPTY while the daemon is still settling after a large
+      # create/push, which reads identically to a tag that genuinely lacks the capability.
+      # Retry, and NEVER 2>/dev/null -- swallowing stderr is what made that undiagnosable.
+      vshow=""; vmf=""
+      for try in 1 2 3 4 5; do
+        vshow=$(ollama show "$VIS" 2>&1)
+        vmf=$(ollama show --modelfile "$VIS" 2>&1)
+        grep -qi vision <<<"$vshow" && { [ "$DRAFT_N" = 0 ] || grep -q "^PARAMETER draft_num_predict $DRAFT_N" <<<"$vmf"; } && break
+        say "$T: vision probe attempt $try inconclusive, retrying"
+        sleep 10
+      done
+      grep -qi vision <<<"$vshow" || { say "$T: vision tag lacks vision cap; ollama show said:"; sed 's/^/      /' <<<"$vshow" | head -20; ok=0; }
+      if [ "$DRAFT_N" != 0 ]; then
+        grep -q "^PARAMETER draft_num_predict $DRAFT_N" <<<"$vmf" \
+          || { say "$T: vision tag lost draft_num_predict"; ok=0; }
+      fi
     fi
+    [ "$ok" = 1 ] || { say "$T: VISION GATE FAIL, pushing neither"; ollama rm "$TXT" "$VIS" >/dev/null 2>&1; continue; }
   fi
-  [ "$ok" = 1 ] || { say "$T: VISION GATE FAIL, pushing neither"; ollama rm "$TXT" "$VIS" >/dev/null 2>&1; continue; }
 
-  say "$T: gates OK — pushing $TXT and $VIS"
+
+  if [ "$MMPROJ" = none ]; then say "$T: gates OK — pushing $TXT (text-only)"
+  else say "$T: gates OK — pushing $TXT and $VIS"; fi
   push_checked "$TXT" "$WORK/push.$T.log" || { say "$T: push text FAILED"; ok=0; }
-  push_checked "$VIS" "$WORK/push.$T.log" || { say "$T: push vision FAILED"; ok=0; }
+  [ "$MMPROJ" = none ] || push_checked "$VIS" "$WORK/push.$T.log" || { say "$T: push vision FAILED"; ok=0; }
 
   if [ "$T" = "$LATEST_TIER" ] && [ "$ok" = 1 ]; then
     ollama cp "$TXT" "$OL_BASE:latest" >/dev/null 2>&1 \
