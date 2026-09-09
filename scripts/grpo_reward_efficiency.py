@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Efficiency reward: the an-finetune GRPO shape, with a PER-GROUP length budget.
 
+Knowledge doc (READ FIRST, keep updated): docs/METHOD_grpo_efficiency.md
+
 WHY THIS EXISTS SEPARATELY FROM gepo_reward_v2
 ----------------------------------------------
 `gepo_reward_v2` scores length GROUP-RELATIVELY and is deliberately SCALE-FREE:
@@ -174,7 +176,8 @@ def make_efficiency_reward(tokenizer,
                            lcb_verifier: Callable[[str, dict], Any] | None,
                            max_completion: int,
                            log_every: int = 0,
-                           allow_unset_budget: bool = False):
+                           allow_unset_budget: bool = False,
+                           dump_rollouts: str | None = None):
     """Build the reward callable TRL will invoke.
 
     `max_completion` is the trainer's completion cap and is used ONLY to identify
@@ -245,6 +248,24 @@ def make_efficiency_reward(tokenizer,
                  for c in completions]
 
         rewards = [0.0] * n
+        # Per-index length bookkeeping, kept so the GROUP loop below can classify each
+        # group and so --dump-rollouts can emit an exact per-rollout record. Without
+        # these, `rewards` alone cannot tell a group tied at the clamp from a group that
+        # genuinely agrees.
+        # A caller that passes mismatched lengths gets a NAMED refusal, not an
+        # IndexError five frames down in the group census. The census indexes ok_i by
+        # bounds derived from `prompts`, so prompts longer than completions reads off
+        # the end -- which is exactly how test 2 silently never ran.
+        if prompts is not None and len(list(prompts)) != n:
+            raise ValueError(
+                f"REFUSE: {len(list(prompts))} prompts for {n} completions. The group "
+                "census derives bounds from prompts and indexes per-completion arrays "
+                "with them; a mismatch cannot be interpreted.")
+        nt_i: list[int] = [0] * n
+        ok_i: list[bool] = [False] * n
+        under_i: list[bool | None] = [None] * n
+        pen_i: list[float] = [0.0] * n      # the CLAMPED lenpen actually applied
+        raw_i: list[float] = [0.0] * n      # nt/budget, UNCLAMPED
         for i in range(n):
             m = metas[i] or {}
             kind = m.get("reward_kind")
@@ -273,11 +294,15 @@ def make_efficiency_reward(tokenizer,
                         "fallback would measure this tier against another tier's "
                         "operating point. Set meta.length_budget per row.")
                 else:
-                    lenpen = min(nt / float(budget), 1.0)
+                    raw = nt / float(budget)
+                    lenpen = min(raw, 1.0)
                     r = R_CORRECT - lam * lenpen
+                    pen_i[i], raw_i[i] = lenpen, raw
+                    under_i[i] = nt < float(budget)
             if ok and has_answer_marker(texts[i], kind):
                 r += FORMAT_BONUS
             rewards[i] = r
+            nt_i[i], ok_i[i] = nt, bool(ok)
 
             b = state["byk"].setdefault(
                 f"{kind}/{'T' if m.get('think') else 'N'}",
@@ -308,15 +333,70 @@ def make_efficiency_reward(tokenizer,
         # than discovered in the eval.  [[feedback_gate_on_the_component_not_the_aggregate_indicator]]
         if prompts is not None:
             shares, tot_stds = [], []
+            # ---- GROUP CLASSIFICATION (test A) -------------------------------------
+            # `lenpen = min(nt/budget, 1.0)` ties every passer at or above budget at the
+            # SAME penalty, so a group whose passers are ALL above budget carries no
+            # length contrast at all. That -- not "65% of passers" -- is the clamp's real
+            # cost, and it is measurable here rather than assumed. Groups with <2 passers
+            # are dead too, but for an unrelated reason (pass rate), so they are counted
+            # SEPARATELY: merging the two would blame the clamp for a pass-rate problem.
+            # PER TIER, never pooled. The pool is 60/40 driver/replay over tiers with
+            # DIFFERENT jobs: the efficiency driver (manic-arm-contrast think,
+            # lcb_v6_easy think) and the BREVITY replay (gpqa_main_minus_diamond
+            # no-think). A pooled census reports the mean of three different jobs and
+            # cannot see the minority tier that carries the objective going dead -- on
+            # 2026-09-09 it read "clamp is the minor failure mode, 12.5%" when the
+            # clamp was in fact concentrated on the replay.
+            # [[feedback_a_pool_wide_metric_cannot_see_a_minority_tier_objective]]
+            gcls = state.setdefault("gcls", {})
+            rows = []
             for s, e in group_bounds(list(prompts)):
                 grp = rewards[s:e]
                 if len(grp) < 2:
                     continue
                 passers = [x for x in grp if x > 0.0]
+                pidx = [j for j in range(s, e) if ok_i[j]]
+                n_under = sum(1 for j in pidx if under_i[j] is True)
+                m0 = metas[s] or {}
+                cls = gcls.setdefault(
+                    f"{m0.get('reward_kind')}/{'T' if m0.get('think') else 'N'}",
+                    {"lt2pass": 0, "allover": 0, "graded": 0})
+                if len(pidx) < 2:
+                    cls["lt2pass"] += 1
+                elif n_under == 0:
+                    cls["allover"] += 1
+                else:
+                    cls["graded"] += 1
                 tot = st.pstdev(grp)
                 tot_stds.append(tot)
                 if len(passers) >= 2 and tot > 0:
                     shares.append(st.pstdev(passers) / tot)
+                # ---- ROLLOUT DUMP (test B) ----------------------------------------
+                # One row per rollout, carrying everything needed to RE-SCORE the same
+                # rollouts under a different penalty shape offline: the unclamped ratio
+                # raw=nt/budget and the clamped pen actually applied. The counterfactual
+                # reward is then exactly r + lam*pen - lam*f(raw) for any f -- no
+                # regeneration, no GPU, no second training run.
+                if dump_rollouts:
+                    gid = state.get("gid", 0)
+                    state["gid"] = gid + 1
+                    for j in range(s, e):
+                        mj = metas[j] or {}
+                        rows.append({
+                            "gid": gid, "rank": RANK,
+                            "tier": f"{mj.get('reward_kind')}/"
+                                    f"{'T' if mj.get('think') else 'N'}",
+                            "ntok": nt_i[j], "ok": ok_i[j], "r": rewards[j],
+                            "lam": float(mj.get("length_lambda") or 0.0),
+                            "budget": mj.get("length_budget"),
+                            "pen": pen_i[j], "raw": raw_i[j],
+                            "censored": nt_i[j] >= max_completion,
+                        })
+            if rows:
+                import json as _json
+                with open(f"{dump_rollouts}.rank{RANK}.jsonl", "a") as fh:
+                    for rec in rows:
+                        fh.write(_json.dumps(rec) + "\n")
             state.setdefault("share", []).extend(shares)
             state.setdefault("tot", []).extend(tot_stds)
 
@@ -324,6 +404,7 @@ def make_efficiency_reward(tokenizer,
         if log_every and state["n"] >= log_every:
             state["n"] = 0
             sh = state.get("share") or []
+            prev = state.setdefault("prev", {})
             print(f">>> [rank {RANK}] efficiency-reward tiers:", flush=True)
             for k, b in sorted(state["byk"].items()):
                 frac_under = (b["under"] / b["pass"]) if b["pass"] else float("nan")
@@ -332,10 +413,59 @@ def make_efficiency_reward(tokenizer,
                       f"lam={b['lam']:.2f} budget={b['budget']} "
                       f"frac_under_budget={frac_under:.3f} "
                       f"mean_r={b['r'] / max(b['n'],1):.3f}", flush=True)
+                # ---- SINCE THE LAST PRINT ---------------------------------------
+                # The row above is CUMULATIVE: byk is never cleared, only the print
+                # trigger state["n"] is. A running mean moves a shrinking fraction of
+                # the way the underlying quantity moves, so reading those rows as a
+                # per-step trend UNDERSTATES every change -- and "is length falling?"
+                # is the one question this log exists to answer. Print the interval
+                # next to the cumulative so nobody has to difference it offline.
+                # [[feedback_a_pool_wide_metric_cannot_see_a_minority_tier_objective]]
+                p = prev.get(k)
+                if p and b["n"] > p["n"]:
+                    dn = b["n"] - p["n"]
+                    dp = b["pass"] - p["pass"]
+                    dfu = ((b["under"] - p["under"]) / dp) if dp > 0 else float("nan")
+                    print(f"      {'':16s}   since={dn:5d} pass={dp / dn:.3f} "
+                          f"tok={(b['tok'] - p['tok']) / dn:7.0f} "
+                          f"clip={(b['clip'] - p['clip']) / dn:.3f} "
+                          f"frac_under_budget={dfu:.3f} "
+                          f"mean_r={(b['r'] - p['r']) / dn:.3f}", flush=True)
+                prev[k] = {q: b[q] for q in ("n", "pass", "tok", "clip", "r", "under")}
             if sh:
+                mark = state.get("share_mark", 0)
+                fresh = sh[mark:]
+                state["share_mark"] = len(sh)
+                iv = (f" interval={sum(fresh) / len(fresh):.3f} over {len(fresh)}"
+                      if fresh else "")
                 print(f"      length_share (within-group, among passers): "
-                      f"mean={sum(sh)/len(sh):.3f} n_groups={len(sh)}  "
+                      f"mean={sum(sh)/len(sh):.3f} n_groups={len(sh)}{iv}  "
                       f"[v1 died at 0.113 and falling]", flush=True)
+            gc = state.get("gcls") or {}
+            gprev = state.setdefault("gcls_prev", {})
+            for tk in sorted(gc):
+                g = gc[tk]
+                tot_g = sum(g.values())
+                if not tot_g:
+                    continue
+                # Cumulative AND interval: gcls is never cleared, so the cumulative
+                # share is a running mean that lags a real change for many steps.
+                # [[feedback_a_pool_wide_metric_cannot_see_a_minority_tier_objective]]
+                pv = gprev.get(tk, {"lt2pass": 0, "allover": 0, "graded": 0})
+                dn = sum(g[q] - pv[q] for q in g)
+                iv = ""
+                if dn:
+                    iv = ("  | since: graded=%.3f CLAMP-DEAD=%.3f dead=%.3f over %d"
+                          % ((g["graded"] - pv["graded"]) / dn,
+                             (g["allover"] - pv["allover"]) / dn,
+                             (g["lt2pass"] - pv["lt2pass"]) / dn, dn))
+                print(f"      group classes {tk:<14} graded={g['graded']} "
+                      f"({g['graded'] / tot_g:.3f})  "
+                      f"CLAMP-DEAD(all passers over budget)={g['allover']} "
+                      f"({g['allover'] / tot_g:.3f})  "
+                      f"dead(<2 passers, NOT the clamp)={g['lt2pass']} "
+                      f"({g['lt2pass'] / tot_g:.3f}){iv}", flush=True)
+                gprev[tk] = dict(g)
         return rewards
 
     reward.__name__ = "efficiency_budget_reward"

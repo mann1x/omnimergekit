@@ -63,21 +63,24 @@ check("failure is exactly 0.0", rs[2] == 0.0, f"got {rs[2]}")
 
 print("\n=== 2. budget WAY BELOW distribution -> length term is CONSTANT (dead) ===")
 lens = [420, 700, 1150, 1600, 2400, 7600]  # measured-shape, right-skewed
-rs = run(lens, [True] * 4, budget=100, lam=0.5)
+rs = run(lens, [True] * len(lens), budget=100, lam=0.5)  # len(correct) MUST
+# match len(lens): zip() truncates comps while n=len(lengths) sizes prompts/
+# metas, and the group then indexes past ok_i. This test never ran until
+# 2026-09-09 because of that mismatch.
 sd = st.pstdev(rs)
 check("all passers clip to lenpen=1.0 -> zero spread", sd == 0.0,
       f"rewards={[round(x,3) for x in rs]} pstdev={sd:.6f}")
 check("this is the SILENT death mode (cancels under scale_rewards=group)", sd == 0.0)
 
 print("\n=== 3. budget WAY ABOVE distribution -> length term is negligible ===")
-rs_hi = run(lens, [True] * 4, budget=10_000_000, lam=0.5)
+rs_hi = run(lens, [True] * len(lens), budget=10_000_000, lam=0.5)
 sd_hi = st.pstdev(rs_hi)
 check("spread is ~0 but NOT identically 0", 0.0 < sd_hi < 1e-3,
       f"pstdev={sd_hi:.3e}")
 
 print("\n=== 4. budget at the P35 quantile (AN operating point) -> real spread ===")
 budget = budget_from_lengths(lens, q=0.35)
-rs_ok = run(lens, [True] * 4, budget=budget, lam=0.5)
+rs_ok = run(lens, [True] * len(lens), budget=budget, lam=0.5)
 sd_ok = st.pstdev(rs_ok)
 check("spread is materially larger than the too-high case", sd_ok > 100 * sd_hi,
       f"budget={budget} pstdev={sd_ok:.4f} vs too_high={sd_hi:.3e}")
@@ -124,6 +127,37 @@ print("\n=== 7. CENSORED rollout is never credited as a passer ===")
 rs = run([50], [True], budget=1000, lam=0.5, max_completion=50)
 # mk(50) emits exactly 50 tokens, so nt >= max_completion holds.
 check("rollout at the completion cap scores 0.0", rs[0] == 0.0, f"got {rs[0]}")
+
+print("\n=== 9. group census is PER TIER, not pooled ===")
+# The pool is 60/40 driver/replay over tiers with different jobs. A pooled census
+# averages them and cannot see the tier carrying the objective go dead -- on
+# 2026-09-09 it read "clamp-dead 12.5%, the minor mode" while the clamp was in fact
+# flattening the ENTIRE brevity replay. Three groups with deliberately opposite
+# failure modes; pooled they read a flat 33/33/33 and say nothing.
+r9 = make_efficiency_reward(FakeTok(), None, 100000)
+_c, _p, _m, _g = [], [], [], []
+
+
+def _grp(tag, think, lens, budget, correct):
+    for L, c in zip(lens, correct):
+        _c.append(mk(L, c)); _p.append(tag); _g.append("C")
+        _m.append({"reward_kind": "mc_letter", "length_lambda": 0.8,
+                   "length_budget": budget, "think": think})
+
+
+_grp("d1", True, [200, 400, 600, 800], 2000, [True] * 4)                    # graded
+_grp("d2", True, [200, 400, 600, 800], 2000, [True, False, False, False])   # <2 pass
+_grp("r1", False, [3000, 4000, 5000, 6000], 831, [True] * 4)                # clamp-dead
+for _ in range(4):
+    r9(_c, prompts=_p, gold=_g, meta=_m)
+_st = r9._state["gcls"]
+_T, _N = _st.get("mc_letter/T", {}), _st.get("mc_letter/N", {})
+check("census is keyed by tier", set(_st) == {"mc_letter/T", "mc_letter/N"},
+      f"keys={sorted(_st)}")
+check("replay tier shows CLAMP-DEAD only",
+      _N.get("allover") and not _N.get("graded") and not _N.get("lt2pass"), f"{_N}")
+check("driver tier shows graded + <2pass, no clamp-dead",
+      _T.get("graded") and _T.get("lt2pass") and not _T.get("allover"), f"{_T}")
 
 print("\n=== 8. replay tier (lambda=0) is pure correctness ===")
 rs = run([10, 9000], [True, True], budget=None, lam=0.0)
