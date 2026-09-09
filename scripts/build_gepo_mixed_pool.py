@@ -114,8 +114,39 @@ def main() -> int:
                     help="Refuse above this. Default admits the 849-row run4 pool "
                          "(67.7 h at the measured mixed-pool rate), which the previous "
                          "default of 32 h rejected.")
+    ap.add_argument("--lcb-difficulty", default="",
+                    help="Comma list of meta.difficulty values to keep from the LCB "
+                         "pool (e.g. 'easy'). Empty = all. The lcb_v6_77q bench that "
+                         "produced the 'LCB is always ~12.7k tok' figure is medium+hard "
+                         "BY CONSTRUCTION and contains zero easy problems, so an "
+                         "easy-only cut is a different length regime, not the same "
+                         "tier sampled smaller.")
+    ap.add_argument("--gpqa-lambda", type=float, default=0.0,
+                    help="length_lambda for the GPQA no-think tier. Default 0.0 = pure "
+                         "replay. A small positive value makes it a cheap BREVITY tier: "
+                         "measured p50 1595 tok with max 7612, so the tail it would "
+                         "compress is real, at ~8x less generation than LCB.")
+    ap.add_argument("--lcb-lambda", type=float, default=0.7,
+                    help="length_lambda for the lcb_exec tier.")
+    ap.add_argument("--budgets", default="",
+                    help="JSON file mapping tier key ('<reward_kind>/<T|N>') to an "
+                         "integer length_budget, written onto meta.length_budget. "
+                         "Derive it from MEASURED passing lengths with the smoke "
+                         "(grpo_reward_efficiency.budget_from_lengths); never guess.")
+    ap.add_argument("--allow-unset-budget", action="store_true",
+                    help="Permit lambda>0 rows with no length_budget. Only for the "
+                         "PRE-SMOKE build whose whole purpose is to measure the "
+                         "lengths a budget will later be derived from.")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
+
+    budgets: dict[str, int] = {}
+    if a.budgets:
+        bp = pathlib.Path(a.budgets)
+        if not bp.is_file():
+            sys.exit(f"REFUSE: --budgets {bp} does not exist.")
+        budgets = {k: int(v) for k, v in json.loads(bp.read_text()).items()}
+        print(f"budgets: {budgets}")
 
     def load(p):
         f = pathlib.Path(p)
@@ -124,6 +155,13 @@ def main() -> int:
         return [json.loads(x) for x in f.open() if x.strip()]
 
     lcb, rep = load(a.lcb_pool), load(a.replay_pool)
+    if a.lcb_difficulty:
+        want_diff = {x.strip() for x in a.lcb_difficulty.split(",") if x.strip()}
+        before = len(lcb)
+        lcb = [r for r in lcb if (r.get("meta") or {}).get("difficulty") in want_diff]
+        print(f"lcb difficulty filter {sorted(want_diff)}: {before} -> {len(lcb)} rows")
+        if not lcb:
+            sys.exit(f"REFUSE: no LCB rows match difficulty {sorted(want_diff)}.")
     for r in lcb:
         r.setdefault("meta", {}).setdefault("reward_kind", "lcb_exec")
     by: dict[str, list] = {}
@@ -194,8 +232,28 @@ def main() -> int:
                         "or missing makes the reward correctness-only and the tier "
                         "teaches nothing about brevity. Rebuild the pool with "
                         "build_gepo_efficiency_pool.py --length-lambda.")
+            elif kind == "lcb_exec":
+                m["length_lambda"] = a.lcb_lambda
+            elif kind == "mc_letter":
+                m["length_lambda"] = a.gpqa_lambda
             else:
-                m.setdefault("length_lambda", 0.7 if kind == "lcb_exec" else 0.0)
+                m.setdefault("length_lambda", 0.0)
+            # PER-TIER budget. One global budget cannot sit at a low quantile of two
+            # tiers whose medians differ by 4-8x -- it would put one tier on the
+            # sloped part of the penalty and pin every other tier at a constant,
+            # which cancels exactly under scale_rewards='group' and contributes no
+            # gradient at all. So the budget is written per row, from the tier key.
+            tier_key = f"{m['reward_kind']}/{'T' if m.get('think') else 'N'}"
+            if tier_key in budgets:
+                m["length_budget"] = budgets[tier_key]
+            if float(m.get("length_lambda") or 0) > 0 and not m.get("length_budget"):
+                if not a.allow_unset_budget:
+                    sys.exit(
+                        f"REFUSE: tier {tier_key} carries length_lambda="
+                        f"{m['length_lambda']} but no length_budget. The absolute-budget "
+                        "reward has no length term without one, so the tier would train "
+                        "as pure correctness while the pool reported it as a driver. "
+                        "Pass --budgets, or --allow-unset-budget for a pre-smoke pool.")
             rows.append({"id": f"{r['id']}#{'T' if think else 'N'}",
                          "source": r.get("source", kind),
                          "prompt": r["prompt"], "gold": str(r.get("gold") or ""),
@@ -241,6 +299,15 @@ def main() -> int:
         comp[f"{r['meta']['reward_kind']}/{'think' if r['meta']['think'] else 'nothink'}"] = \
             comp.get(f"{r['meta']['reward_kind']}/{'think' if r['meta']['think'] else 'nothink'}", 0) + 1
     print("composition:", dict(sorted(comp.items())))
+    tiers: dict[str, tuple] = {}
+    for r in rows:
+        m = r["meta"]
+        tiers[f"{m['reward_kind']}/{'T' if m.get('think') else 'N'}"] = (
+            m.get("length_lambda"), m.get("length_budget"))
+    print("per-tier lambda / budget:")
+    for k, (lam, bud) in sorted(tiers.items()):
+        role = "DRIVER" if float(lam or 0) > 0 else "replay"
+        print(f"    {k:16s} lambda={lam}  budget={bud}  ({role})")
     print(f"PRICED at G={a.group}: {cost/1e6:.2f}M tokens -> ~{hours:.1f} h "
           f"at {a.rate/1000:.0f}k tok/h")
     if hours > a.hours_budget:

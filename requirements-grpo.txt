@@ -1,0 +1,70 @@
+# omk-grpo -- dedicated environment for GRPO efficiency training.
+#
+# WHY A SEPARATE ENV. Three envs on bs2 have incompatible pins and none of them can
+# host this run:
+#   omnimergekit  trl 1.9.0 / torch 2.10.0+cu128 / transformers 5.5.0  -- the analysis,
+#                 surgery and eval env. TRL is too old for this recipe.
+#   vllm          vllm 0.20.2, serving only. PINNED -- DO NOT MODIFY.
+#   omk-grpo      this file.
+#
+# THE PIN THAT MATTERS: vllm==0.27.1, NOT the newest vLLM.
+# TRL 1.12.0 declares `vllm<=0.27.1,>=0.19.0`. Installing vllm 0.29.0 alongside it
+# satisfies pip (no extra was requested) and then fails at IMPORT:
+#     ImportError: cannot import name 'NCCLTrainerSendWeightsArgs'
+#       from 'vllm.distributed.weight_transfer.nccl_engine'
+# vLLM 0.29.0 renamed that symbol. Always install through the extra -- `trl[vllm]` --
+# so the resolver enforces the ceiling instead of leaving it to be discovered at run
+# time.
+#
+# Build:
+#   /srv/ml/envs/bin/conda create -y -n omk-grpo python=3.11
+#   /srv/ml/envs/envs/omk-grpo/bin/pip install -r requirements-grpo.txt
+# Verify (must print PRESENT for every knob and load the Gemma-4 config):
+#   /srv/ml/envs/envs/omk-grpo/bin/python scripts/probe_grpo_env.py
+#
+# Hardware this was resolved against: bs2, 2x RTX PRO 6000 Blackwell (sm_120), so the
+# torch wheel is a CUDA 13.0 build. sm_120 needs cu128 or newer -- an older CUDA wheel
+# will import fine and then fail to launch kernels.
+
+trl[vllm]==1.12.0
+vllm==0.27.1
+
+# THE SECOND PIN THAT MATTERS: transformers==5.9.0, NOT the newest.
+# transformers 5.16.1 added a heterogeneity guard that makes `config.head_dim` raise
+# on Gemma-4:
+#     AmbiguousGlobalPerLayerAttributeError: 'head_dim' is a per-layer attribute
+# vLLM 0.27.1 reads it globally while building the engine config, so vLLM CANNOT
+# construct a Gemma-4 engine under 5.16.1 at all.
+# The guard is not paranoia -- head_dim really does vary on Gemma-4 (and on the
+# vendor base, so this is inherent to the family, not the prune): 256 on the 25
+# layers with 8 kv-heads, 512 on the 5 with 2. So setting
+# `allow_global_per_layer_attribute_access` would hand vLLM 256 for layers that need
+# 512, which is precisely the unsafe case the error describes. It is not a fix.
+# 5.9.0 is the version the PROVEN Gemma-4 vLLM serving path already runs (the `vllm`
+# env: vllm 0.20.2 / transformers 5.9.0), it satisfies both ceilings (TRL needs
+# >=4.56.2, vLLM 0.27.1 needs >=5.5.3), and the model it builds is still correctly
+# heterogeneous -- verified on Jprime-p3: k_proj out_features 2048 on 25 layers and
+# 1024 on exactly layers 5/11/17/23/29, with the LoRA scope still 205 modules.
+transformers==5.9.0
+peft==0.20.0
+accelerate==1.14.0
+datasets==5.0.1
+bitsandbytes==0.50.2
+math-verify==0.9.0
+
+# Resolved transitively, recorded so a rebuild is comparable:
+#   torch==2.13.0 (cu130)  transformers==5.16.1  numpy==2.3.5  triton==3.7.1
+# Full lock: requirements-grpo.lock.txt
+
+# ---------------------------------------------------------------------------
+# MANDATORY POST-INSTALL PATCH -- run after EVERY build/upgrade of this env:
+#     python scripts/patch_flashinfer_py311.py --python <env>/bin/python
+#
+# flashinfer 0.6.16.post3 (a HARD dependency of vllm 0.27.1) annotates
+# `array.array[int]` in comm/fd_exchange.py. That subscript is Python 3.12+ only, so
+# on 3.11 the import raises `TypeError: type 'array.array' is not subscriptable`.
+# vLLM imports flashinfer.comm UNGUARDED when it builds a tensor-parallel group, so
+# the failure is invisible at vllm_tensor_parallel_size=1 and FATAL at 2 -- i.e. it
+# only appears in exactly the topology this recipe uses.
+# The patch adds `from __future__ import annotations` (lazy annotations); a pip
+# reinstall reverts it silently.
