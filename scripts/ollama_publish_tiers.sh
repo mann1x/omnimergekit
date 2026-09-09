@@ -39,6 +39,13 @@ PREFETCH_FLOOR_G="${PREFETCH_FLOOR_G:-100}"
 TIERS="${TIERS:-Q8_0 Q6_K_L Q6_K Q5_K_L Q5_K_M Q5_K_S Q4_K_L Q4_K_M Q4_K_S IQ4_NL IQ4_XS Q3_K_XL Q3_K_L Q3_K_M Q3_K_S IQ3_M Q2_K_L IQ2_M IQ2_XS}"
 
 # Sampler + runtime params baked into every tag. Defaults = the shipped Qwen3.6 coder set.
+# Minimum ollama version, emitted as the Modelfile `REQUIRES` directive
+# (parser/parser.go:136,699 -> server/create.go:68 `config.Requires = r.Requires`).
+# Without it a client on an older ollama pulls the tag, loads it, and dies at render
+# with `unknown renderer "qwen3.8"` instead of getting a clean version refusal. The
+# official library/qwen3.8:27b declares 0.32.12 and so did our own pre-2026-09-09
+# v6 tags; every tag this script published lacked it purely because we never set it.
+OL_REQUIRES="${OL_REQUIRES:-0.32.12}"
 OL_RENDERER="${OL_RENDERER:-qwen3.5}"
 OL_PARSER="${OL_PARSER:-qwen3.5}"
 OL_NUM_CTX="${OL_NUM_CTX:-32768}"
@@ -73,6 +80,102 @@ fi
 # the disk floor mid-campaign (measured: 113G -> 207G over 10 tiers, 2026-08-21).
 [ -f "$GCPY" ] || { say "REFUSE: no ollama_gc_orphans.py next to this script ($GCPY)"; exit 1; }
 
+# Daemon-resolved store, for the no-TEMPLATE gate below. Resolved the way the DAEMON
+# sees it (OLLAMA_MODELS -> unit Environment -> daemon user's home), never guessed.
+OL_STORE="$("$PY" "$GCPY" --print-store 2>/dev/null | tail -1)"
+[ -d "$OL_STORE/manifests" ] || { say "REFUSE: cannot resolve the ollama store (got '$OL_STORE'); the no-TEMPLATE gate cannot run and this script will not publish blind."; exit 1; }
+say "store: $OL_STORE"
+
+# HARD GATE. `TEMPLATE {{ .Prompt }}` was introduced in ca77bfe and shipped on every
+# tag this script published until 2026-09-09, including via the VISION path, which
+# rebuilt its Modelfile from `ollama show --modelfile` -- and ollama SYNTHESISES a
+# TEMPLATE line into that output even when the source Modelfile had none. A comment
+# alone did not stop it coming back, so this refuses to push instead.
+#
+# Gates on the STORED MANIFEST, not on the Modelfile we wrote and not on
+# `ollama show` (which synthesises the very line under test).
+SANITIZE_PY='
+import sys
+has_tmpl, req = sys.argv[1] == "1", sys.argv[2]
+out, saw_req = [], False
+for ln in sys.stdin.read().splitlines():
+    st = ln.strip()
+    if st.startswith("TEMPLATE ") and not has_tmpl:
+        continue
+    if st.startswith("REQUIRES "):
+        saw_req = True
+    out.append(ln)
+if req and not saw_req:
+    idx = next((i for i, l in enumerate(out) if l.strip().startswith("FROM ")), -1)
+    out.insert(idx + 1, "REQUIRES " + req)
+sys.stdout.write("\n".join(out) + "\n")
+'
+
+sanitize_shown_modelfile(){
+  # `ollama show --modelfile <tag>` is NOT a faithful round-trip of what was stored.
+  # Measured 2026-09-09 on mannix/omnimerge-v6:IQ2_S:
+  #   TEMPLATE  stored: NO template layer     shown: `TEMPLATE {{ .Prompt }}` INVENTED
+  #   REQUIRES  stored: requires "0.32.12"    shown: OMITTED entirely
+  # Anything rebuilt from that output therefore GAINS a template the model never had
+  # and LOSES its version floor -- which is exactly how the vision tags acquired a
+  # template after it had been removed from the text path.
+  #
+  # This repairs the shown Modelfile against the STORED BLOBS, which are the truth:
+  #   * drop every TEMPLATE line when the manifest has NO template layer
+  #     (keep it when there IS one -- then the template is real and must survive)
+  #   * re-add REQUIRES from the config blob when the config carries one and the
+  #     shown output dropped it
+  # $1 = full tag, stdin = `ollama show --modelfile` output, stdout = repaired.
+  local full="$1" name tg mf cd cfg has_tmpl req
+  name="${full%%:*}"; tg="${full##*:}"
+  mf="$OL_STORE/manifests/registry.ollama.ai/$name/$tg"
+  if [ ! -f "$mf" ]; then say "  REFUSE: cannot sanitize $full -- no stored manifest"; return 1; fi
+  has_tmpl=0
+  grep -q "vnd\.ollama\.image\.template" "$mf" && has_tmpl=1
+  cd="$("$PY" -c 'import json,sys;print(json.load(open(sys.argv[1]))["config"]["digest"].replace(":","-"))' "$mf")" || return 1
+  cfg="$OL_STORE/blobs/$cd"
+  req="$("$PY" -c 'import json,sys;print(json.load(open(sys.argv[1])).get("requires") or "")' "$cfg" 2>/dev/null)"
+  # NOTE: `$PY - <<HEREDOC` would feed the PROGRAM on stdin and leave nothing for the
+  # script to read -- caught by the truth-table test, which returned only the REQUIRES
+  # line. Pass the code with -c so stdin stays the piped Modelfile.
+  "$PY" -c "$SANITIZE_PY" "$has_tmpl" "$req"
+}
+
+assert_stored_identity(){
+  # Gate on the STORED ARTIFACTS -- the manifest and the config/params blobs the
+  # daemon actually wrote -- never on `ollama show --modelfile`. Measured 2026-09-09
+  # on IQ2_S, `ollama show` is BOTH lossy and inventive:
+  #     requires        stored 0.32.12          shown: OMITTED   -> false "missing"
+  #     template layer  stored: ABSENT          shown: TEMPLATE {{ .Prompt }} INVENTED
+  # so it would hide a real REQUIRES drop and report a TEMPLATE that does not exist.
+  # ollama also returns success for Modelfile directives it silently ignores, which is
+  # why every field is verified after the fact rather than trusted from the write.
+  local full="$1" name tg mf cd cfg
+  name="${full%%:*}"; tg="${full##*:}"
+  mf="$OL_STORE/manifests/registry.ollama.ai/$name/$tg"
+  if [ ! -f "$mf" ]; then say "  REFUSE: no stored manifest at $mf"; return 1; fi
+  if grep -q "vnd\.ollama\.image\.template" "$mf"; then
+    say "  REFUSE: $full carries a TEMPLATE layer. The RENDERER is the chat format; a"
+    say "          passthrough TEMPLATE beside it is redundant at best and overrides it"
+    say "          at worst. Never rebuild a Modelfile from \`ollama show --modelfile\`,"
+    say "          which synthesises one. NOT PUSHING."
+    return 1
+  fi
+  cd="$("$PY" -c 'import json,sys;print(json.load(open(sys.argv[1]))["config"]["digest"].replace(":","-"))' "$mf")" || {
+    say "  REFUSE: cannot read config digest from $mf"; return 1; }
+  cfg="$OL_STORE/blobs/$cd"
+  [ -f "$cfg" ] || { say "  REFUSE: config blob $cfg missing"; return 1; }
+  "$PY" - "$cfg" "$OL_RENDERER" "$OL_PARSER" "$OL_REQUIRES" <<'PYGATE'
+import json, sys
+c = json.load(open(sys.argv[1]))
+want = {"renderer": sys.argv[2], "parser": sys.argv[3], "requires": sys.argv[4]}
+bad = [f"{k}={c.get(k)!r} want {v!r}" for k, v in want.items() if v and c.get(k) != v]
+if bad:
+    print("  REFUSE: stored config mismatch -- " + "; ".join(bad))
+    sys.exit(1)
+PYGATE
+}
+
 # `ollama push` PRINTS an auth error and EXITS 0 (2026-05-18: 31 tags reported DONE, zero
 # uploaded, ~150 GB egress wasted). The OUTPUT is the success signal, not $?.
 # Failure markers must be PHRASES. A bare "401" matched "401 MB" in the progress counter and
@@ -98,17 +201,19 @@ push_checked(){   # $1 = tag, $2 = logfile
 }
 
 emit_params(){   # shared by text and vision so the two can never drift apart
-  # DO NOT ADD A `TEMPLATE` LINE HERE. One was added in ca77bfe (2026-08-21) as
-  # `TEMPLATE {{ .Prompt }}`, on the mistaken belief that `ollama create` needs a
-  # template when a RENDERER is set. It does not, and it is not inert: every tag
-  # published through this script carried an invented passthrough template AND lost
-  # the `requires` version floor, while tags published by the older path kept it.
-  #     ornith:Q6_K   (this script)  template '{{ .Prompt }}'  requires None
-  #     coderx:Q4_K_M (this script)  template '{{ .Prompt }}'  requires None
-  #     omnimerge-v4  (older path)   template NONE             requires 0.30.0
-  # `requires` is what stops an older ollama pulling a tag that loads and then fails
-  # at render. The RENDERER is the chat format; a TEMPLATE alongside it is at best
-  # redundant and at worst overrides it. Removed 2026-09-09.
+  # DO NOT ADD A `TEMPLATE` LINE HERE, and do not rebuild a Modelfile from
+  # `ollama show --modelfile` -- it SYNTHESISES one. `TEMPLATE {{ .Prompt }}` was
+  # added in ca77bfe (2026-08-21) on the mistaken belief that `ollama create` needs a
+  # template when a RENDERER is set. It does not. The RENDERER *is* the chat format;
+  # a passthrough TEMPLATE beside it is redundant at best and overrides it at worst.
+  # It shipped on every tag this script published until 2026-09-09, and on the vision
+  # tags it survived the first removal because that path went through `ollama show`.
+  # assert_no_template() now refuses to push a tag whose STORED manifest has one.
+  #
+  # NOTE: an earlier note here claimed the TEMPLATE line suppressed `requires`. That
+  # was WRONG and is retracted -- `requires` was absent simply because we never
+  # emitted the directive. Both facts are independent; see OL_REQUIRES above.
+  [ -n "$OL_REQUIRES" ] && echo "REQUIRES $OL_REQUIRES"
   echo "RENDERER $OL_RENDERER"
   echo "PARSER $OL_PARSER"
   echo "PARAMETER num_ctx $OL_NUM_CTX"
@@ -171,10 +276,12 @@ PYEOF
 
   # Gate on what ollama STORED, never on the Modelfile we just wrote: ollama returns HTTP 200
   # for options it does not recognise, so an unsupported PARAMETER is silently dropped.
-  MF=$(ollama show --modelfile "$TXT" 2>&1)
   ok=1
-  grep -q "^RENDERER $OL_RENDERER" <<<"$MF" || { say "$T: RENDERER missing"; ok=0; }
-  grep -q "^PARSER $OL_PARSER"     <<<"$MF" || { say "$T: PARSER missing"; ok=0; }
+  # RENDERER/PARSER/REQUIRES are verified from the STORED CONFIG by
+  # assert_stored_identity below, not from `ollama show` -- see the note there.
+  # Repaired against the stored blobs first: `ollama show` invents a TEMPLATE and
+  # drops REQUIRES, so an unrepaired read gates on fiction in both directions.
+  MF=$(ollama show --modelfile "$TXT" 2>&1 | sanitize_shown_modelfile "$TXT")
   if [ "$DRAFT_N" != 0 ]; then
     grep -q "^PARAMETER draft_num_predict $DRAFT_N" <<<"$MF" \
       || { say "$T: draft_num_predict DROPPED"; ok=0; }
@@ -182,7 +289,12 @@ PYEOF
   [ "$ok" = 1 ] || { say "$T: GATE FAIL, not pushing"; continue; }   # keep $G for retry
 
   if [ "$MMPROJ" != none ]; then
-    { ollama show --modelfile "$TXT" | grep -v '^#'; echo "FROM $MMPROJ"; } > "$WORK/Modelfile.vis.$T"
+    # Build the vision Modelfile from emit_params DIRECTLY -- never by round-tripping
+    # through `ollama show --modelfile`, which SYNTHESISES a `TEMPLATE {{ .Prompt }}`
+    # line that was never in the text Modelfile. Measured 2026-09-09 on IQ2_S: the text
+    # tag came out with template NONE and the vision tag with '{{ .Prompt }}', so the
+    # two tags silently diverged on the exact axis emit_params exists to keep identical.
+    { echo "FROM $G"; echo "FROM $MMPROJ"; emit_params; } > "$WORK/Modelfile.vis.$T"
     ollama create "$VIS" -f "$WORK/Modelfile.vis.$T" >"$WORK/create.vis.$T.log" 2>&1 \
         || { say "$T: create vision FAILED"; ok=0; }
     if [ "$ok" = 1 ]; then
@@ -192,7 +304,7 @@ PYEOF
       vshow=""; vmf=""
       for try in 1 2 3 4 5; do
         vshow=$(ollama show "$VIS" 2>&1)
-        vmf=$(ollama show --modelfile "$VIS" 2>&1)
+        vmf=$(ollama show --modelfile "$VIS" 2>&1 | sanitize_shown_modelfile "$VIS")
         grep -qi vision <<<"$vshow" && { [ "$DRAFT_N" = 0 ] || grep -q "^PARAMETER draft_num_predict $DRAFT_N" <<<"$vmf"; } && break
         say "$T: vision probe attempt $try inconclusive, retrying"
         sleep 10
@@ -206,6 +318,11 @@ PYEOF
     [ "$ok" = 1 ] || { say "$T: VISION GATE FAIL, pushing neither"; ollama rm "$TXT" "$VIS" >/dev/null 2>&1; continue; }
   fi
 
+
+  assert_stored_identity "$TXT" || { say "$T: IDENTITY GATE FAIL"; ollama rm "$TXT" "$VIS" >/dev/null 2>&1; continue; }
+  if [ "$MMPROJ" != none ]; then
+    assert_stored_identity "$VIS" || { say "$T: IDENTITY GATE FAIL (vision)"; ollama rm "$TXT" "$VIS" >/dev/null 2>&1; continue; }
+  fi
 
   if [ "$MMPROJ" = none ]; then say "$T: gates OK — pushing $TXT (text-only)"
   else say "$T: gates OK — pushing $TXT and $VIS"; fi

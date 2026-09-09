@@ -50,6 +50,11 @@ def resolve_store() -> str:
 def main() -> int:
     apply = "--apply" in sys.argv
     root = resolve_store()
+    if "--print-store" in sys.argv:
+        # Used by ollama_publish_tiers.sh's no-TEMPLATE gate so it locates stored
+        # manifests the way the DAEMON does, never from a guessed literal path.
+        print(root)
+        return 0
     mdir, bdir = os.path.join(root, "manifests"), os.path.join(root, "blobs")
     if not os.path.isdir(mdir) or not os.path.isdir(bdir):
         print(f"REFUSE: {root} does not look like an ollama store")
