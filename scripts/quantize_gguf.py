@@ -201,30 +201,43 @@ def verify_mtp_in_gguf(f16_gguf: Path, mtp_info: dict, tools: dict) -> None:
     only when llama-gguf is not on the system (CD/quant builds without
     the inspector tool).
     """
-    llama_gguf = Path(tools["quantize"]).parent / "llama-gguf"
-    if not llama_gguf.exists():
-        print("  MTP verify: llama-gguf not found; skipping post-conversion "
-              "check (rely on tier-level visibility).", flush=True)
-        return
     block_idx = mtp_info["mtp_block_idx"]
     expected_prefix = f"blk.{block_idx}."
+
+    # Read the ARTIFACT, not a tool's stdout. The previous implementation shelled
+    # out to `llama-gguf r <file>` and grepped the text. Two ways that lies:
+    #   * argument order is `llama-gguf <file> <r|w>` -- `r` first makes the tool
+    #     abort on GGML_ASSERT(mode == "r" || "w"), and
+    #   * subprocess ran with check=False, so a CRASHED probe produced empty
+    #     output that was read as "the tensor is absent".
+    # Result on llama.cpp 0.4.0 (2026-09-08): a guaranteed false negative that
+    # hard-failed every MTP build, on a GGUF that provably had blk.40 + 4 nextn
+    # tensors. A probe that cannot fail loudly must not gate a build.
     try:
-        result = subprocess.run(
-            [str(llama_gguf), "r", str(f16_gguf)],
-            capture_output=True, text=True, timeout=180, check=False,
-        )
-    except Exception as exc:  # noqa: BLE001
-        print(f"  MTP verify: llama-gguf failed ({exc}); skipping check.",
+        from gguf import GGUFReader
+    except ImportError:
+        print("  MTP verify: python `gguf` not importable; skipping "
+              "post-conversion check (rely on tier-level visibility).",
               flush=True)
         return
-    output = (result.stdout or "") + (result.stderr or "")
+    try:
+        reader = GGUFReader(str(f16_gguf))
+        names = [tensor.name for tensor in reader.tensors]
+    except Exception as exc:  # noqa: BLE001
+        # Could not READ the file -> unknown, not absent. Never convert an
+        # inability to check into a failed check.
+        print(f"  MTP verify: could not read {f16_gguf.name} ({exc}); "
+              "skipping check.", flush=True)
+        return
+    output = "\n".join(names)
     if expected_prefix not in output:
         raise RuntimeError(
             f"MTP head detected in source ({mtp_info['mtp_tensor_count']} "
             f"mtp.* tensors, expected blk.{block_idx}.* in GGUF) but "
-            f"{f16_gguf.name} does NOT contain {expected_prefix}* — "
-            "convert_hf_to_gguf.py likely doesn't have MTP support for "
-            "this architecture. Update llama.cpp to a version including "
+            f"{f16_gguf.name} does NOT contain {expected_prefix}* "
+            f"(read back {len(names)} tensors from the file itself). "
+            "Most likely convert_hf_to_gguf.py lacks MTP support for this "
+            "architecture — update llama.cpp to a version including "
             "PR #20533 (Qwen3.5/3.6) or the equivalent for your arch."
         )
     mtp_in_gguf = sum(1 for ln in output.splitlines() if expected_prefix in ln)
