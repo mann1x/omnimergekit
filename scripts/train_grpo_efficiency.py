@@ -140,6 +140,14 @@ def main() -> int:
     ap.add_argument("--vllm-tp", type=int, default=2,
                     help="Model split across both GPUs for generation (colocate).")
     ap.add_argument("--vllm-mem", type=float, default=0.30)
+    ap.add_argument("--no-vllm-sleep", dest="vllm_sleep", action="store_false",
+                    help="Keep vLLM resident through the training step. DEFAULT IS "
+                         "SLEEP ON: at TP=2 colocate on 2x96 GB, a 39 GB DDP policy "
+                         "replica plus vLLM's held 28.7 GB leaves ~5 GB, and the "
+                         "reference-logprob fp32 logits upcast alone wants 8.00 GB. "
+                         "Only pass this if the model is small enough that vLLM's "
+                         "share is genuinely spare.")
+    ap.set_defaults(vllm_sleep=True)
     # --- optimisation (an-finetune values) ---
     ap.add_argument("--lr", type=float, default=1e-6)
     ap.add_argument("--beta", type=float, default=0.04,
@@ -202,6 +210,45 @@ def main() -> int:
     print(f">>> EOG ids (literal, from generation_config): {eog}", flush=True)
 
     tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=True)
+
+    # ---- reassert the EOG that transformers collapses at load -------------------
+    # transformers "aligns" model + generation config to the TOKENIZER's scalar and
+    # announces it:
+    #     Updated tokens: {'eos_token_id': 1, 'bos_token_id': 2, 'pad_token_id': 0}
+    # so eos collapses from [1, 106, 50] to 1. resolve_eog() cannot catch this: it
+    # validates the FILE, and the override happens afterwards, in memory.
+    #
+    # Generation is NOT affected -- vLLM reads generation_config.json from disk
+    # itself, which the 2026-09-09 smoke proved empirically (reward clip=0.000, mean
+    # completion 961-2871 tok against an 8192 cap). What breaks is TRL's ACCOUNTING:
+    #     grpo_trainer.py:1917   is_eos = completion_ids == self._tokenizer.eos_token_id
+    # a SCALAR compare. With eos=1 nothing ever matches, every completion is called
+    # truncated, mask_truncated_completions=True masks all of them, and the run
+    # reports loss 0 / grad_norm nan -- i.e. it trains on NOTHING while looking alive.
+    #
+    # TRL's check is scalar, so it CANNOT represent {1, 106, 50}. We give it the id
+    # the model actually ends turns with: <turn|> = 106. Any completion ending on 1
+    # or 50 is still miscounted, which is why the assertion below is a LOUD warning
+    # and not a silent fix -- if clipped_ratio stays 1.000 after this, 106 is the
+    # wrong choice and the terminal-token distribution must be measured directly.
+    TURN_END = 106
+    prev_eos = tok.eos_token_id
+    if TURN_END not in eog:
+        sys.exit(f"REFUSE: turn terminator {TURN_END} is not in the resolved EOG {eog}; "
+                 "do not guess a stop id.")
+    if prev_eos != TURN_END:
+        tok.eos_token_id = TURN_END
+        print(f">>> EOS REASSERTED for TRL accounting: tokenizer.eos_token_id "
+              f"{prev_eos} -> {TURN_END} (<turn|>). Full EOG {eog} stays in "
+              f"generation_config for vLLM. TRL's is_eos check is a SCALAR compare, "
+              f"so completions ending on {sorted(set(eog) - {TURN_END})} are still "
+              f"counted truncated; if completions/clipped_ratio stays ~1.000 this "
+              f"choice is wrong -- measure the terminal-token distribution.",
+              flush=True)
+    else:
+        print(f">>> EOS already {TURN_END}; no reassertion needed", flush=True)
+    # -----------------------------------------------------------------------------
+
     rows = load_pool(a.pool)
 
     if a.smoke:
@@ -267,6 +314,28 @@ def main() -> int:
         # --- an-finetune method: TRL defaults, explicit so a default change is loud ---
         loss_type="dapo",
         importance_sampling_level="token",
+        # The line ABOVE sets the POLICY-side IS granularity. `vllm_importance_sampling_mode`
+        # is a DIFFERENT knob -- the vLLM-vs-trainer distribution correction -- and TRL
+        # 1.12 defaults it to `sequence_mask` with clip_max=3.0 / clip_min=None. That
+        # default is wrong for this run and was never a choice; pinning it here for the
+        # same reason every other TRL default in this block is pinned: so a default
+        # change is LOUD.
+        #
+        # `sequence_mask` forms exp(SUM of signed per-token logp deltas) over the WHOLE
+        # completion, then masks any sequence above clip_max to EXACTLY 0. Our
+        # completions run 1600-8200 tokens, so that sum has no realistic chance of
+        # landing inside (0, 3.0]: it either clears the cap and is zeroed, or underflows
+        # toward 0. Measured on the 2026-09-09 eos-fix smoke, with the completion mask no
+        # longer hiding it:
+        #     step1  logp_diff/mean 1.128 max 37.64   is_ratio min 0 mean 0.0925 max 1.776
+        #     step2  logp_diff/mean 0.923 max 35.17   is_ratio min 0 mean 0.1696 max 1.406
+        # i.e. ~83-91% of the batch contributed NOTHING, and DAPO's token-count
+        # normaliser can then divide by zero -- which is the shape of the `grad_norm nan`
+        # seen from step 1 onward, BEFORE any weight update (step 1 ran at lr=0).
+        #
+        # `token_truncate` matches the granularity the method already declares above and
+        # CLAMPS instead of zeroing, so no exact-zero ratios and no 0/0 denominator.
+        vllm_importance_sampling_mode="token_truncate",
         scale_rewards="group",
         epsilon=0.2,
         beta=a.beta,
@@ -281,6 +350,22 @@ def main() -> int:
         vllm_mode="colocate",
         vllm_tensor_parallel_size=a.vllm_tp,
         vllm_gpu_memory_utilization=a.vllm_mem,
+        # vLLM's share is a CAP IT FILLS AND HOLDS, not a floor it grows into. Without
+        # sleep mode it keeps its weight shard AND its whole KV pool resident THROUGH
+        # the training step -- ~28.7 GiB per card that the optimiser can never use.
+        # That is what killed the 2026-09-09 smoke: the OOM was NOT in the loss (Liger
+        # already fuses that) but in _get_per_token_logps_and_entropies, where
+        # accelerate's convert_to_fp32 upcasts the reference-logprob logits. 8192 tok x
+        # 262,144 vocab x 4 B = exactly the 8.00 GiB it failed to allocate, against
+        # ~5 GiB free. Liger does not cover that path.
+        #
+        # sleep(level=2) after generation discards weights AND kv_cache and gives the
+        # memory back for the forward/backward; TRL re-pushes weights on wake. vLLM's
+        # own kv_cache_memory_bytes would be the finer knob but TRL 1.12 does not
+        # expose it -- releasing the pool entirely is strictly more headroom anyway.
+        # Cost is a per-step weight re-push, which is the right trade when memory, not
+        # time, is the binding constraint.
+        vllm_enable_sleep_mode=a.vllm_sleep,
         # --- optimisation ---
         learning_rate=a.lr,
         lr_scheduler_type="constant_with_warmup",
@@ -323,9 +408,66 @@ def main() -> int:
     print(f">>> torch {torch.__version__} | devices {torch.cuda.device_count()} | "
           f"vllm colocate TP={a.vllm_tp} mem={a.vllm_mem}", flush=True)
 
+    # ------------------------------------------------------------- nan probe
+    # `grad_norm: nan` on EVERY step of the 2026-09-09 eos-fix smoke, including step 1
+    # which ran at lr=0 -- i.e. BEFORE any weight update. The obvious theory says that
+    # must be fatal: clip_grad_norm_ gets total_norm=nan, clip_coef = max/(nan+eps) is
+    # nan, every grad is scaled by nan, and AdamW's addcdiv_ poisons the params even at
+    # lr=0 because 0*nan == nan. But the tiers did NOT collapse -- mc_letter/T held
+    # pass=1.000 across all four steps -- so the theory is wrong somewhere and the
+    # difference matters: a nan that never reaches the weights is a broken METRIC and a
+    # lost update, not a destroyed policy.
+    #
+    # Scan at three points, because they answer different questions:
+    #   on_substep_end        PRE-clip  -- which params the BACKWARD actually made nan.
+    #   on_pre_optimizer_step POST-clip -- whether clipping SMEARED nan across all of
+    #                                      them (it will, if total_norm is nan).
+    #   on_step_end           params    -- whether the optimiser wrote nan into WEIGHTS.
+    # Without the pre-clip scan the post-clip reading is uninformative by construction.
+    # Cheap: LoRA only, a few hundred small tensors.
+    from transformers import TrainerCallback
+
+    class NanProbe(TrainerCallback):
+        def __init__(self, model):
+            self.m, self.sub = model, 0
+
+        def _scan(self, grads: bool):
+            bad, tot, names = 0, 0, []
+            for n, prm in self.m.named_parameters():
+                if not prm.requires_grad:
+                    continue
+                t = prm.grad if grads else prm
+                if t is None:
+                    continue
+                tot += 1
+                if not torch.isfinite(t).all():
+                    bad += 1
+                    if len(names) < 4:
+                        names.append(n.split("base_model.model.")[-1])
+            return bad, tot, names
+
+        def on_substep_end(self, args, state, control, **kw):
+            bad, tot, names = self._scan(grads=True)
+            if bad or self.sub < 2:
+                print(f">>> NANPROBE step={state.global_step} sub={self.sub} "
+                      f"PRE-CLIP grads nonfinite={bad}/{tot} first={names}", flush=True)
+            self.sub += 1
+
+        def on_pre_optimizer_step(self, args, state, control, **kw):
+            bad, tot, names = self._scan(grads=True)
+            print(f">>> NANPROBE step={state.global_step} POST-CLIP grads "
+                  f"nonfinite={bad}/{tot} first={names}", flush=True)
+
+        def on_step_end(self, args, state, control, **kw):
+            bad, tot, names = self._scan(grads=False)
+            print(f">>> NANPROBE step={state.global_step} PARAMS nonfinite={bad}/{tot} "
+                  f"first={names}", flush=True)
+            self.sub = 0
+
     trainer = GRPOTrainer(model=a.model, args=cfg, train_dataset=ds,
                           reward_funcs=[reward], peft_config=peft_cfg,
                           processing_class=tok)
+    trainer.add_callback(NanProbe(trainer.model))
     trainer.train()
 
     if a.smoke:
