@@ -22,3 +22,44 @@ regexes = [
     # Gemma4ForConditionalGeneration blocked recipes/gemma4/ream/.
     '''\b[A-Z][A-Za-z0-9]*For(CausalLM|ConditionalGeneration|SequenceClassification|TokenClassification|MaskedLM|QuestionAnswering)\b''',
 ]
+
+# ---------------------------------------------------------------------------
+# GATED EVAL CONTENT — not a credential, but the same class of mistake: content
+# that must never reach a public repo, caught by the machine rather than by
+# someone remembering to look.
+#
+# Origin: 2026-09-09. A tier census on 2026-09-08 correctly withheld
+# `router_calib_corpus_ornith.jsonl` (80 gpqa_diamond rows). The audit today
+# found `router_calib_corpus_qwen.jsonl` — md5-IDENTICAL, same 80 Diamond rows —
+# already tracked and public. The withhold was keyed on the FILENAME, and the
+# same bytes under another name walked straight past it. Nine tracked .jsonl
+# files carry Diamond questions verbatim.
+#
+# GPQA is gated precisely so its items stay out of crawls and pretraining sets;
+# it ships a per-row canary for exactly this purpose. Publishing the items also
+# contaminates the benchmark this project scores its own model cards on.
+#
+# These rules key on CONTENT, never on path or program name.
+# See docs/SECURITY.md and docs/METHOD_grpo_efficiency.md section 7.1.
+
+[[rules]]
+id = "gated-eval-gpqa-canary"
+description = "GPQA canary string — the dataset's own contamination marker. Its presence means raw GPQA rows are in the file."
+regex = '''gpqa:[0-9a-f]{4}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'''
+tags = ["gated-dataset", "contamination", "gpqa"]
+
+[[rules]]
+id = "gated-eval-content-in-data-file"
+description = "A DATA file whose rows are tagged with a gated/frozen eval split. Rendered prompts need not carry the canary, so the row tag is the detector."
+regex = '''"(bench|tier|source|subset|task|split)"\s*:\s*"(gpqa[A-Za-z0-9_]*|lcb_v6_77q|lcb_v6_55|lcb_hard_77|lcb_medium_100|lcb_calib|mbpp_full_test|humaneval_test)"'''
+path = '''\.(jsonl|ndjson|csv|tsv)$'''
+tags = ["gated-dataset", "contamination"]
+
+# NOTE on the LCB alternatives: the frozen EVAL sets are named lcb_v6_77q,
+# lcb_v6_55, lcb_hard_77, lcb_medium_100 and lcb_calib. `lcb_v6_easy` /
+# `lcb_v6_medium` / `lcb_v6_hard` are DIFFICULTY labels on RL-pool rows that
+# build_lcb_rl_pool.py has already gated against every frozen task-id list --
+# they are training data, not eval content. A first draft of this rule matched
+# the difficulty labels and flagged eval/lcb/lcb_rl_pool.jsonl (55) and
+# eval/replay/gepo_mixed_pool.open.jsonl (42); both are legitimate. A gate that
+# cries wolf on correct artifacts is a gate someone switches off.

@@ -1,5 +1,69 @@
 # Security — secrets handling
 
+
+## Gated eval content (GPQA, frozen LCB) — a second class of "never commit"
+
+This repo is public. Alongside credentials there is a second class of content that must
+never reach it: **gated benchmark items in plaintext**. GPQA is gated precisely so its
+questions stay out of crawls and future pretraining sets, and it ships a per-row canary
+for that purpose. Publishing the items also contaminates the benchmarks this project
+scores its own model cards on.
+
+### What went wrong
+
+A tier census on **2026-09-08** correctly withheld
+`recipes/qwen3_6_35b_a3b_prune/results/router_calib_corpus_ornith.jsonl` (80
+`gpqa_diamond` rows). An audit on **2026-09-09** found
+`router_calib_corpus_qwen.jsonl` — **md5-identical, the same 80 Diamond rows** —
+already tracked and public, along with nine other files:
+
+| findings | file |
+|---|---|
+| 396 | `eval_results_vllm_suite/.../samples_gpqa_diamond_cot_zeroshot_*.jsonl` |
+| 209 | `scripts/router_calib_corpus.jsonl` |
+| 100 | `scripts/router_calib_corpus_9bench_balanced.jsonl` |
+| 100 | `scripts/router_calib_corpus_ifeval_heavy.jsonl` |
+| 95 | `eval/efficiency/grpo_pool_v3_presmoke.jsonl` |
+| 80 x4 | `recipes/.../router_calib_corpus_{qwen,coder_qwen,coder_lcbmpe_qwen,coder_lcbmpeife_qwen}.jsonl` |
+| 11 | `scripts/router_calib_corpus_protect.jsonl` |
+
+**The withhold was keyed on the FILENAME, and the same bytes under another name walked
+straight past it.**
+
+### The gate
+
+Two content-keyed gitleaks rules in `.gitleaks.toml`, enforced by the same pre-commit
+hook as the secret scan:
+
+- **`gated-eval-gpqa-canary`** — matches GPQA's own per-row canary (`gpqa:xxxx:<uuid>`).
+  Catches raw dataset rows and lm-eval sample dumps.
+- **`gated-eval-content-in-data-file`** — matches a row tagged with a gated/frozen eval
+  split (`"bench"`/`"tier"`/`"source"`/... = `gpqa*`, `lcb_v6_77q`, `lcb_v6_55`,
+  `lcb_hard_77`, `lcb_medium_100`, `lcb_calib`, `mbpp_full_test`), restricted to data
+  extensions. A rendered prompt need not carry the canary, so the row tag is the
+  detector.
+
+Verified in **both** directions before landing. Catches: 80 findings on
+`router_calib_corpus_qwen.jsonl`, 146 on `grpo_pool_v4_budgeted.jsonl`, 396 on the
+lm-eval samples — counts matching the known row counts exactly. Does **not** fire on
+`build_grpo_pool_v4.py`, `competence_qwen35b.json` (aggregate stats, no question text),
+the drop-map summaries, or `docs/METHOD_grpo_efficiency.md`.
+
+A first draft matched the LCB **difficulty** labels (`lcb_v6_hard` / `lcb_v6_medium`)
+and flagged `eval/lcb/lcb_rl_pool.jsonl` and `eval/replay/gepo_mixed_pool.open.jsonl`,
+both legitimate and already gated by task id. Narrowed. **A gate that cries wolf on
+correct artifacts is a gate someone switches off.**
+
+### Rules
+
+1. **Key the withhold on CONTENT, never on path, program, or filename prefix.**
+2. `.gitignore` entries are convenience only. **Never add a path to silence the gitleaks
+   gate** — census the content instead.
+3. `git rm --cached` stops future exposure; it does **not** remove history. Removing
+   history needs the `git filter-repo` + force-push runbook below, and it cannot recall
+   forks or caches.
+
+
 ## Never hardcode credentials
 
 This is a **public** repository. No token, API key, password, or other secret may

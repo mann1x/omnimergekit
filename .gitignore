@@ -150,3 +150,19 @@ eval/efficiency/gepo_full_efficiency_pool.jsonl
 eval/efficiency/gepo_mixed_with_efficiency.jsonl
 eval/efficiency/gepo_light_efficiency_pool.jsonl
 recipes/qwen3_6_35b_a3b_prune/results/router_calib_corpus_ornith.jsonl
+
+# --- Gated eval content (GPQA / frozen LCB) ------------------------------------
+# These paths carry gated benchmark ITEMS in plaintext. Untracked 2026-09-09 after
+# an audit found 10 tracked files publishing them, including 80 GPQA Diamond rows.
+#
+# The 2026-09-08 rule was keyed on the FILENAME and withheld
+# router_calib_corpus_ornith.jsonl -- while router_calib_corpus_qwen.jsonl, MD5
+# IDENTICAL, was already tracked. Path rules cannot see that. The REAL gate is the
+# content-keyed gitleaks rule (gated-eval-gpqa-canary /
+# gated-eval-content-in-data-file in .gitleaks.toml); this section is convenience
+# so these do not sit in `git status` forever.
+#
+# NEVER add a path here to silence the gitleaks gate. Census the content instead.
+**/router_calib_corpus*.jsonl
+eval/efficiency/grpo_pool_v*_*.jsonl
+eval_results_vllm_suite/**/samples_*.jsonl
