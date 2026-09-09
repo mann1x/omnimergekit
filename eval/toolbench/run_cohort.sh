@@ -3,7 +3,20 @@
 # tool-eval-bench 64k cohort — 10 models x 5 seeds, HARDMODE (88 scen / 176 pts)
 #
 # BASIS (constant across every cell):
-#   harness  tool-eval-bench HEAD cf54b4b (v2.6.0-45)   <- latest, per user
+#   harness  tool-eval-bench v2.6.0  (uv tool, pinned `rev=v2.6.0`)
+#            !! CORRECTED 2026-09-09. This line used to claim cf54b4b
+#            (v2.6.0-45) "per user" -- that build WAS asked for and WAS
+#            checked out to /srv/.../dev/tool-eval-bench, but the uv tool
+#            install two hours later pinned the plain v2.6.0 tag, and the
+#            CLI imports the uv install, never the checkout. So the ~45
+#            scorer fixes between them (TC-62, TC-05, TC-50, TC-68, ...)
+#            have never been in effect. Every cell since 2026-09-05 is
+#            v2.6.0, so the cohort is self-consistent -- the DOC was wrong,
+#            not the data. To move to cf54b4b, ALL cells must be re-run.
+#            Verify with the CLI's own interpreter, never `git rev-parse`:
+#              $(command -v tool-eval-bench) -> its python -c \
+#                'import tool_eval_bench,os;print(tool_eval_bench.__file__)'
+#            See BASIS-CORRECTION-2026-09-09.md in the results dir.
 #   flags    --hardmode --weight-by-difficulty --backend llamacpp
 #            --context-size 65536 --context-pressure 0.25   (~14k fill)
 #   server   opencoti-llamafile 0.10.5-c7-x86_64 (git 4142df1)
@@ -71,6 +84,16 @@ while [ $# -gt 0 ]; do
 done
 mkdir -p "$W"
 export PATH="$HOME/.local/bin:$PATH"
+
+# Record the scorer that will actually run. Resolved from the CLI's own
+# interpreter, because a git checkout can sit at the intended commit and be
+# entirely inert -- which is exactly what happened here before 2026-09-09.
+TEB_BIN="$(command -v tool-eval-bench || true)"
+TEB_PY="$(head -1 "$TEB_BIN" 2>/dev/null | sed "s/^#!//")"
+TEB_MOD="$("$TEB_PY" -c 'import tool_eval_bench,os;print(os.path.dirname(tool_eval_bench.__file__))' 2>/dev/null)"
+TEB_VER="$("$TEB_PY" -c 'import importlib.metadata as m;print(m.version("tool-eval-bench"))' 2>/dev/null)"
+echo "[$(date +%H:%M:%S)] SCORER version=${TEB_VER:-unknown} module=${TEB_MOD:-unknown}"
+
 
 # Entries are  name|gguf[|drafter_gguf]
 #   2 fields -> self-speculation. If the GGUF carries a NextN/mtp head the driver

@@ -72,6 +72,35 @@ def served_quant(W, model):
     return ""
 
 
+def harness_version(W):
+    """The scorer version that ACTUALLY produced these cells, read from the cells.
+
+    NOT from a git checkout. On 2026-09-09 both clones of tool-eval-bench sat at
+    cf54b4b (v2.6.0-45) -- the build that was asked for -- while every cell had in
+    fact been scored by a uv tool install pinned to the plain `v2.6.0` tag, so the
+    ~45 scorer fixes between them (TC-62, TC-05, TC-50, TC-68, ...) were never in
+    effect. `git rev-parse` in the checkout said cf54b4b and was answering about
+    code nothing imported. Each cell's own report records the version that scored
+    it, and that is the only honest source.
+
+    Returns (label, mixed). `mixed` is True when cells disagree, which means the
+    table pools more than one scorer and MUST NOT be read as one basis.
+    """
+    import glob as _g, re as _re
+    vs = set()
+    for md in _g.glob(os.path.join(W, "*-s*", "**", "*.md"), recursive=True):
+        try:
+            head = open(md, errors="replace").read(4000)
+        except OSError:
+            continue
+        m = _re.search(r"\*\*tool-eval-bench\*\*:\s*`([^`]+)`", head)
+        if m:
+            vs.add(m.group(1))
+    if not vs:
+        return "", False
+    return " + ".join(sorted(vs)), len(vs) > 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-o", "--out", default="toolbench_scores.png")
@@ -160,8 +189,10 @@ def main():
 
     ax.set_title(a.title, fontsize=13.5, fontweight="bold",
                  color="#0f172a", loc="left", pad=26)
+    hv, hv_mixed = harness_version(W)
     sub = (f"n={n} paired seeds {sorted(common)} · 64k ctx · context-pressure 0.25 · "
-           f"greedy-off (temp 0.6/top-p 0.95/top-k 20)")
+           f"greedy-off (temp 0.6/top-p 0.95/top-k 20)"
+           + (f" · scorer {hv}" if hv else ""))
     ax.annotate(sub, (0, 1), xycoords="axes fraction", xytext=(0, 12),
                 textcoords="offset points", fontsize=8.8, color="#64748b")
 
@@ -179,12 +210,23 @@ def main():
     if n < 2:     notes.append("n=1 — no confidence interval yet")
     if ragged:    notes.append("in-flight cells excluded to keep the cohort balanced")
     if pending:   notes.append("awaiting cells (re-running, not yet plotted): " + ", ".join(pending))
-    if notes:
-        fig.text(.012, .012, "  ·  ".join(notes), fontsize=8.2, color="#94a3b8")
-    # Benchmark credit, bottom-right. Same baseline as the notes on the left.
-    fig.text(.988, .012, BENCH_URL, fontsize=8.2, color="#94a3b8", ha="right")
+    if hv_mixed:  notes.insert(0, "!! MIXED SCORER VERSIONS ACROSS CELLS (" + hv + ") — these rows are NOT one basis")
+    # Footer. The notes and the credit used to share one baseline, so a long note
+    # ran straight through the right-hand credit and made the scorer version --
+    # the one thing this footer exists to state -- unreadable. Wrap the notes and
+    # stack the credit ABOVE them so neither can ever overlap the other.
+    import textwrap as _tw
+    lines = []
+    for nline in _tw.wrap("  ·  ".join(notes), width=118) if notes else []:
+        lines.append(nline)
+    STEP = 0.015
+    for i, nline in enumerate(reversed(lines)):          # bottom-up
+        fig.text(.012, .008 + i * STEP, nline, fontsize=8.2, color="#94a3b8")
+    fig.text(.988, .008 + len(lines) * STEP, BENCH_URL + (f"  ·  scorer {hv}" if hv else ""),
+             fontsize=8.2, color="#94a3b8", ha="right")
 
     fig.tight_layout()
+    fig.subplots_adjust(bottom=0.008 + (len(lines) + 1) * STEP + 0.055)
     fig.savefig(a.out, facecolor="white", bbox_inches="tight")
     print(f"wrote {a.out}  ({len(names)} models, n={n}, seeds={sorted(common)})")
 
