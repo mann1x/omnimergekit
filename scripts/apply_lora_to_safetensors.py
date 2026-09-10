@@ -62,11 +62,40 @@ print(f"adapter targets {len(pairs)} modules")
 idx_path = os.path.join(base_dir, "model.safetensors.index.json")
 index = json.load(open(idx_path))
 wmap = index["weight_map"]
-missing = [k for k in pairs if k not in wmap]
+# Resolve adapter names against the base index. On the VL-style checkpoints
+# (Qwen3.5/3.6 Qwen3_5ForConditionalGeneration) the text tower is nested under
+# `model.language_model.`, while peft records the target as `model.layers.N...`
+# because it was trained through a wrapper that had already descended into it.
+# Stripping only `base_model.model.` therefore yields a name that exists in NO
+# shard, and every target silently misses. Try the nesting variants explicitly.
+def _resolve(key: str) -> str | None:
+    cands = [key]
+    if key.startswith("model.layers."):
+        cands.append("model.language_model." + key[len("model."):])
+    elif key.startswith("layers."):
+        cands.append("model.language_model." + key)
+    if key.startswith("model.") and not key.startswith("model.language_model."):
+        cands.append("model.language_model." + key[len("model."):])
+    for c in cands:
+        if c in wmap:
+            return c
+    return None
+
+
+resolved, missing = {}, []
+for k in list(pairs):
+    hit = _resolve(k)
+    if hit is None:
+        missing.append(k)
+    else:
+        resolved[hit] = pairs[k]
 if missing:
     sys.exit(f"REFUSE: {len(missing)} adapter targets are absent from the base index — "
              f"name mapping is wrong: {missing[:3]}")
-print(f"all {len(pairs)} targets resolve against the base index")
+renamed = sum(1 for k in pairs if k not in wmap)
+pairs = resolved
+print(f"all {len(pairs)} targets resolve against the base index"
+      + (f" ({renamed} via the model.language_model.* nesting)" if renamed else ""))
 
 os.makedirs(out_dir, exist_ok=True)
 by_shard = {}

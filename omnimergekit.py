@@ -816,9 +816,32 @@ def main():
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"  device  : {args.device}", flush=True)
 
-    if len(args.source) < 2:
-        print("ERROR: need at least 2 sources for TIES merge", file=sys.stderr)
+    # A 2-model merge (one --base, one --source) is legitimate. Only the methods
+    # whose core step is a CROSS-SOURCE sign consensus become meaningless at K=1:
+    # dare_ties and della elect a sign by agreement between sources, and with a
+    # single source that "election" is just that source's own sign -- the user
+    # would get a silent no-op where they asked for consensus.
+    #
+    # The other three are well-defined at K=1:
+    #   task_arithmetic / dare_linear -- no election stage exists at all.
+    #   omnimerge_v2  -- has an EMR election, but it provably degenerates to an
+    #     IDENTITY: sign comes from sum(stack, dim=0) and amplitude from the
+    #     max-abs over dim 0, both of which return the single delta unchanged.
+    #     Verified bit-exact (max|out - reference| == 0.0) against an independent
+    #     reference base + w*where(topk_mask, delta/q, 0); see
+    #     scripts/test_omnimerge_single_source.py.
+    _NEEDS_CONSENSUS = ("dare_ties", "della")
+    if len(args.source) < 2 and args.method in _NEEDS_CONSENSUS:
+        print(f"ERROR: --method {args.method} elects a sign by consensus ACROSS "
+              f"sources and needs at least 2 --source; got {len(args.source)}. "
+              f"For a 2-model merge use --method omnimerge_v2 (EMR degenerates to "
+              f"identity at one source), dare_linear, or task_arithmetic.",
+              file=sys.stderr)
         sys.exit(1)
+    if len(args.source) < 2:
+        print(f"  NOTE    : single-source merge -- {args.method} reduces to "
+              f"base + w*delta(source - task_base) with the configured masking; "
+              f"no cross-source election takes place.", flush=True)
 
     # Parse weights
     if args.weights:
