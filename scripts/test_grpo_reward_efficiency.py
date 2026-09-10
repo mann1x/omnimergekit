@@ -165,6 +165,50 @@ check("both passers identical regardless of length",
       rs[0] == rs[1] == R_CORRECT + FORMAT_BONUS,
       f"{[round(x,3) for x in rs]}")
 
+print("\n=== 10. per-tier DIRECTION (rho) -- and the failing side ===")
+# The 2026-09-10 null proved `alive`/std alone is not a health metric: loosening the
+# budget drives both monotonically up while removing the pressure toward shorter.
+# Only the SIGN of Spearman(ntok, reward) says the gradient points the right way, so
+# this asserts the negative case AND a positive/undefined case. A direction check that
+# only ever comes back negative cannot tell you the reward is inverted.
+# [[feedback_a_check_gold_fails_is_a_broken_check]]
+r10 = make_efficiency_reward(FakeTok(), None, 100000)
+_c, _p, _g, _m = [], [], [], []
+
+
+def _dgrp(pid, lens, budget, oks, lam=0.8):
+    # Use the module's own mk(): FakeTok counts WHITESPACE WORDS, so "x"*200 is ONE
+    # token, not 200 -- which silently makes every rollout the same length and every
+    # reward identical. That is a test artefact that would fake a dead group.
+    for L, ok in zip(lens, oks):
+        _c.append(mk(L, ok)); _p.append(pid); _g.append("C")
+        _m.append({"reward_kind": "mc_letter", "think": True,
+                   "length_budget": budget, "length_lambda": lam})
+
+
+# shorter passers score HIGHER -> rho must be negative
+_dgrp("g1", [200, 400, 600, 800], 2000, [True] * 4)
+for _ in range(4):
+    r10(_c, prompts=_p, gold=_g, meta=_m)
+_tg = (r10._state.get("tier_grp") or {}).get("mc_letter/T", {})
+_rho = _tg["rho"] / _tg["rho_n"] if _tg.get("rho_n") else None
+check("graded group is counted alive", _tg.get("alive", 0) > 0, f"{_tg.get('alive')}")
+check("rho is NEGATIVE when shorter scores higher", _rho is not None and _rho < 0,
+      f"rho={_rho}")
+check("all such groups counted as rho<0", _tg.get("neg") == _tg.get("rho_n"),
+      f"neg={_tg.get('neg')} of {_tg.get('rho_n')}")
+
+# FAILING SIDE: a clamp-dead group (all passers over budget) has zero length contrast,
+# so it must NOT be counted as a rho measurement at all -- not as rho=0.
+r11 = make_efficiency_reward(FakeTok(), None, 100000)
+_c, _p, _g, _m = [], [], [], []
+_dgrp("g2", [3000, 4000, 5000, 6000], 831, [True] * 4)
+for _ in range(4):
+    r11(_c, prompts=_p, gold=_g, meta=_m)
+_tg2 = (r11._state.get("tier_grp") or {}).get("mc_letter/T", {})
+check("clamp-dead group yields NO rho measurement (not rho=0)",
+      _tg2.get("rho_n", 0) == 0, f"rho_n={_tg2.get('rho_n')} alive={_tg2.get('alive')}")
+
 print()
 if FAILS:
     print(f"SELFTEST: FAIL ({len(FAILS)}): {', '.join(FAILS)}")

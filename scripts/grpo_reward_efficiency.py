@@ -172,6 +172,38 @@ def has_answer_marker(text: str, kind: str) -> bool:
 
 
 # --------------------------------------------------------------------- the reward
+def _rank(xs):
+    order = sorted(range(len(xs)), key=lambda i: xs[i])
+    r = [0.0] * len(xs)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and xs[order[j + 1]] == xs[order[i]]:
+            j += 1
+        avg = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            r[order[k]] = avg
+        i = j + 1
+    return r
+
+
+def _spearman(a, b):
+    """Spearman rho, or None when either side is constant.
+
+    None is NOT 0.0. A constant side means rho is undefined -- reporting it as 0
+    would read as "no direction found" when the truth is "no measurement was
+    possible", and those two get averaged very differently.
+    [[feedback_a_zero_needs_a_nonzero_floor_control]]
+    """
+    ra, rb = _rank(a), _rank(b)
+    if st.pstdev(ra) == 0 or st.pstdev(rb) == 0:
+        return None
+    ma, mb = st.mean(ra), st.mean(rb)
+    num = sum((x - ma) * (y - mb) for x, y in zip(ra, rb))
+    den = (sum((x - ma) ** 2 for x in ra) * sum((y - mb) ** 2 for y in rb)) ** 0.5
+    return num / den if den else None
+
+
 def make_efficiency_reward(tokenizer,
                            lcb_verifier: Callable[[str, dict], Any] | None,
                            max_completion: int,
@@ -371,6 +403,34 @@ def make_efficiency_reward(tokenizer,
                 tot_stds.append(tot)
                 if len(passers) >= 2 and tot > 0:
                     shares.append(st.pstdev(passers) / tot)
+
+                # ---- PER-TIER group health, DISCRETE (test C) ----------------------
+                # state["tot"]/["share"] above are POOLED across tiers. A pooled number
+                # is the mean of three different jobs and cannot see the minority tier
+                # that carries the objective going dead.
+                # [[feedback_a_pool_wide_metric_cannot_see_a_minority_tier_objective]]
+                #
+                # Two quantities per tier, and BOTH are needed:
+                #   alive  -- group has non-zero reward variance at all
+                #   rho    -- Spearman(ntok, reward) WITHIN the group
+                # The 2026-09-10 null proved `alive` alone is not a gate: loosening the
+                # budget drives alive and std monotonically up, because at a loose budget
+                # ~all rollouts sit under it and the budget stops being a target. Variance
+                # without a NEGATIVE sign is noise, not brevity pressure. Only rho says
+                # the gradient points toward SHORTER.
+                tg = state.setdefault("tier_grp", {}).setdefault(
+                    f"{m0.get('reward_kind')}/{'T' if m0.get('think') else 'N'}",
+                    {"n": 0, "alive": 0, "std": 0.0, "rho": 0.0, "rho_n": 0, "neg": 0})
+                tg["n"] += 1
+                tg["std"] += tot
+                if tot > 1e-9:
+                    tg["alive"] += 1
+                    rho = _spearman([nt_i[j] for j in range(s, e)], list(grp))
+                    if rho is not None:
+                        tg["rho"] += rho
+                        tg["rho_n"] += 1
+                        if rho < 0:
+                            tg["neg"] += 1
                 # ---- ROLLOUT DUMP (test B) ----------------------------------------
                 # One row per rollout, carrying everything needed to RE-SCORE the same
                 # rollouts under a different penalty shape offline: the unclamped ratio

@@ -59,12 +59,90 @@ import shutil
 import signal
 import sys
 import time
+from pathlib import Path
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
 sys.path.insert(0, str(REPO / "eval" / "lcb"))
 
 EXPECTED_EOG = [1, 106, 50]
+
+
+WANDB_HOST = "api.wandb.ai"
+
+
+def resolve_wandb_key() -> tuple[str, str]:
+    """Return (key, source). ("", "") when no credential exists anywhere.
+
+    PORTED VERBATIM from scripts/gepo_brevity.py. It is not duplicated for fun: this
+    trainer was written fresh on 2026-09-09 and did NOT inherit its sibling's telemetry,
+    so it shipped a hardcoded `report_to=[]` while WANDB_API_KEY was exported in bs2's
+    ~/.bashrc the whole time. grpo_an_short then ran 300 steps / 7h59m with ZERO
+    experiment tracking, and the null had to be reconstructed by grepping an 899 KB
+    stdout log. A new script must not silently drop a safeguard its sibling already has.
+    """
+    key = os.environ.get("WANDB_API_KEY", "").strip()
+    if key:
+        return key, "env:WANDB_API_KEY"
+    try:
+        import netrc
+        auth = netrc.netrc().authenticators(WANDB_HOST)
+        if auth and auth[2]:
+            return auth[2].strip(), f"netrc:{WANDB_HOST}"
+    except Exception:
+        pass
+    return "", ""
+
+
+def setup_wandb(args, run_config: dict) -> list[str]:
+    """Enable wandb iff a key is resolvable. Returns the `report_to` list.
+
+    Explicit and implicit requests fail differently ON PURPOSE. If the operator named a
+    project/entity/name they asked for telemetry, and silently training without it
+    wastes the run -- so a missing key or package REFUSES. Auto-detection is a
+    convenience and must never kill a run, so those failures warn and continue.
+    """
+    explicit = bool(args.wandb_project or args.wandb_name or args.wandb_entity)
+    if args.no_wandb:
+        print(">>> WANDB off (--no-wandb)", flush=True)
+        return []
+    key, source = resolve_wandb_key()
+    if not key:
+        msg = f"WANDB_API_KEY unset and no {WANDB_HOST} entry in ~/.netrc"
+        if explicit:
+            sys.exit(f"REFUSE: --wandb-* was requested but {msg}.")
+        print(f">>> WANDB off ({msg})", flush=True)
+        return []
+    try:
+        import wandb
+    except ImportError:
+        msg = "wandb key found but the wandb package is not installed"
+        if explicit:
+            sys.exit(f"REFUSE: {msg}.")
+        print(f">>> WANDB off -- {msg}", flush=True)
+        return []
+    # Only rank 0 talks to wandb; other ranks would open duplicate runs.
+    if int(os.environ.get("RANK", "0")) != 0:
+        return ["wandb"]
+    os.environ["WANDB_API_KEY"] = key
+    project = args.wandb_project or os.environ.get("WANDB_PROJECT") or "grpo-efficiency"
+    name = args.wandb_name or f"{Path(args.output).name}-{time.strftime('%Y%m%d-%H%M%S')}"
+    entity = args.wandb_entity or os.environ.get("WANDB_ENTITY") or None
+    # Init here rather than leaving it to transformers' WandbCallback: the callback only
+    # knows TrainingArguments, so the fields that actually distinguish two runs -- lr,
+    # beta, lambda, budget quantile, pool -- would never reach the UI. The callback
+    # reuses an existing run, so pre-initing adds config without losing metrics.
+    try:
+        run = wandb.init(project=project, name=name, entity=entity,
+                         config=run_config, resume="allow")
+    except Exception as exc:                       # network/auth: never fatal on auto
+        if explicit:
+            sys.exit(f"REFUSE: wandb.init failed: {exc}")
+        print(f">>> WANDB off -- wandb.init failed: {exc}", flush=True)
+        return []
+    print(f">>> WANDB on key={source} project={project} name={name} url={run.url}",
+          flush=True)
+    return ["wandb"]
 
 
 def load_pool(path: str) -> list[dict]:
@@ -133,7 +211,14 @@ def main() -> int:
                     help="JSON tier->budget. Required unless --smoke (the smoke's job "
                          "is to MEASURE the lengths a budget is derived from).")
     # --- generation / topology ---
-    ap.add_argument("--num-generations", type=int, default=8)
+    ap.add_argument("--num-generations", type=int, default=8,
+                    help="Rollouts per prompt = the group size GRPO computes advantage "
+                         "within. It sets how often a group has >=2 passers and can "
+                         "therefore carry ANY length contrast. On lcb_exec/T (pass rate "
+                         "0.151) G=8 gives P(>=2 passers)=0.34 and the measured graded "
+                         "share was 0.32 -- 68%% of that tier's groups contributed zero "
+                         "gradient. G=16 lifts it to ~0.72. Undocumented default until "
+                         "2026-09-10; state it explicitly.")
     ap.add_argument("--max-completion-len", type=int, default=8192)
     ap.add_argument("--max-prompt-len", type=int, default=2048,
                     help="Prompt headroom. TRL 1.12.0 has NO max_prompt_length: it "
@@ -156,7 +241,22 @@ def main() -> int:
                          "share is genuinely spare.")
     ap.set_defaults(vllm_sleep=True)
     # --- optimisation (an-finetune values) ---
-    ap.add_argument("--lr", type=float, default=1e-6)
+    ap.add_argument("--lr", type=float, default=1e-6,
+                    help="THE parameter that scales every update, and the one that was "
+                         "left implicit until 2026-09-10. grpo_an_short ran 300 steps / "
+                         "7h59m at this default: with median grad_norm 0.107 that is a "
+                         "~1e-7 per-step update, KL stayed FLAT (Spearman(step,kl)="
+                         "-0.012), and the run returned a null even though the reward "
+                         "gradient was correctly signed (within-group Spearman(ntok,"
+                         "reward) -0.34..-0.86, 76-97%% of live groups negative). "
+                         "ALWAYS PASS THIS EXPLICITLY. bug-709.")
+    ap.add_argument("--wandb-project", default="",
+                    help="wandb project. Naming any --wandb-* makes telemetry EXPLICIT: "
+                         "a missing key then REFUSES instead of training untracked.")
+    ap.add_argument("--wandb-name", default="")
+    ap.add_argument("--wandb-entity", default="")
+    ap.add_argument("--no-wandb", action="store_true",
+                    help="disable telemetry even when a key is resolvable")
     ap.add_argument("--save-steps", type=int, default=1,
                     help="Checkpoint every N optimiser steps. 1 = every step, so an "
                          "interruption costs at most one step of GPU time.")
@@ -222,8 +322,10 @@ def main() -> int:
                          "steps and had no power. 16 restores AN's ratio (bsz 1 x 16 x "
                          "2 = 32) and roughly halves step time, since generation "
                          "dominates and the step generates half as many completions.")
-    ap.add_argument("--lora-r", type=int, default=32)
-    ap.add_argument("--lora-alpha", type=int, default=64)
+    ap.add_argument("--lora-r", type=int, default=32,
+                    help="LoRA rank. Adapter capacity; pair with --lora-alpha (2x r here).")
+    ap.add_argument("--lora-alpha", type=int, default=64,
+                    help="LoRA alpha. Effective scale is alpha/r = 2.0 at the defaults.")
     ap.add_argument("--warmup-steps", type=int, default=6,
                     help="TRL 1.12.0's GRPOConfig exposes only warmup_steps -- the "
                          "ratio form was removed. an-finetune used a 0.1 ratio; at 248 "
@@ -239,8 +341,11 @@ def main() -> int:
                          "BASIS CHANGE: A/B it against a non-Liger baseline on the "
                          "same seed (per-tier pass rate / mean reward / mean tok) "
                          "before adopting it, rather than assuming equivalence.")
-    ap.add_argument("--seed", type=int, default=3407)
-    ap.add_argument("--log-every", type=int, default=64)
+    ap.add_argument("--seed", type=int, default=3407,
+                    help="Run seed. Changing it changes the arm -- record it per run.")
+    ap.add_argument("--log-every", type=int, default=64,
+                    help="Rollouts between per-tier reward log blocks (stdout). The "
+                         "machine-readable series is tier_metrics.jsonl + trainer_state.")
     ap.add_argument("--smoke", action="store_true",
                     help="Short run over a stratified slice: validates topology, "
                          "reward dispatch and EOG, and MEASURES per-tier passing "
@@ -455,6 +560,20 @@ def main() -> int:
                                     allow_unset_budget=a.measure_only,
                                     dump_rollouts=(a.dump_rollouts or None))
 
+    # ---- telemetry decided BEFORE the config, so report_to is set once ----------
+    # run_config is what makes two runs distinguishable in the UI. TrainingArguments
+    # alone cannot say which lr / lambda / budget quantile / pool produced a curve --
+    # and lr in particular is the parameter whose unstated default (1e-6) caused the
+    # 2026-09-10 null. Put it where it is visible.
+    _run_config = {
+        "model": a.model, "pool": a.pool, "output": a.output,
+        "lr": a.lr, "beta": a.beta, "length_lambda": a.length_lambda,
+        "budget_quantile": a.budget_quantile, "budgets": a.budgets,
+        "grad_accum": a.grad_accum, "max_completion_len": a.max_completion_len,
+        "max_grad_norm": a.max_grad_norm, "steps": a.smoke_steps,
+    }
+    _report_to = setup_wandb(a, _run_config)
+
     cfg = GRPOConfig(
         output_dir=a.output,
         # LOAD DTYPE IS NOT `bf16=True`. `bf16` selects the training autocast; the
@@ -568,7 +687,7 @@ def main() -> int:
         # all six (grpo_trainer.py:794-844), and loss_type/beta/temperature are passed
         # straight through to LigerFusedLinearGRPOLoss, so dapo + beta=0.04 survive.
         use_liger_kernel=a.liger,
-        report_to=[],
+        report_to=_report_to,
     )
 
     # LoRA scope: reuse the REVIEWED regex from gepo_brevity rather than a third
@@ -800,6 +919,84 @@ def main() -> int:
             print(f">>> --resume {a.resume!r} found no checkpoint in {a.output}; "
                   "starting from scratch", flush=True)
 
+    # ---- DISCRETE PER-TIER METRICS INTO trainer_state.json --------------------
+    # The reward fn computes per-tier pass/tok/clip/mean_r, group classes, length
+    # share and (since 2026-09-10) per-tier live-group share + direction rho -- but
+    # only print()s them. A stdout print cannot be regressed, plotted, or diffed
+    # across runs, and it is absent from every checkpoint. The 300-step null of
+    # 2026-09-10 was diagnosed only because the ROLLOUT DUMP happened to be on; the
+    # per-tier series itself had to be re-derived by grepping an 899 KB log.
+    #
+    # Two things this callback must get right:
+    #  1. reward._state counters are CUMULATIVE and never cleared. A running mean
+    #     moves a shrinking fraction of the way the underlying quantity moves, so
+    #     logging them raw UNDERSTATES every trend -- and "is length falling?" is the
+    #     one question the series exists to answer. DIFFERENCE them per step.
+    #     [[feedback_a_pool_wide_metric_cannot_see_a_minority_tier_objective]]
+    #  2. `alive` without `rho` is not a health metric. See the reward fn: loosening
+    #     the budget drives alive/std monotonically up while removing the pressure.
+    #     Both are emitted, and the GATE belongs on rho.
+    class TierMetrics(TrainerCallback):
+        def __init__(self, reward_fn, sidecar):
+            self._st = getattr(reward_fn, "_state", {})
+            self._prev = {}
+            self._sidecar = sidecar
+
+        def _delta(self, tier, b, keys):
+            p = self._prev.get(tier)
+            self._prev[tier] = {k: b.get(k, 0) for k in keys}
+            if not p:
+                return None
+            d = {k: b.get(k, 0) - p.get(k, 0) for k in keys}
+            return d if d.get("n", 0) > 0 else None
+
+        def on_log(self, args, state, control, logs=None, **kw):
+            if not state.is_world_process_zero or not state.log_history:
+                return
+            row = {"step": state.global_step}
+            for tier, b in (self._st.get("byk") or {}).items():
+                d = self._delta("byk:" + tier, b, ("n", "pass", "tok", "clip", "r", "under"))
+                if not d:
+                    continue
+                n = d["n"]
+                row[f"tier/{tier}/pass"] = d["pass"] / n
+                row[f"tier/{tier}/mean_tok"] = d["tok"] / n      # PER-TIER LENGTH
+                row[f"tier/{tier}/mean_r"] = d["r"] / n          # PER-TIER REWARD
+                row[f"tier/{tier}/clip"] = d["clip"] / n
+                if d["pass"] > 0:
+                    row[f"tier/{tier}/frac_under_budget"] = d["under"] / d["pass"]
+            for tier, g in (self._st.get("tier_grp") or {}).items():
+                d = self._delta("grp:" + tier, g, ("n", "alive", "std", "rho", "rho_n", "neg"))
+                if not d:
+                    continue
+                row[f"tier/{tier}/live_group_share"] = d["alive"] / d["n"]
+                row[f"tier/{tier}/mean_group_std"] = d["std"] / d["n"]
+                if d["rho_n"] > 0:
+                    # THE GATE: negative rho = reward falls as length rises.
+                    row[f"tier/{tier}/rho"] = d["rho"] / d["rho_n"]
+                    row[f"tier/{tier}/frac_rho_neg"] = d["neg"] / d["rho_n"]
+            for tier, c in (self._st.get("gcls") or {}).items():
+                d = self._delta("cls:" + tier, c, ("graded", "allover", "lt2pass"))
+                if not d:
+                    continue
+                t = sum(d.values())
+                if t <= 0:
+                    continue
+                row[f"tier/{tier}/graded"] = d["graded"] / t
+                row[f"tier/{tier}/clamp_dead"] = d["allover"] / t
+                row[f"tier/{tier}/pass_dead"] = d["lt2pass"] / t
+            if len(row) == 1:
+                return
+            # Merge into the row Trainer just appended, so these survive in every
+            # checkpoint's trainer_state.json alongside reward/kl/completion_length.
+            state.log_history[-1].update(row)
+            # AND a sidecar, so a TRL version that reorders append-vs-callback cannot
+            # silently drop the series. [[feedback_verify_artifacts_not_exitcodes]]
+            if self._sidecar:
+                with open(self._sidecar, "a") as fh:
+                    fh.write(json.dumps(row) + "\n")
+
+    trainer.add_callback(TierMetrics(reward, os.path.join(a.output, "tier_metrics.jsonl")))
     trainer.add_callback(NanProbe(trainer.model))
     trainer.add_callback(KLProbe(a.max_grad_norm))
     trainer.add_callback(Checkpointer(_is_main))
