@@ -48,7 +48,9 @@ TIERS="${TIERS:-Q8_0 Q6_K_L Q6_K Q5_K_L Q5_K_M Q5_K_S Q4_K_L Q4_K_M Q4_K_S IQ4_N
 OL_REQUIRES="${OL_REQUIRES:-0.32.12}"
 OL_RENDERER="${OL_RENDERER:-qwen3.5}"
 OL_PARSER="${OL_PARSER:-qwen3.5}"
-OL_NUM_CTX="${OL_NUM_CTX:-32768}"
+# `-` not `:-`: an explicitly EMPTY OL_NUM_CTX means "omit the directive", and
+# `:-` would silently restore the default for exactly that case.
+OL_NUM_CTX="${OL_NUM_CTX-32768}"
 OL_TEMPERATURE="${OL_TEMPERATURE:-1}"
 OL_TOP_P="${OL_TOP_P:-0.95}"
 OL_TOP_K="${OL_TOP_K:-20}"
@@ -216,7 +218,12 @@ emit_params(){   # shared by text and vision so the two can never drift apart
   [ -n "$OL_REQUIRES" ] && echo "REQUIRES $OL_REQUIRES"
   echo "RENDERER $OL_RENDERER"
   echo "PARSER $OL_PARSER"
-  echo "PARAMETER num_ctx $OL_NUM_CTX"
+  # num_ctx is OPTIONAL: set OL_NUM_CTX="" to omit it entirely, which lets the
+  # context window follow the model's own n_ctx_train and whatever the host can
+  # afford. Pinning it is right when a model's n_ctx_train is so large that the
+  # fallback OOMs a normal box (the v6 256k case); it is wrong when it would cap
+  # a model the host could serve wider.
+  [ -n "$OL_NUM_CTX" ] && echo "PARAMETER num_ctx $OL_NUM_CTX"
   echo "PARAMETER temperature $OL_TEMPERATURE"
   echo "PARAMETER top_p $OL_TOP_P"
   echo "PARAMETER top_k $OL_TOP_K"
