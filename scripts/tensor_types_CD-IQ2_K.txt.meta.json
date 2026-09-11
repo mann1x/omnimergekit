@@ -1,14 +1,14 @@
 {
-  "generated_from_imatrix_sha256": "dc2a5e35cd686b0fc61849269f828392a3ff3f20eafac659529dbb6d10b9d019",
+  "generated_from_imatrix_sha256": "02d25d657dc8a42f350acebe6d7eff41f6bc9b3e084607644d29c8f3e5958046",
   "importance_source": "imatrix",
   "importance_file_sha256": null,
   "importance_file_name": null,
-  "generated_at": "2026-06-24T03:48:05+00:00",
+  "generated_at": "2026-09-11T18:02:08+00:00",
   "tier_profile": "CD-IQ2_K",
   "tiers": {
     "top": "IQ3_M",
     "mid": "IQ3_XS",
     "low": "IQ2_M"
   },
-  "num_layers": 30
+  "num_layers": 32
 }
