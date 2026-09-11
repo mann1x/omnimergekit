@@ -20,6 +20,16 @@
 #   sampler   GREEDY (temp 0.0 / top-p 1.0 / top-k 0). run_cohort.sh serves
 #             temp 0.6 / top-p 0.95 / top-k 20 — also not poolable.
 #   flags     --hardmode --weight-by-difficulty --backend llamacpp
+#   seeds     42 43 44 45 46 -- PAIRED across the arms of the cohort, n=5,
+#             t=2.776. THE SEED SET IS PART OF THE BASIS, exactly like the
+#             sampler and the harness version. The reportable tool-calling
+#             cell for an arm is the MEAN OVER ALL FIVE; a 1- or 3-seed run
+#             is a different denominator with a different CI and must never
+#             be pooled into an arm table or compared against a 5-seed cell.
+#             Passing a subset on the command line is for FILLING missing
+#             seeds of an arm that will reach 42..46 -- not for producing a
+#             cell. This runner prints TOOLBENCH_BASIS_COMPLETE only when
+#             all five seed files exist on disk.
 #   server    llama-server --jinja (MANDATORY: without it the tool grammar
 #             never comes from the model's chat template and every scenario
 #             degrades to prose)
@@ -40,7 +50,9 @@ ARM="${1:?ARM name required}"
 GGUF="${2:?GGUF path required}"
 OUT="${3:?output dir required}"
 shift 3
-SEEDS=("${@:-42}")
+# Default is the FULL canonical basis, not seed 42 alone. A bare invocation
+# must produce a reportable cell; under-powering has to be an explicit choice.
+if [ "$#" -gt 0 ]; then SEEDS=("$@"); else SEEDS=(42 43 44 45 46); fi
 
 LLAMA_BIN="${LLAMA_BIN:-/opt/llama.cpp/build/bin}"
 PORT="${OMK_TB_PORT:-8265}"
@@ -59,6 +71,12 @@ PY=$(head -1 "$(command -v tool-eval-bench)" | sed 's|^#!||')
 VER=$("$PY" -c 'import importlib.metadata as m; print(m.version("tool-eval-bench"))' 2>/dev/null)
 echo ">>> harness tool-eval-bench $VER   (resolved via the CLI interpreter)"
 echo ">>> arm=$ARM gguf=$(basename "$GGUF") ctx=$CTX pressure=$PRESSURE timeout=${TIMEOUT}s seeds=${SEEDS[*]}"
+
+if [ "${#SEEDS[@]}" -lt 5 ]; then
+    echo ">>> PARTIAL BASIS: ${#SEEDS[@]}/5 seeds (${SEEDS[*]}) -- canonical cell is the mean over 42..46."
+    echo ">>> This invocation alone does NOT yield a reportable cell for $ARM."
+    printf '%s partial invocation seeds=%s\n' "$(date -u +%FT%TZ)" "${SEEDS[*]}" >> "$OUT/PARTIAL_BASIS.txt"
+fi
 
 echo ">>> starting llama-server on :$PORT"
 "$LLAMA_BIN/llama-server" -m "$GGUF" --port "$PORT" -c "$CTX" -ngl 99 \
@@ -96,4 +114,19 @@ done
 kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null
 echo ">>> server stopped"
 [ $rc_all -eq 0 ] && echo "TOOLBENCH_OK $ARM" || echo "TOOLBENCH_FAIL $ARM rc=$rc_all"
+
+# Basis census. The reportable unit is the ARM, not this invocation: earlier
+# runs may have filled other seeds, so count the files on disk. An arm is only
+# tabulatable once all five paired seeds exist.
+have=(); missing=()
+for S in 42 43 44 45 46; do
+    if [ -f "$OUT/${ARM}_seed${S}.json" ]; then have+=("$S"); else missing+=("$S"); fi
+done
+if [ "${#missing[@]}" -eq 0 ]; then
+    echo "TOOLBENCH_BASIS_COMPLETE $ARM seeds=42..46 (n=5, t=2.776)"
+else
+    echo "TOOLBENCH_BASIS_INCOMPLETE $ARM have=${have[*]:-none} missing=${missing[*]}"
+    echo "TOOLBENCH_BASIS_INCOMPLETE -> do NOT report a $ARM tool-calling score yet."
+fi
+
 exit $rc_all

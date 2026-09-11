@@ -565,6 +565,57 @@ fires <5% of the time.
 
 ---
 
+#### Tool-calling (`tool-eval-bench`) — THE SEED SET IS PART OF THE BASIS
+
+```
+Runner:  omnimergekit/eval/toolbench/run_arm_llamacpp.sh   (stock llama.cpp, Q6_K arms)
+         omnimergekit/eval/toolbench/run_cohort.sh         (opencoti-llamafile 64k cohort)
+Seeds:   42 43 44 45 46   -- PAIRED across every arm of the cohort. n=5 -> t=2.776.
+Sampler: GREEDY (temp 0.0 / top-p 1.0 / top-k 0)  [run_arm_llamacpp.sh]
+Flags:   --hardmode --weight-by-difficulty --backend llamacpp
+         --context-size 65536 --context-pressure 0.25
+Server:  llama-server --jinja  (MANDATORY -- without it the tool grammar never
+         comes from the model's chat template and every scenario degrades to prose)
+```
+
+**The reportable tool-calling cell for an arm is the MEAN OVER ALL FIVE PAIRED
+SEEDS.** A 1- or 3-seed run is not a smaller version of that cell: it is a
+different denominator with a different CI, and pooling it into an arm table —
+or comparing it against a 5-seed cell — is a basis violation of exactly the
+same class as mixing samplers or harness versions.
+
+Passing a seed subset on the command line is legal for **filling** the missing
+seeds of an arm that will reach 42..46. It is never a way to produce a cell.
+
+**Enforcement (both live in `run_arm_llamacpp.sh`):**
+- A bare invocation now defaults to the full `42 43 44 45 46`. Under-powering
+  has to be an explicit, visible choice; it is no longer what you get by
+  accident.
+- Every invocation ends with a **basis census over the files on disk** (not
+  over what this run did, since earlier runs may have filled other seeds):
+  `TOOLBENCH_BASIS_COMPLETE <arm> seeds=42..46` or
+  `TOOLBENCH_BASIS_INCOMPLETE <arm> have=... missing=...`. **Do not report a
+  tool-calling score for an arm whose census says INCOMPLETE.** A partial
+  invocation also drops a dated line in `<outdir>/PARTIAL_BASIS.txt`.
+
+The census keys on `<arm>_seed<N>.json`. If an arm was run with the seed baked
+into the arm name (e.g. `ARM=jackod4-9b-ac-s43` → `jackod4-9b-ac-s43_seed43.json`)
+the census cannot see those cells — rename to `<arm>_seed<N>.json` rather than
+defeating the check.
+
+**Origin (2026-09-11):** `run_cohort.sh` had carried the paired 5-seed basis in
+its header and its default since it was written (`SEEDS="${OMK_TB_SEEDS:-42 43
+44 45 46}"`, documented as *n=5 -> t=2.776*). Its companion
+`run_arm_llamacpp.sh` — whose own header says *"every field here must be held
+constant across the arms of a cohort"* — listed harness, sampler, flags and
+server in that BASIS block but **omitted seeds**, and defaulted to
+`SEEDS=("${@:-42}")`, a single seed. The JackOD4 tool-calling arm was
+consequently reported as a 3-seed mean (42/43/44, the latter two added ad hoc to
+fill idle cards) against 5-seed published cells. The basis was correct in the
+repo and absent from the runner that the pods actually invoke; nothing warned.
+
+---
+
 ### 1.5 Gated datasets need HF_TOKEN — ENFORCED by omk_eval pre-flight (exit 7)
 
 Some benches load a **gated** HF dataset and silently fast-fail without an
@@ -855,6 +906,7 @@ For each eval, before publishing a score:
 | 2026-05-10 | Pod vs local llama.cpp commit drift                    | 3pp HE noise    |
 | 2026-05-10 | Did NOT validate-during-run; let LCB finish before checking p90 gen length | wasted 2 multi-quart runs |
 | 2026-05-23 | Read raw lm_eval `exact_match,strict-match` (GPQA) / `exact_match,none` (math500) instead of omk `summary.json` `.score`; compounded by a SUMMARY.md roll-up globbing the wrong single-`<served>` path → `NO_RESULT`. Falsely reported GPQA 1.52% / math500 41% when the real canonical scores were 72.73% / 94%. | hours of false alarm; nearly re-ran valid evals |
+| 2026-09-11 | Toolbench seed set was in `run_cohort.sh`'s basis but NOT in its companion `run_arm_llamacpp.sh`, which defaulted to a single seed. JackOD4 tool-calling reported as a 3-seed mean against 5-seed published cells. | wrong-basis cell; re-run seeds 45/46 + all of base & qwopus |
 
 ---
 
