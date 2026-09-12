@@ -359,6 +359,15 @@ def main() -> int:
                          "ran a single lambda=0.8; its FLAT sibling ran 0.5. Our pool "
                          "ships 0.1/0.1/0.3. This flattens the per-tier weighting on "
                          "purpose -- it is a different design, not a tweak.")
+    ap.add_argument("--lenpen-ceiling", type=float, default=1.0,
+                    help="Clamp ceiling on lenpen=min(ntok/budget, CEILING). Default 1.0 "
+                         "means ZERO length gradient for any rollout at or above budget "
+                         "-- a tier whose budget sits under its own mean length starts "
+                         "in that dead zone and never feels the objective (observed "
+                         "2026-09-12: mc_letter/N at raw 1.44 for half a run). Raising "
+                         "this REQUIRES lowering --length-lambda: lam*ceiling must stay "
+                         "below R_CORRECT=1.0 or a correct-but-long answer scores worse "
+                         "than a wrong one. The pair is gated by assert_lenpen_bound().")
     ap.add_argument("--budget-quantile", type=float, default=None,
                     help="Quantile of PASSING lengths used to derive budgets in the "
                          "measure path (default: grpo_reward_efficiency.BUDGET_QUANTILE "
@@ -387,6 +396,8 @@ def main() -> int:
     from trl import GRPOConfig, GRPOTrainer
 
     from grpo_reward_efficiency import budget_from_lengths, make_efficiency_reward
+    from grpo_reward_efficiency import set_lenpen_ceiling
+    set_lenpen_ceiling(a.lenpen_ceiling)
 
     eog = resolve_eog(a.model)
     print(f">>> EOG ids (literal, from generation_config): {eog}", flush=True)
@@ -482,6 +493,18 @@ def main() -> int:
                 n_over += 1
         print(f">>> LAMBDA OVERRIDE: {n_over} rows set to lambda={a.length_lambda} "
               f"(replay rows with lambda==0 untouched)", flush=True)
+
+    # ---------------------------------------------------- LENPEN BOUND GATE
+    # Checked on the RESOLVED per-row lambdas, not on the CLI flag: --length-lambda
+    # only rewrites rows that already carry lambda>0, so the flag alone does not tell
+    # you what the pool actually holds. Every distinct lambda in play must satisfy
+    # lam*ceiling < R_CORRECT or the worst passer scores at/below a failure.
+    from grpo_reward_efficiency import assert_lenpen_bound, LENPEN_CEILING
+    lams = sorted({float((r.get("meta") or {}).get("length_lambda") or 0) for r in rows})
+    for _lam in lams:
+        assert_lenpen_bound(_lam)
+    print(f">>> LENPEN BOUND OK: ceiling={LENPEN_CEILING} lambdas={lams} "
+          f"(max lam*ceiling={max(lams) * LENPEN_CEILING:.4f} < 1.0)", flush=True)
 
     # A lambda>0 row with no budget is the failure this whole path exists to stop.
     # Check the ROWS, not the flag -- for a real run it is fatal.

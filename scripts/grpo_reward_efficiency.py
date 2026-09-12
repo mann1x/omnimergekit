@@ -82,6 +82,54 @@ RANK = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
 R_CORRECT = 1.0
 LAMBDA_MAX = 1.0
 
+# THE CLAMP CEILING on lenpen, and why it is a knob now instead of a literal 1.0.
+#
+# raw = ntok/budget is unbounded above; the clamp caps it so one runaway rollout cannot
+# dominate the loss. But the clamp is ALSO A DEAD ZONE: for raw >= ceiling the length
+# term is constant, so d(reward)/d(ntok) is exactly 0. A tier whose budget sits below
+# its own mean length starts entirely inside that zone and never feels the objective.
+#
+# Observed 2026-09-12 (run grpo_full_lr1e-5): budgets came from an-finetune's 0.82x
+# ratio, which by construction starts EVERY tier at raw = 1/0.82 = 1.22 -- above a
+# ceiling of 1.0. mc_letter/N was worst (budget 831 vs measured mean 1193 -> raw 1.44)
+# and sat with frac_under_budget pinned at 0.125 for the first half of the run, moving
+# only once trunk drift carried it under raw 1.0. The BUDGET_QUANTILE note below already
+# predicted this exact failure; the 0.82x anchor overrode the rule that prevented it.
+#
+# SAFETY BOUND -- NOT OPTIONAL. A passer scores R_CORRECT - lam*lenpen; a FAILURE scores
+# exactly 0.0. So lam * ceiling >= R_CORRECT makes a correct-but-long answer score WORSE
+# THAN BEING WRONG, inverting the correctness gradient. Raising the ceiling REQUIRES
+# lowering lam. assert_lenpen_bound() gates it; the trainer calls it after it resolves
+# every per-row lambda, so a bad pair cannot reach a single optimizer step.
+LENPEN_CEILING = 1.0
+
+
+def set_lenpen_ceiling(v):
+    """Set the lenpen clamp ceiling. Refuses < 1.0: below 1.0 the clamp bites BEFORE
+    the budget is reached, penalising a rollout for being short enough."""
+    global LENPEN_CEILING
+    v = float(v)
+    if v < 1.0:
+        raise ValueError(
+            "REFUSE: lenpen ceiling %g < 1.0. Below 1.0 the clamp bites BEFORE the "
+            "budget is reached, so a rollout is penalised for being short enough." % v)
+    LENPEN_CEILING = v
+
+
+def assert_lenpen_bound(lam):
+    """REFUSE any (lam, ceiling) pair whose worst passer scores <= a failure's 0.0."""
+    lam = float(lam)
+    if lam <= 0:
+        return
+    if lam * LENPEN_CEILING >= R_CORRECT:
+        raise ValueError(
+            "REFUSE: length_lambda=%g x lenpen_ceiling=%g = %.4f >= R_CORRECT=%g. The "
+            "worst-scoring CORRECT answer would score %+.4f, at or below a FAILURE's "
+            "0.0 -- the correctness gradient inverts and short-and-wrong beats "
+            "long-and-right. Lower length_lambda below %.4f, or lower the ceiling."
+            % (lam, LENPEN_CEILING, lam * LENPEN_CEILING, R_CORRECT,
+               R_CORRECT - lam * LENPEN_CEILING, R_CORRECT / LENPEN_CEILING))
+
 MC_RE = re.compile(r"correct answer is[^A-Da-d]*\(?([A-Da-d])\)?")
 
 # The format bonus is deliberately TINY (an-finetune used the same shape as a separate
@@ -327,7 +375,7 @@ def make_efficiency_reward(tokenizer,
                         "operating point. Set meta.length_budget per row.")
                 else:
                     raw = nt / float(budget)
-                    lenpen = min(raw, 1.0)
+                    lenpen = min(raw, LENPEN_CEILING)
                     r = R_CORRECT - lam * lenpen
                     pen_i[i], raw_i[i] = lenpen, raw
                     under_i[i] = nt < float(budget)
