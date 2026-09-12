@@ -9,6 +9,11 @@ The build arm is named `JackOD4` in the scripts — it was the fourth weighting
 tried. The published model is that arm; the codename is kept in the scripts so
 the logs and this recipe line up, and is dropped from the release name.
 
+**JackOD** is an initialism of the three sources: **Jack** = JackRong's Qwopus
+9B, **O** = Ornith-1.5-9B, **D** = DeltaCoder. `Qwen3.5-9B` is absent from the
+name because it is the shared ancestor the merge is taken *against*, not a
+flavour contributed to the blend.
+
 ## What it is
 
 A four-way `omnimerge_v2` merge over a single shared ancestor, aimed at
