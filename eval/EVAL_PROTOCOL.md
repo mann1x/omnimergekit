@@ -2620,3 +2620,346 @@ Greedy is enforced (template + canonical rule). MRCR composes with the §8
 NoLiMa + RULER-VT + MK1 triad as a 4th long-context signal — co-reference
 disambiguation under many same-distribution distractors, which NIAH/VT do not
 probe.
+
+---
+
+## v2.12 — Multi-turn AGENTIC bench: BFCL V3 via inspect_ai (§8 — 2026-09-12)
+
+Canonical driver: **`eval/agentic/run_arm_bfcl.sh`** (+ `setup_agentic_env.sh`,
+`write_stack_bfcl.sh`, `summarize_arms.py`). Env pins:
+**`requirements-agentic.txt`**. Full rationale: `eval/agentic/README.md`.
+
+### v2.12.1 Why a separate harness at all
+
+**The canonical 9-bench suite is single-turn, so a whole defect class is
+invisible to it by construction** — prompt growth across an agentic loop,
+reasoning re-injection, tool-call degradation, mid-loop truncation. A model
+can hold its 9-bench cells flat and still be unusable in a coding agent. We
+had exactly that: strong single-turn cells, and a cline session that looped
+tool calls and could not complete tasks.
+
+**SWE-bench was tried and rejected for this slot.** Docker-per-instance, tens
+of minutes per sample, and the score is dominated by scaffold — the *same
+model* scores 60.47 / 59.20 / 53.73 under OpenHands / OpenCode / Codex,
+**6.7 pp from the harness alone**. That variance swamps the effects we need to
+resolve. BFCL V3 holds the scaffold fixed, is deterministic, and runs 200
+samples in under an hour on one GPU.
+
+### v2.12.2 The cell
+
+`inspect_evals/bfcl -T categories=multi_turn_base` — **n=200**, V3 stateful
+multi-turn. The scorer compares the **final state of the backend objects**
+(file system, trading bot, ...) plus execution results against ground truth.
+**No LLM judge**, therefore no judge drift between arms — which is what makes
+it usable when the whole effect may be a few points.
+
+V4 `memory_*` / web-search categories need backends we do not install
+(`html2text`, `memory_api_metaclass`). Their import warnings at startup are
+**expected** and do not affect `multi_turn_*`.
+
+### v2.12.3 Stack pinning (§1.4.5 applies, with one addition)
+
+`inspect_evals` **must be pinned by COMMIT, not version** — the project
+re-cuts `0.x` tags over a moving main, so a version string does not identify
+the scorer. `requirements-agentic.txt` carries the commit; `STACK.txt` records
+it by reading `direct_url.json` from the installed dist-info. Verify with the
+**env's own interpreter**, never a git checkout.
+
+This stack is deliberately **lm-eval-free** and lives in its own env. Folding
+it into the omk env would drag two unrelated pin sets together and break
+§1.4.5 for both.
+
+### v2.12.4 PEG-degrade build is REQUIRED — the runner refuses without it
+
+An unpatched llama.cpp **throws** on a full PEG parse failure → HTTP 500 → the
+harness stores an empty completion → **a generation the model produced
+correctly is scored as a failure.** On a *tool-calling* bench that is not a
+rare event, and it biases whichever arm emits more parser-stressing output.
+
+Probe **`libllama-common.so`**, never the `llama-server` binary (a ~17 KB thin
+wrapper; a string probe on it is a confident false negative). And **capture**
+the probe — do not pipe into `grep -q`: under `set -o pipefail`, `grep -q`
+exits early, SIGPIPEs `strings`, and the pipeline reports **failure on a
+successful match**. This bit us while writing this very runner.
+
+### v2.12.5 Cap asymmetry turns this bench into a length meter
+
+If one arm inflates generation it hits `max_tokens` more often than its
+sibling, and the accuracy delta then partly measures **length**, not quality.
+`summarize_arms.py` counts cap-hits per arm and refuses to call a delta clean
+when they diverge by ≥1.5×. Counting only the *final* output misses this —
+**a mid-loop cap is the failure mode**, so the counter walks events.
+
+Size the cap so neither arm is near it. Do not equalise after the fact.
+
+### v2.12.6 The comparison is PAIRED
+
+Both arms see the same sample ids, so the test is **McNemar on the discordant
+pairs** (exact binomial), not two independent proportions. Treating them as
+independent discards the pairing and widens the interval for nothing.
+An **errored** sample is counted apart from a **failed** one — a delta
+computed across different denominators is not a delta.
+
+### v2.12.7 Chat template is part of the measurement
+
+A tool-calling score grades the model **and** the template it ships. To
+isolate a template, hold weights and every serve flag byte-identical, declare
+it in `OMK_DECLARED_VARIABLE`, and treat the arms' **`STACK.txt` diff as the
+audit** — it must show the declared variable and nothing else.
+
+First cohort under this section: `gemma4-128e-chat-template-ab-2026-09-12`,
+isolating Google's live `chat_template.jinja` (18683 B, `ae53464b…`, which
+re-injects prior-turn reasoning across an agentic loop) against the T195.D
+fixed template (19177 B, `d9f21aac…`), on identical 128e Q4_K_M eos106
+weights.
+
+
+### v2.12.9 omk_eval integration — `backend: agentic` (2026-09-12)
+
+The agentic benches are now first-class omk templates, not side scripts. Same
+shape as `mrcr` / `nolima`: `dispatch_agentic()` subprocesses into
+**`eval/agentic/agentic_runner.py`**, which writes **`agentic_result.json`**,
+which `extract_canonical_score()` folds into `summary.json`.
+
+```bash
+omk_eval.py --model <dir> --template agentic_bfcl_multiturn      # tool-use competence
+omk_eval.py --model <dir> --template agentic_bfcl_longctx        # loop_rate headline
+omk_eval.py --model <dir> --template agentic_tb_loop30 --no-server --port 8401
+```
+
+| template | harness | dataset | n | headline |
+|---|---|---|---|---|
+| `agentic_bfcl_multiturn` | bfcl | `multi_turn_base` | 200 | `pass_at_1` |
+| `agentic_bfcl_longctx` | bfcl | `multi_turn_long_context` | 200 | `loop_rate` |
+| `agentic_bfcl_composite` | bfcl | `multi_turn_composite` | 200 | `loop_rate` |
+| `agentic_tb_loop30` | harbor | terminal-bench@2.0 | 30 | `loop_rate` |
+
+**`scoring.metric` is a real decision, not bookkeeping.** For a DEGENERATION
+hypothesis declare **`loop_rate`**: the task pass rate is a *downstream proxy*
+that moves only when a loop is severe enough to wreck the task, so a null there
+is not evidence of absence. Both numbers are always recorded in `summary.json`,
+along with `rep_turns` / `runaway_turns` / `reasoning_p50|p90|max` /
+`cache_read_frac`. Loop detectors: a 2-40 char unit repeated >=8x, one char
+repeated >=41x, or a reasoning block over `scoring.runaway_chars` (10k default)
+— the same detectors as the project's rumination work.
+
+**Pick the instrument that can EXHIBIT the endpoint.** Measured 2026-09-12:
+BFCL `multi_turn` reasoning is p50 **252-480 chars** with a **1.5-4.5%** loop
+rate and no template effect (p=1.0 / p=0.34). The fixture that originally showed
+the effect ran `think_len` to **18,419 chars**. BFCL is a fine tool-use cell and
+a useless degeneration cell — that is a property of the bench, not a refutation
+of the hypothesis. Deep-context (terminal-bench / compilebench / swe-bench)
+is where degeneration lives.
+
+**Harbor templates need container-reachable serving.** Agents run in Docker, so
+`base_url` must be reachable from inside a container: serve on the **docker
+bridge (172.17.0.1)** and drive omk with `--no-server --port N`. **NEVER bind
+0.0.0.0** — `llama-server` has no authentication and the run host has a public
+interface. `run_arm_harbor.sh` refuses any non-private bind address.
+
+**`enable_summarize` MUST stay off for a history-accumulation test.** terminus-2
+defaults it **true** with an 8000-token proactive threshold; it compresses the
+conversation, which is exactly the accumulation under test. The runner defaults
+it off and records the value in `agentic_result.json`.
+
+**Disk is the binding constraint for harbor datasets.** Each terminal-bench task
+pins a pre-built `docker_image` in its `task.toml`. Measured for the 89-task
+set: **49.0 GB compressed**, with a real on-disk expansion of **2.41x** for the
+four ML-heavy images and **4.62x** for the rest => **~160 GB**, against ~160 GB
+of headroom above the 200 GB root-fs floor. Start at 30 tasks (~30 GB) and
+expand; the image cost is paid **once** for both arms of a paired design. Gate
+on free space and abort rather than eat the floor.
+
+**Env:** `requirements-agentic.txt` (lm-eval-free, python 3.12,
+`inspect_evals` pinned by COMMIT). `eval/agentic/setup_agentic_env.sh` for the
+bfcl env; harbor lives in its own venv (`OMK_AGENTIC_ENV` / `selection.harness_env`).
+
+### v2.12.8 Serve flags
+
+Same Gemma-4 llama-server recipe as §v2.7, plus `--jinja` (**mandatory** —
+without it the tool grammar does not come from the chat template and every
+scenario degrades to prose). Per-slot ctx obeys §1.3a against **both**
+`max_tokens` and `thinking_budget+4096`; the runner computes it and refuses
+rather than truncating silently.
+
+### v2.12.10 Reading a harbor job (CORRECTED against a real run, 2026-09-13)
+
+An earlier version of this section was written from harbor's SOURCE and got two things
+wrong. Both were caught by a 2-task smoke. Static reading is necessary but not sufficient:
+**run the smallest real job and diff its actual output tree against your parser before
+trusting a cohort to it.**
+
+**Layout (verified on disk, harbor 0.23.0):**
+
+```
+jobs/<job>/result.json                  <- JOB   (has .stats)
+jobs/<job>/<task>__<hash>/result.json   <- TRIAL (no .stats)   *** ALSO SINGULAR ***
+jobs/<job>/<task>__<hash>/agent/trajectory.json
+jobs/<job>/<task>__<hash>/verifier/{reward.txt,ctrf.json,pytest.log}
+```
+
+harbor's own `models/trial/paths.py` docstring documents the trial file as `results.json`
+(plural). **It is `result.json`.** A glob for the plural finds nothing.
+**Identify job vs trial by SCHEMA (`.stats` is a dict), never by filename.**
+
+**Score from the PER-TRIAL rewards.** The job-level
+`stats.evals[key].pass_at_k` is `{}` **even when every trial passed**, because harbor
+writes its final job file with `exclude_trial_results=True` and its own aggregation then
+runs over an empty list. Observed on a 2/2 perfect run: `pass_at_k={} n_trials=2
+n_errors=0`, `trial_results` key absent, while each trial held
+`{"verifier_result": {"rewards": {"reward": 1.0}}}`.
+
+Apply harbor's own rule to the per-trial rewards: exactly one reward key, value in
+{0,1}, pass@1 = mean over tasks. A multi-key or non-binary reward is a **REFUSAL, not a
+0.0** — raise it. Use the job aggregate only as a cross-check when populated, and warn on
+disagreement. There is no `resolved`/`passed`/`is_resolved` field anywhere in the schema.
+
+Errors: `stats.n_errored_trials`, `evals[key].n_errors`, per-trial `exception_info`. An
+errored trial is not a failed trial.
+
+**Multi-cell refusal:** more than one key in `stats.evals` means the job mixes bases —
+refuse rather than merge (§1.4).
+
+**Loop census** reads `<trial_dir>/agent/trajectory.json` (confirmed present), excluding
+`trajectory.summarization-*.json`. If **zero** trajectories parse, `loop_rate` is
+**withheld as `null`**, never `0.0`.
+
+**Invocation gotchas, all found by the same smoke:**
+- `--dataset` takes a REGISTRY reference (`name@version`, pydantic-validated as
+  `org/name`). A **local directory must use `--path`** or the job dies with
+  "Package name must be in 'org/name' format". `run_arm_harbor.sh` picks by inspecting
+  whether the argument is a directory.
+- The terminus-2 option is **`proactive_summarization_threshold`** (summarizATION). The
+  80-column `harbor agent schema` table TRUNCATES it to `proactive_summariz…`, which is
+  how a wrong guess survives — use `COLUMNS=300`.
+- harbor validates agent kwargs strictly and rejects the whole job on an unknown key.
+
+`eval/agentic/agentic_runner.py::score_harbor` implements all of the above and was
+validated end-to-end against the real smoke job (`pass_at_1=1.0`, `n_pass=2/2`,
+`score_source="per-trial rewards"`, `loop_rate=0.0` over 20 parsed turns).
+
+### v2.12.11 The loop detector — MANDATORY positive control
+
+`eval/agentic/loop_detect.py` is **the** detector. Import it; never re-declare a
+regex in a census script (three drifting copies is how the gap below survived).
+
+**Char-level regexes alone are an invalid loop detector.** The original pair —
+`(.{2,40}?)\1{7,}` and `(.)\1{40,}` — is blind to the shape a reasoning model
+actually produces: a whole **sentence or paragraph** restated verbatim. The unit
+is 60-200 chars (outside the 2-40 window) and recurs 3-400 times.
+
+Measured, BFCL composite, Gemma-4 26B-A4B, 2026-09-12:
+
+| detector | armA blocks | armB blocks |
+|---|---|---|
+| char-level (rep + runchar) | 1 | 9 |
+| **sentence-level** | **29** | **89** |
+
+The worst real block repeated one sentence **402 times out of 421 units** in
+30,920 chars; the char detectors scored it clean.
+
+**Four detectors, always reported SEPARATELY:**
+`rep` (char unit) · `runchar` (single char) · `sentence` (>=3 verbatim repeats
+of a >=60 char unit **within one block**) · `runaway` (block >= `runaway_chars`).
+`looped` is their OR and is a **diluted** indicator: on the composite cell the
+OR-ed flag reported p=0.58 while the sentence component reported p=0.076,
+because the length proxy fires noisily on both arms. **Gate and report on the
+component.**
+
+**A scorer fix voids every earlier cell of that bench.** Every `loop_rate`
+produced before 2026-09-12 was computed with the blind detectors and must be
+re-measured from the retained `.eval` logs before being quoted.
+
+**Positive control is mandatory.** `python eval/agentic/loop_detect.py` runs
+`selftest()`: each detector must fire on its own degeneration control, and
+healthy long reasoning must stay clean. A null loop rate is only reportable if
+the selftest passed on that code path — a zero needs a nonzero floor control.
+
+**Parsing trap:** inspect's assistant `content` is **string-typed in one arm and
+list-of-parts in the other within the SAME cohort**. A probe handling only `str`
+reports ZERO blocks for the list-typed arm — a null that is a parsing bug, not a
+measurement. Use `loop_detect.message_texts()`.
+
+**Negative controls are as mandatory as positive ones — the detector is
+DOMAIN-DEPENDENT.** The same char regexes that were too *blind* on BFCL prose were
+wildly too *loud* on terminal-bench: on 2026-09-13 **every single `rep` firing was a
+false positive**, the repeated unit being `'  '` (code indentation) or `'0. '` (a numpy
+array print). `(.{2,40}?)\1{7,}` matches any 16-char run of repeated whitespace —
+ubiquitous in code, absent from prose. Unfixed, TB30's loop rate would have read ~83%
+of tasks, essentially all indentation.
+
+Rules now enforced in `loop_detect.py`:
+- a repeated unit must carry **word content** (>=3 alphabetic chars);
+- `runchar` fires only when the repeated character is **alphabetic** (`aaaa` is
+  degeneration; `====`, `----`, `0000` are separators and data);
+- `selftest()` carries five NEGATIVE controls taken from real transcripts alongside the
+  positive ones. After the fix, rep firings went 7->0 and 8->0.
+
+The false positives were code **quoted inside the model's own reasoning**, so isolating
+the channel (`steps[].reasoning_content` for terminus-2) is correct for the hypothesis
+but would NOT have fixed them — the detector had to change.
+
+**Always report the WORST repetition count beside the binary rate.** At a 3x threshold
+the sentence detector still counts a model restating its own code while drafting.
+Terminal-bench peaked at **6x/5x**; BFCL composite peaked at **318x/312x**. That
+two-orders-of-magnitude gap is what distinguishes drafting from degeneration, and a
+binary flag hides it.
+
+**Whenever the text domain changes, re-validate both directions before quoting any rate.**
+
+### v2.12.12 Thinking budgets: what they measure, and the cap message (2026-09-13)
+
+Measured on Gemma-4 128e Q4_K_M, BFCL `multi_turn_composite`, budget 8192 vs -1,
+everything else byte-identical (GGUF sha, libllama sha, template, `-c 2097152 -np 8`,
+`max_tokens 32768`, greedy).
+
+**1. A cap-hit rate is NOT a measurement of thinking length.** The budget force-closes
+the thinking block and the model writes its answer anyway, so the rumination relocates
+into the message channel. A call that reaches the budget is therefore *guaranteed* to
+exceed it in total output — the signature is a p99 parked at budget+~30 tokens (8,225
+for 8,192). Removing the budget produced FEWER long calls, not more (≥8192-token calls
+5.02% → 0.77% on armB, 200v200), because the two cells diverge as **trajectories**: one
+early cap hit changes the next turn's input and compounds. Never compare two cells
+call-for-call across a budget change — only task-for-task, on the same ids.
+
+**2. Unbounded goes bimodal.** A call either ends naturally well under the budget or
+never terminates and burns to the `max_tokens` ceiling (22 of armB's 27 long calls sat
+at 32,768). Bounded = rumination-that-still-acts; unbounded = rumination-to-failure.
+
+**3. `--reasoning-budget-message` already exists in llama.cpp** and is the knob that
+makes a cap actionable: `common/reasoning-budget.cpp` forces an arbitrary token sequence
+when the budget expires, and `server-task.cpp` builds it as `tokenize(message + end_tag)`.
+Pass it alongside `--reasoning-budget N`. Verify it **lands in the text**, not just in
+the log — read an assistant block and look for the message immediately before `</think>`.
+FINAL result on all 29 cap-hitting tasks, all three cells complete (an earlier draft of
+this section quoted 0.555 / 15-of-16 — those were interim at n=16 and are SUPERSEDED):
+announcing the cap cuts the loop rate **28/29 → 17/29**; it shortens the median generation
+by only ~16% (paired ratio **0.836**); and it does **not** save compute — total output is
+unchanged (2.29M vs 2.32M) because the announced cell makes **26% more model calls**
+(1,458 vs 1,157). It rescues no accuracy (0/29 in both capped cells — that cohort has no
+headroom) and does not eliminate degeneration: 17/29 still loop and one task never
+converged, absorbing ~60 of the 179 forced caps while being told to stop each time.
+Note how the median ratio drifted 0.555 (n=16) -> 0.765 (n=28) -> 0.836 (n=29): do not
+publish a length ratio off a partial cell.
+
+**4. Count cap hits from the server log, not from token stats.** The marker is
+`reasoning-budget: budget exhausted, forcing end sequence`. `deactivated (natural end)`
+is the non-event. Reconstructing cap hits from output-token distributions works but is
+indirect; the log marker is exact.
+
+**5. Selecting tasks by "hit the cap" biases the cell you selected on.** The capped arm's
+output volume is then high by construction. That subset is still the right place to test
+a *message* effect (paired within task, and neither the message arm nor the no-cap arm
+was selected on its own behaviour), but cap-vs-nocap must be read off the FULL cohort.
+
+**6. Two clocks, and only one is a latency measurement.** inspect records `working_time`
+(model calls + tools) and `total_time` (which includes waiting for a `--max-connections`
+slot). A single task running for hours holds its slot, so the arm's completion counter
+stalls while per-task speed is unchanged — we observed a 2.8x gap in *completed task
+count* between two arms whose per-task times were within 2%. Quote paired `working_time`
+on shared ids; never quote cohort wall time from a concurrent run.
+
+**7. Capability gates: never `binary --help | grep -q -- "--flag"` under `set -o
+pipefail`.** `grep -q` exits at the first match, the writer takes SIGPIPE, and pipefail
+reports the pipeline as failed — so a successful match aborts a valid run. Capture first,
+match after (`HELP=$(bin --help 2>&1 || true); case "$HELP" in *--flag*) ;; *) abort;; esac`).

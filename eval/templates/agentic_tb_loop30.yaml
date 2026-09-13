@@ -1,0 +1,48 @@
+# Terminal-Bench via Harbor + terminus-2 — the DEEP-CONTEXT degeneration cell.
+#
+# WHY 30 AND NOT 89. Each task pulls a pre-built image (`docker_image` in its
+# task.toml). Measured: 49.0 GB compressed for all 89, and the real on-disk
+# expansion is 2.41x for the ML-heavy images / 4.62x for the rest => ~160 GB,
+# against ~160 GB of headroom above the 200 GB root-fs floor. Zero margin.
+# 30 tasks is ~30 GB, resolves a large effect on a paired design, and expands.
+# The image cost is paid ONCE for both arms — both run the same tasks.
+#
+# HEADLINE = loop_rate. This cell exists to measure DEGENERATION, and the task
+# pass rate only moves when a loop is severe enough to wreck the task. BFCL
+# cannot exhibit this (reasoning p50 252-480 chars); the fixture that first
+# showed the effect ran think_len to 18,419 chars.
+#
+# enable_summarize is OFF (runner default). terminus-2 defaults it ON with an
+# 8000-token proactive threshold, which COMPRESSES HISTORY — the exact
+# accumulation under test.
+#
+# SERVING: harbor agents run in containers, so serve on the docker bridge
+# (172.17.0.1) with --no-server. NEVER 0.0.0.0 — llama-server has no auth and
+# the host has a public interface.
+name: agentic_tb_loop30
+backend: agentic
+task: terminal_bench_2_0
+n: 30
+selection:
+  harness: harbor
+  dataset: /mnt/sdc/agentbench/datasets/terminal-bench
+  agent: terminus-2
+  limit: 30
+  concurrency: 4
+  harness_env: /mnt/sdc/agentbench/venv-harbor
+generation:
+  max_gen_toks: 32768
+  # -1 = llama.cpp default (unrestricted). A cap is a self-imposed limit and
+  # must not be mistaken for model behaviour; measured, 8192 fired on only
+  # 0.04-0.30% of calls, so it buys nothing here and risks clipping the arm
+  # that reasons more.
+  thinking_token_budget: -1
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: loop_rate
+  runaway_chars: 10000
+  validated_against: harbor/terminal-bench@2.0
+  validation_date: "2026-09-12"

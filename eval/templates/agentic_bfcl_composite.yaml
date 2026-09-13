@@ -1,0 +1,32 @@
+# BFCL V3 multi_turn_composite via inspect_evals — the program's single-turn-free
+# tool-use cell. n=200, stateful backends, deterministic state+execution scorer
+# (no LLM judge, so no judge drift between arms).
+#
+# HEADLINE = pass_at_1 here: this template measures TOOL-USE COMPETENCE.
+# For a DEGENERATION hypothesis use agentic_bfcl_longctx / the harbor templates,
+# which declare `metric: loop_rate` — task score is only a downstream proxy for
+# looping and this bench is far too shallow to exhibit it (measured reasoning
+# p50 252-480 chars, loop rate 1.5-4.5%, no template effect).
+name: agentic_bfcl_composite
+backend: agentic
+task: bfcl_multi_turn_composite
+n: 200
+selection:
+  harness: bfcl
+  dataset: multi_turn_composite
+  limit: 200
+  concurrency: 4
+generation:
+  # max_gen_toks must clear thinking_token_budget with room for the tool call,
+  # or a step that spends its whole budget has ZERO tokens left to emit one.
+  max_gen_toks: 32768
+  thinking_token_budget: 8192
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: loop_rate
+  runaway_chars: 10000
+  validated_against: inspect_evals/bfcl
+  validation_date: "2026-09-12"

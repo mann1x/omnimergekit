@@ -1,0 +1,16 @@
+# requirements-agentic.txt — multi-turn AGENTIC eval harness (EVAL_PROTOCOL §8).
+#
+# Separate from requirements-eval.txt on purpose: this stack is lm-eval-FREE.
+# The agentic harness is inspect_ai, which speaks plain OpenAI-compatible HTTP
+# and therefore drives llama-server / vLLM without any lm-eval coupling. Mixing
+# it into the omk env would drag transformers/datasets pins across two
+# unrelated stacks and break the §1.4.5 cohort rule for BOTH.
+#
+# Python 3.12 (inspect_ai drops 3.11 for some task packages).
+#
+# inspect_evals has NO usable release cadence for our purposes — pin the COMMIT.
+# Bumping either pin is a stack change: it re-scores every arm in the cohort.
+
+inspect_ai==0.3.263
+inspect_evals @ git+https://github.com/UKGovernmentBEIS/inspect_evals@360484a06383f9260279938262d78ed646ddbca1
+openai==3.13.0

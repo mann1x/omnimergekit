@@ -57,6 +57,20 @@ OL_TOP_K="${OL_TOP_K:-20}"
 OL_MIN_P="${OL_MIN_P:-0}"
 OL_PRESENCE_PENALTY="${OL_PRESENCE_PENALTY:-1.5}"
 OL_REPEAT_PENALTY="${OL_REPEAT_PENALTY:-1}"
+# repeat_last_n is OPTIONAL and DEFAULTS TO OMITTED (`-` not `:-`), so every existing
+# invocation of this script keeps emitting the byte-identical Modelfile it did before
+# this knob existed. Set it to pin the penalty window; leave it unset to inherit
+# ollama's own default.
+OL_REPEAT_LAST_N="${OL_REPEAT_LAST_N-}"
+# OL_STRIP_TEMPLATE=1 -- for a model whose STORED tag already carries a WRONG template
+# layer. Default 0 keeps the rule that a real stored template is real and must survive;
+# 1 says "this one is wrong, drop it" and makes every Modelfile this script derives come
+# out with no TEMPLATE line at all, regardless of what the manifest holds.
+# It does NOT reach into an already-stored manifest: emit_params never writes a TEMPLATE,
+# so a freshly created tag only acquires one from the GGUF's own chat_template metadata.
+# If that happens, assert_stored_identity still refuses and names the cause, because the
+# fix then belongs in the GGUF, not in a Modelfile.
+OL_STRIP_TEMPLATE="${OL_STRIP_TEMPLATE:-0}"
 # MTP self-speculative decoding. ollama maps draft_num_predict to
 # `--spec-type draft-mtp --spec-draft-n-max N --spec-draft-backend-sampling`.
 # n=3 is a deliberate default: on Blackwell (5080) 189.65 -> 251.94 tok/s (+33%) at n=3 but
@@ -134,6 +148,9 @@ sanitize_shown_modelfile(){
   if [ ! -f "$mf" ]; then say "  REFUSE: cannot sanitize $full -- no stored manifest"; return 1; fi
   has_tmpl=0
   grep -q "vnd\.ollama\.image\.template" "$mf" && has_tmpl=1
+  # OL_STRIP_TEMPLATE=1: the stored template is known-wrong for this model, so treat it
+  # as absent and let SANITIZE_PY drop every TEMPLATE line it sees.
+  [ "$OL_STRIP_TEMPLATE" = 1 ] && has_tmpl=0
   cd="$("$PY" -c 'import json,sys;print(json.load(open(sys.argv[1]))["config"]["digest"].replace(":","-"))' "$mf")" || return 1
   cfg="$OL_STORE/blobs/$cd"
   req="$("$PY" -c 'import json,sys;print(json.load(open(sys.argv[1])).get("requires") or "")' "$cfg" 2>/dev/null)"
@@ -157,6 +174,13 @@ assert_stored_identity(){
   mf="$OL_STORE/manifests/registry.ollama.ai/$name/$tg"
   if [ ! -f "$mf" ]; then say "  REFUSE: no stored manifest at $mf"; return 1; fi
   if grep -q "vnd\.ollama\.image\.template" "$mf"; then
+    if [ "$OL_STRIP_TEMPLATE" = 1 ]; then
+      say "  REFUSE: $full STILL carries a TEMPLATE layer with OL_STRIP_TEMPLATE=1 set."
+      say "          This script never emits a TEMPLATE line, so the layer came from the"
+      say "          GGUF's own chat_template metadata -- a Modelfile flag cannot remove it."
+      say "          Strip it at the GGUF level and rebuild the tier. NOT PUSHING."
+      return 1
+    fi
     say "  REFUSE: $full carries a TEMPLATE layer. The RENDERER is the chat format; a"
     say "          passthrough TEMPLATE beside it is redundant at best and overrides it"
     say "          at worst. Never rebuild a Modelfile from \`ollama show --modelfile\`,"
@@ -230,6 +254,7 @@ emit_params(){   # shared by text and vision so the two can never drift apart
   echo "PARAMETER min_p $OL_MIN_P"
   echo "PARAMETER presence_penalty $OL_PRESENCE_PENALTY"
   echo "PARAMETER repeat_penalty $OL_REPEAT_PENALTY"
+  [ -n "$OL_REPEAT_LAST_N" ] && echo "PARAMETER repeat_last_n $OL_REPEAT_LAST_N"
   [ "$DRAFT_N" != 0 ] && echo "PARAMETER draft_num_predict $DRAFT_N"
 }
 

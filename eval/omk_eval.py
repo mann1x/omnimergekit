@@ -63,6 +63,7 @@ MPE_DIR = REPO_ROOT / "eval" / "multipl_e"
 NOLIMA_DIR = REPO_ROOT / "eval" / "nolima"
 RULER_DIR = REPO_ROOT / "eval" / "ruler_native"
 MRCR_DIR = REPO_ROOT / "eval" / "mrcr"
+AGENTIC_DIR = REPO_ROOT / "eval" / "agentic"
 
 
 def log(msg: str) -> None:
@@ -1257,6 +1258,74 @@ def dispatch_mrcr(template: dict, model_tag: str, base_url: str,
     return subprocess.call(cmd)
 
 
+def dispatch_agentic(template: dict, model_tag: str, base_url: str,
+                     out_dir: Path, tokenizer: str | None) -> int:
+    """Run a MULTI-TURN AGENTIC bench against the served chat-completions endpoint.
+
+    Same shape as dispatch_mrcr: subprocess into eval/agentic/agentic_runner.py,
+    which writes agentic_result.json for extract_canonical_score().
+
+    `selection.harness` picks the harness:
+      bfcl    inspect_evals/bfcl, `selection.dataset` = a BFCL category
+              (multi_turn_base / multi_turn_long_context / multi_turn_composite).
+              No docker. Deterministic state scorer, no LLM judge.
+      harbor  Harbor + `selection.agent` (default terminus-2) on a downloaded
+              dataset dir (terminal-bench / compilebench / aider-polyglot).
+              Docker per task, DEEP context.
+
+    `scoring.metric` chooses the HEADLINE number and it matters: for a
+    degeneration hypothesis use `loop_rate`, because the task pass rate is a
+    downstream proxy that only moves when a loop wrecks the task. Both are
+    always recorded.
+
+    HARBOR + DOCKER: agents run in containers, so `base_url` must be reachable
+    from inside one. Serve on the docker bridge (172.17.0.1) and use
+    --no-server, NEVER 0.0.0.0 — llama-server has no auth and bs2 has a public
+    interface. `tokenizer` is unused (accepted for dispatch symmetry).
+    """
+    g = template.get("generation", {}) or {}
+    sel = template.get("selection", {}) or {}
+    sc = template.get("scoring", {}) or {}
+
+    harness = sel.get("harness")
+    if harness not in ("bfcl", "harbor"):
+        log("ERROR: agentic template needs selection.harness = bfcl|harbor")
+        return 11
+    dataset = sel.get("dataset")
+    if not dataset:
+        log("ERROR: agentic template missing selection.dataset")
+        return 11
+
+    py = os.environ.get("OMK_PYTHON") or (
+        "/root/anaconda3/envs/omnimergekit/bin/python"
+        if os.path.exists("/root/anaconda3/envs/omnimergekit/bin/python")
+        else sys.executable)
+
+    cmd = [
+        py, str(AGENTIC_DIR / "agentic_runner.py"),
+        "--harness", str(harness),
+        "--name", model_tag,
+        "--base-url", base_url,
+        "--out", str(out_dir),
+        "--dataset", str(dataset),
+        "--limit", str(int(sel.get("limit", template.get("n", 0)) or 0)),
+        "--max-tokens", str(int(g.get("max_gen_toks", 32768))),
+        "--temperature", str(float(g.get("temperature", 0.0))),
+        "--concurrency", str(int(sel.get("concurrency", 4))),
+        "--agent", str(sel.get("agent", "terminus-2")),
+        "--runaway-chars", str(int(sc.get("runaway_chars", 10000))),
+        "--metric", str(sc.get("metric", "pass_at_1")),
+    ]
+    if sel.get("enable_summarize"):
+        cmd.append("--enable-summarize")
+    env_dir = sel.get("harness_env") or os.environ.get("OMK_AGENTIC_ENV")
+    if env_dir:
+        cmd += ["--harness-env", str(env_dir)]
+
+    log("agentic: " + " ".join(cmd))
+    return subprocess.run(cmd).returncode
+
+
 def dispatch_multipl(template: dict, model_tag: str, base_url: str,
                      out_dir: Path) -> int:
     """MultiPL-E backend: per-language generate (against the running
@@ -2014,6 +2083,45 @@ def extract_canonical_score(template: dict, out_dir: Path) -> tuple[float | None
             "gen_tok_s": d.get("gen_tok_s"),
             "wall_s_median": d.get("wall_s_median"),
             "vram_peak_mib": d.get("vram_peak_mib"),
+        }
+        return (float(score) if score is not None else None), score_dict
+
+    if backend == "agentic":
+        rj = out_dir / "agentic_result.json"
+        if not rj.exists():
+            return None, {}
+        try:
+            d = json.loads(rj.read_text())
+        except Exception as e:  # pragma: no cover
+            return None, {"error": f"agentic_result.json parse: {e}"}
+        # Headline is whatever the template declared (pass_at_1 or loop_rate);
+        # the runner already resolved it into "score". Keep BOTH plus the
+        # degeneration detail, because a pass-rate null on a degeneration
+        # hypothesis is not evidence of absence.
+        score = d.get("score")
+        score_dict = {
+            "pass_at_1": d.get("pass_at_1"),
+            "loop_rate": d.get("loop_rate"),
+            "n_looped": d.get("n_looped"),
+            "n_pass": d.get("n_pass"),
+            "n": d.get("n"),
+            "rep_turns": d.get("rep_turns"),
+            "runchar_turns": d.get("runchar_turns"),
+            "runaway_turns": d.get("runaway_turns"),
+            "runaway_chars": d.get("runaway_chars"),
+            "reasoning_turns": d.get("reasoning_turns"),
+            "reasoning_p50": d.get("reasoning_p50"),
+            "reasoning_p90": d.get("reasoning_p90"),
+            "reasoning_max": d.get("reasoning_max"),
+            "cap_hits": d.get("cap_hits"),
+            "errors": d.get("errors"),
+            "out_tokens": d.get("out_tokens"),
+            "cache_read_frac": d.get("cache_read_frac"),
+            "harness": d.get("harness"),
+            "agent": d.get("agent"),
+            "dataset": d.get("dataset"),
+            "enable_summarize": d.get("enable_summarize"),
+            "metric": d.get("metric"),
         }
         return (float(score) if score is not None else None), score_dict
 
@@ -2921,6 +3029,8 @@ def main() -> None:
             rc = dispatch_nolima(template, served_name, base_url, out_dir, tokenizer)
         elif template["backend"] == "ruler_native":
             rc = dispatch_ruler_native(template, served_name, base_url, out_dir, tokenizer)
+        elif template["backend"] == "agentic":
+            rc = dispatch_agentic(template, served_name, base_url, out_dir, tokenizer)
         elif template["backend"] == "mrcr":
             rc = dispatch_mrcr(template, served_name, base_url, out_dir, tokenizer,
                                vram_gpu=serve_gpu_id)
