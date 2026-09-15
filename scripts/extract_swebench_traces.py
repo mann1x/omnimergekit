@@ -32,13 +32,25 @@ TWO NORMALISATIONS, both load-bearing:
   2. mini-swe-agent appends a synthetic `{"role": "exit"}` message. It is not a
      chat role; the template would either drop or mis-render it. Removed.
 
-REASONING IS DROPPED FROM THE REPLAYED TRACE, deliberately. mini-swe-agent DOES
-persist `reasoning_content` per message, but the published Tier-B profiles the
-ANSWER channel (it replays saved answer completions), and Gemma-4's template
-strips model-turn thinking anyway. Keeping the tiers commensurable matters more
-than the extra tokens. The field is still READ for one purpose: detecting which
-traces contain a thinking-budget cut, since the nudge is injected into the
-thinking channel and never appears in `content`.
+REASONING IS CARRIED BY DEFAULT (`--reasoning include`). An earlier revision of
+this file dropped it, on the argument that published Tier-B profiles the ANSWER
+channel; that paragraph is superseded and was left stale here until 2026-09-15.
+For AGENTIC CODING the overwhelming majority of expert usage lives in the
+thinking channel -- measured at 69% of trace text on batch 2 -- so stripping it
+discards the signal the map exists to capture. Pass `--reasoning strip` only to
+reproduce the old answer-channel-only cohort, and never mix the two in one pool.
+
+  WARNING, and it fails SILENTLY: `reasoning_content` only reaches the forward
+  pass if the analysis renders with the GENERATION-TIME template and
+  preserve_thinking=True. The stock model-dir template has no reasoning support
+  and drops the field without error -- you get a pool that looks right, is 69%
+  smaller through the renderer than it should be, and says nothing about it.
+  Verify the rendered token count against the trace's own estimate before
+  trusting a map built from this output.
+
+`reasoning_content` is also read to detect which traces contain a thinking-budget
+cut, since the nudge is injected into the thinking channel and never appears in
+`content`.
 """
 from __future__ import annotations
 import argparse
