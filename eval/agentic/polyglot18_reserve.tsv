@@ -1,0 +1,18 @@
+# Reserve alternates, 2 per language. Tier-B replays PASS traces ONLY, so a
+# language whose three primaries all FAIL contributes no class at all. Promote
+# from here (same axis-diversity rule, easier tasks) if a language ends a
+# teacher run with fewer than 2 passes.
+#
+# language  exercise          axis
+rust        acronym           string-processing
+rust        word-count        hash-maps
+cpp         circular-buffer   raii-buffers
+cpp         clock             modular-arithmetic
+python      pov               tree-reparenting
+python      zipper            functional-structure
+go          sublist           slices-comparison
+go          matrix            2d-parsing
+java        bank-account      thread-synchronization
+java        series            string-windows
+javascript  tournament        aggregation-formatting
+javascript  triangle          validation-branching

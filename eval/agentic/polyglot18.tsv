@@ -1,0 +1,28 @@
+# polyglot18 — 18 aider-polyglot tasks, 3 per language, selected for DIVERSE
+# knowledge axes rather than coverage of the 225-task pool. Used to source
+# Tier-B agentic PASS traces for the v7-coder targeting map.
+#
+# Selection rule: within each language, pick three tasks on three DIFFERENT
+# knowledge axes, preferring the task that most exercises that language's own
+# idioms (rust ownership, java generics, js async, go error handling ...). A
+# coder expert map wants breadth of competence, not repetitions of one axis.
+#
+# language  exercise                    axis
+rust        doubly-linked-list          memory-ownership
+rust        macros                      metaprogramming
+rust        parallel-letter-frequency   concurrency
+cpp         binary-search-tree          pointers-recursion
+cpp         complex-numbers             operator-overloading
+cpp         knapsack                    dynamic-programming
+python      sgf-parsing                 recursive-descent-parser
+python      react                       reactive-graph-observers
+python      grep                        file-io-cli-flags
+go          error-handling              language-error-idiom
+go          paasio                      io-interfaces-mutex
+go          markdown                    parser-refactoring
+java        forth                       stack-vm-interpreter
+java        custom-set                  generics-collections
+java        rest-api                    json-routing-state
+javascript  promises                    async-semantics
+javascript  list-ops                    higher-order-functions
+javascript  rectangles                  grid-geometry

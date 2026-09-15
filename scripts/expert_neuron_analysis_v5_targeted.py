@@ -17,6 +17,16 @@ Two-tier signal:
     No generation needed — the completions already exist on disk. Traces
     longer than `--window-tokens` are split into overlapping chunks.
 
+    T203 — a Tier-B trace may instead carry a `messages` key holding a full
+    multi-turn chat trajectory (user -> assistant(tool_calls) -> tool ->
+    assistant -> ...), as produced by `extract_polyglot_traces.py` from harbor
+    agentic runs. When `messages` is present it is rendered through the chat
+    template in one pass (add_generation_prompt=False) and `prompt`/
+    `completion` are ignored; when it is absent the single-turn path is
+    byte-for-byte unchanged, so every previously published map reproduces
+    exactly. The tier prints which shape it actually rendered, and the count
+    is recorded in the output metadata as `tier_b_shape`.
+
 Output: `scripts/expert_neuron_v5_<variant>.json` — drop-in compatible with the
 v4 JSON schema for `generate_drop_map_multiclass.py` extension, with 3 extra
 `targeted_*` class keys alongside the 5 generic ones.
@@ -356,15 +366,45 @@ def chunk_input(input_ids: torch.Tensor, window: int, overlap: int):
         start += step
 
 
+def trace_has_reasoning(trace: dict) -> bool:
+    return any(m.get("reasoning_content") or m.get("reasoning")
+               for m in trace.get("messages", []) if isinstance(m, dict))
+
+
+def _verify_reasoning_rendered(tokenizer, trace) -> None:
+    """HARD GATE (T204). A trace can carry `reasoning_content` and still have it
+    silently dropped: the STOCK model-dir chat template has no reasoning support
+    at all (only `strip_thinking`), while the generation-time v7-coder template
+    gates it behind `preserve_thinking`. Rendering the wrong one means replaying
+    the answer channel while believing we replayed the thinking channel -- the
+    map would be wrong in the one dimension it exists to measure, and nothing
+    downstream would reveal it. Fail at trace 1, not after 12 hours."""
+    txt = tokenizer.apply_chat_template(
+        trace["messages"], tokenize=False, add_generation_prompt=False,
+        preserve_thinking=True, enable_thinking=True)
+    if "<|channel>thought" not in txt:
+        raise SystemExit(
+            "FATAL (T204): trace %r carries reasoning_content but the rendered "
+            "prompt contains no '<|channel>thought' block. The active chat "
+            "template drops history reasoning. Pass --chat-template-file with "
+            "the GENERATION-TIME template (the one llama-server served with); "
+            "the stock model-dir template cannot preserve thinking."
+            % trace.get("task_id"))
+    print("[tier_b] GATE OK: history reasoning renders as '<|channel>thought' "
+          "(verified on trace %r)" % trace.get("task_id"), flush=True)
+
+
 def tier_b_run(model, tokenizer, num_layers, num_experts, intermediate_size,
                traces, window, overlap, all_cats: dict, done_keys: set,
-               checkpoint_cb=None) -> None:
+               checkpoint_cb=None) -> dict:
     """Accumulates per-bench trackers into `all_cats[f"targeted_{bench}"]`
     in-place, skipping traces in `done_keys` (strings
     `"tier_b/<bench>/<task_id>/<set>"`). Calls `checkpoint_cb(done_keys)`
     after each trace."""
     overall_t0 = time.time()
     total = len(traces)
+    n_multi = n_single = n_with_reasoning = 0   # T203 provenance: shape actually used
+    reasoning_verified = {"ok": False}
     for ti, trace in enumerate(traces):
         bench = trace["bench"]
         weight = float(trace.get("weight", 1.0))
@@ -374,15 +414,46 @@ def tier_b_run(model, tokenizer, num_layers, num_experts, intermediate_size,
                 print(f"  [{ti+1}/{total}] {bench}/{trace['task_id']} SKIP (ckpt)",
                       flush=True)
             continue
-        prompt = trace["prompt"]
-        completion = trace["completion"]
-        msgs = [{"role": "user", "content": prompt}]
-        chat_ids = tokenizer.apply_chat_template(
-            msgs, return_tensors="pt", return_dict=True,
-            add_generation_prompt=True, enable_thinking=True)["input_ids"]
-        comp_ids = tokenizer(completion, return_tensors="pt",
-                             add_special_tokens=False)["input_ids"]
-        full_ids = torch.cat([chat_ids, comp_ids], dim=-1).to(model.device)
+        # T203: a trace may carry EITHER the single-turn `prompt`+`completion`
+        # pair (every bench trace from extract_pass_traces.py — unchanged) OR a
+        # full multi-turn `messages` list (agentic trajectories:
+        # user -> assistant(tool_calls) -> tool -> assistant -> ...). The
+        # multi-turn shape is rendered through the chat template in ONE pass so
+        # the tool-result turns survive; those turns are where an agentic coder
+        # cut's signal lives (routing while reading a compiler error or a
+        # failing test), and flattening them into a single completion string
+        # would discard exactly that. `messages` absent => byte-for-byte the
+        # original single-turn path, so every published map stays reproducible.
+        if trace.get("messages"):
+            # add_generation_prompt=False: the trajectory already ENDS on an
+            # assistant turn; a dangling generation prompt would append a
+            # role header that was never routed at trace time.
+            # preserve_thinking=True is REQUIRED for agentic coding traces: the
+            # template gates history reasoning behind it, and the overwhelming
+            # majority of a coder's expert usage lives in the thinking channel.
+            # Without it the thinking tokens are silently dropped and the map
+            # profiles the answer channel instead.
+            full_ids = tokenizer.apply_chat_template(
+                trace["messages"], return_tensors="pt", return_dict=True,
+                add_generation_prompt=False, preserve_thinking=True,
+                enable_thinking=True)["input_ids"].to(model.device)
+            n_multi += 1
+            if trace_has_reasoning(trace):
+                n_with_reasoning += 1
+                if not reasoning_verified["ok"]:
+                    _verify_reasoning_rendered(tokenizer, trace)
+                    reasoning_verified["ok"] = True
+        else:
+            prompt = trace["prompt"]
+            completion = trace["completion"]
+            msgs = [{"role": "user", "content": prompt}]
+            chat_ids = tokenizer.apply_chat_template(
+                msgs, return_tensors="pt", return_dict=True,
+                add_generation_prompt=True, enable_thinking=True)["input_ids"]
+            comp_ids = tokenizer(completion, return_tensors="pt",
+                                 add_special_tokens=False)["input_ids"]
+            full_ids = torch.cat([chat_ids, comp_ids], dim=-1).to(model.device)
+            n_single += 1
         bench_key = f"targeted_{bench}"
         if bench_key not in all_cats:
             all_cats[bench_key] = _new_per_layer_tracker(num_layers, num_experts, intermediate_size)
@@ -407,6 +478,12 @@ def tier_b_run(model, tokenizer, num_layers, num_experts, intermediate_size,
         done_keys.add(item_key)
         if checkpoint_cb is not None:
             checkpoint_cb(done_keys)
+    print(f"[tier_b] DONE: rendered {n_multi} multi-turn (messages) + "
+          f"{n_single} single-turn (prompt+completion) traces "
+          f"[skipped-by-checkpoint: {total - n_multi - n_single}]", flush=True)
+    return {"multi_turn": n_multi, "single_turn": n_single,
+            "with_reasoning": n_with_reasoning,
+            "skipped_by_checkpoint": total - n_multi - n_single}
 
 
 def tier_eog_run(model, tokenizer, num_layers, num_experts, intermediate_size,
@@ -632,6 +709,12 @@ def main():
                     help="Skip Tier-B replay phase. Used for Tier-A-only smoke runs "
                          "(~40 min on 3090, validates bf16 patch) before committing "
                          "to the 12-22 h Tier-B overnight run.")
+    ap.add_argument("--chat-template-file", default=None,
+                    help="Override the tokenizer's chat template with this jinja "
+                         "file. Use the GENERATION-TIME template so replay matches "
+                         "what was served. REQUIRED for agentic traces: the stock "
+                         "model-dir template has no reasoning_content support and "
+                         "silently drops history thinking.")
     ap.add_argument("--load-tier-a-from", default=None,
                     help="Import generic_* categories from an existing v5 output JSON. "
                          "Use when running additional variants (science/math) after the "
@@ -691,6 +774,7 @@ def main():
           f"({'CoT channel' if args.tier_a_thinking else 'ANSWER channel'})", flush=True)
     print(f"  tier-b window/overlap: {args.window_tokens}/{args.window_overlap}", flush=True)
 
+    tier_b_shape = {}   # T203: populated by tier_b_run; {} when Tier-B did not run
     if args.tier_b_json and not args.skip_tier_b:
         print(f"\nLoading Tier-B traces from {args.tier_b_json} …", flush=True)
         with open(args.tier_b_json) as f:
@@ -754,6 +838,14 @@ def main():
             str(MODEL_PATH), dtype=dtype, device_map="cpu",
             trust_remote_code=True, low_cpu_mem_usage=True)
     tokenizer = AutoTokenizer.from_pretrained(str(MODEL_PATH))
+    if args.chat_template_file:
+        _tpl = Path(args.chat_template_file)
+        if not _tpl.exists():
+            raise SystemExit(f"--chat-template-file: {_tpl} does not exist")
+        tokenizer.chat_template = _tpl.read_text()
+        import hashlib
+        _sha = hashlib.sha256(_tpl.read_bytes()).hexdigest()[:16]
+        print(f"[chat-template] OVERRIDE {_tpl.name} sha={_sha}", flush=True)
     model.eval()
     num_layers = model.config.text_config.num_hidden_layers
     num_experts = model.config.text_config.num_experts
@@ -881,10 +973,10 @@ def main():
               "(Tier-A-only smoke / partial rebuild)", flush=True)
     else:
         print(f"\n=== Tier-B: {len(traces)} PASS-trace replays ===", flush=True)
-        tier_b_run(model, tokenizer, num_layers, num_experts,
-                   intermediate_size, traces,
-                   args.window_tokens, args.window_overlap,
-                   all_cats, done_keys, checkpoint_cb=_ckpt_cb_b)
+        tier_b_shape = tier_b_run(model, tokenizer, num_layers, num_experts,
+                                  intermediate_size, traces,
+                                  args.window_tokens, args.window_overlap,
+                                  all_cats, done_keys, checkpoint_cb=_ckpt_cb_b)
 
     # ── T202: agentic_eog emit-position tier (standalone) ────────────────────
     if args.variant == "agentic_eog":
@@ -916,6 +1008,8 @@ def main():
             "tier_b_trace_count": len(traces),
             "tier_b_set_counts": tier_b["metadata"]["set_counts"] if tier_b else {},
             "tier_b_set_weights": tier_b["metadata"]["set_weights"] if tier_b else {},
+            "tier_b_shape": tier_b_shape,   # T203: multi-turn vs single-turn census
+            "chat_template_file": args.chat_template_file,
             "device": args.device,
             "dtype": args.dtype,
             "categories": list(all_cats.keys()),
