@@ -27,6 +27,12 @@ ap.add_argument("dst")
 ap.add_argument("--keep-empty", action="store_true", default=True,
                 help="write neuron_act as [] rather than deleting the key, matching the "
                      "published Qwen maps so downstream readers see the same schema")
+ap.add_argument("--keep-cats", default="",
+                help="comma-separated category names or prefixes to KEEP (e.g. 'generic_'). "
+                     "Used when publishing the Tier-A baseline: its source map also holds "
+                     "stale targeted_* categories from a retired bench basis, which have no "
+                     "business in a public repo and are not what --load-tier-a-from imports "
+                     "(the loader takes generic_* only).")
 ap.add_argument("--verify", action="store_true",
                 help="after writing, re-read both files and assert that every cell field "
                      "other than neuron_act is identical")
@@ -34,6 +40,16 @@ args = ap.parse_args()
 
 d = json.load(open(args.src))
 cats = d["categories"]
+dropped_cats = []
+if args.keep_cats:
+    want = [x.strip() for x in args.keep_cats.split(",") if x.strip()]
+    keep = {c for c in cats if any(c == w or c.startswith(w) for w in want)}
+    if not keep:
+        raise SystemExit("FATAL: --keep-cats %r matched nothing in %s" % (args.keep_cats, sorted(cats)))
+    dropped_cats = sorted(set(cats) - keep)
+    for c in dropped_cats:
+        del cats[c]
+    print("  kept %d categories, dropped %d: %s" % (len(cats), len(dropped_cats), dropped_cats))
 n_cells = n_vals = 0
 for cat in cats.values():
     for rows in cat.values():
@@ -46,6 +62,11 @@ for cat in cats.values():
 
 meta = d.setdefault("metadata", {})
 meta["neuron_act_stripped"] = True
+if dropped_cats:
+    meta["categories_dropped_for_publication"] = dropped_cats
+    meta["categories_dropped_note"] = ("retired/stale bench categories removed for publication; "
+                                       "--load-tier-a-from imports generic_* only, so nothing "
+                                       "that is actually consumed was removed")
 meta["neuron_act_note"] = ("per-neuron vectors removed for publication; the full map is "
                            "required for neuron-level work and is kept on disk")
 with open(args.dst, "w") as fh:
@@ -60,8 +81,10 @@ print("  categories preserved: %s" % sorted(cats))
 if args.verify:
     src = json.load(open(args.src))["categories"]
     dst = json.load(open(args.dst))["categories"]
+    if dropped_cats:
+        src = {k: v for k, v in src.items() if k not in set(dropped_cats)}
     if set(src) != set(dst):
-        raise SystemExit("VERIFY FAILED: category sets differ")
+        raise SystemExit("VERIFY FAILED: category sets differ (beyond the ones dropped on purpose)")
     checked = 0
     for c in src:
         if set(src[c]) != set(dst[c]):
