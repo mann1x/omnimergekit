@@ -1,4 +1,38 @@
-# Gemma-4 26B-A4B — SWE-bench agentic competence maps (q-set convergence study)
+# Gemma-4 26B-A4B — competence maps
+
+Expert competence maps for `google/gemma-4-26B-A4B-it` (128 experts, 30 layers, top-8
+routing). Every map here is the **publication form**: `neuron_act` stripped to `[]`,
+matching the published Qwen maps. Verified field-by-field — every other value is
+unchanged, so any scorer that does not read `neuron_act` produces an identical drop
+map. Neuron-level work (DERN-style redistribution) needs the full maps, which are
+200–500 MB and kept on disk, not in git.
+
+## The historical maps (v4, v5, v5-code)
+
+These are the maps the recipes in this repo actually reference, and until now they were
+not in the repo at all — the scripts pointed at files that did not exist here.
+
+| file | categories | tiers | what it is |
+|---|---|---|---|
+| `competence_gemma4_a4b_v4.json` | 5 | Tier-A only | 2026-04-08. `code, creative, logic, math, science`, legacy bare naming. The map behind the working 109e / v4 models; the most-referenced map in this repo. |
+| `competence_gemma4_a4b_v5.json` | 7 | Tier-A only | 2026-04-08. Adds `gpqa_organic`, `organic_chem`. |
+| `competence_gemma4_a4b_v5_code.json` | 8 | **A + B** | 2026-05-15. 5 × `generic_*` + 3 × `targeted_*`, Tier-B from 360 PASS traces. This is the map imported as the Tier-A baseline by every targeted run (`--load-tier-a-from`). |
+| `competence_gemma4_a4b_v5_code_fixed.json` | 8 | **A + B** | 2026-05-16. Same shape, the corrected build. |
+
+Note on naming: v4 and v5 predate the tier split and use **bare** category names
+(`code`), while the v5-code maps use the `generic_*` / `targeted_*` prefixes that
+`--load-tier-a-from` requires (it imports `generic_*` only). The historical files are
+published **unmodified** — renaming them would break reproduction of the shipped models.
+
+`targeted_lcb_medium_55` is a **retired bench basis**. It is part of these maps' real
+content and is published intact so the shipped drop maps reproduce, but it must not be
+used for reporting.
+
+The v5-code lineage also has `_v2` / `_v3` / `_hybrid` variants on disk. They are not
+published here because no recipe in this repo references them — they were pod-side
+experiments. Ask before treating one as canonical.
+
+## The SWE-bench agentic maps (q-set convergence study)
 
 Six competence maps built from **SWE-bench multi-turn agentic traces**, plus the
 measurement that says how many traces per language a targeted map actually needs.
@@ -75,9 +109,16 @@ cross-language control also sits at ρ 0.92–0.94.
   layers 11–29, inherited from that May-15 source. Inert: no drop-map scorer reads the
   map's `wsum` field (every `wsum` in the generators is a local weight-sum variable).
   All targeted categories produced by the current pipeline are clean.
-- **`neuron_act` is stripped** (`[]`), matching the published Qwen maps. Verified
-  field-by-field: every other value is unchanged across all 46,080 cells, so any
-  scorer that does not read `neuron_act` produces an identical drop map. Neuron-level
-  work (DERN-style redistribution) needs the full ~480 MB maps, kept on disk.
+- **End-of-generation is thin, and this is a known open defect.** Measured on all 43
+  traces: the turn-close token `<turn|>` (106) appears ~4× per trace — the system/user
+  framing only — and **0 of 43 rendered sequences end on it**. In this harness the
+  model's step terminator is `<tool_call|>`, and the episode ends on a submit tool call,
+  so the model never closes its final turn. The extractor also drops the harness's
+  `exit` record, leaving the last tool call unanswered and the sequence ending on a
+  dangling `<|tool_response>` opener. Tool handling itself IS fully covered (tool calls,
+  tool responses and thinking channels all render 1:1 with the trace). The single-turn
+  Tier-A path appends raw completion text with `add_special_tokens=False` and so likely
+  has the same gap. Treat the EOG-handling experts as **under-profiled** in every map on
+  this page until the replay is fixed and the maps rebuilt.
 - Per-trace `set` labels read `C` — that is the pipeline's **weight class** (uniform
   weight 1.0 here), not the q-set letter. The two letter namespaces collide.
