@@ -133,13 +133,16 @@ advisory is not on its own sufficient reason to move them. Decide explicitly,
 record the decision here, and re-pin the whole cohort together — never one
 package silently.
 
-Reviewed 2026-09-03 (4 open Dependabot alerts, 2 high + 2 low, duplicated across
-the two manifests):
+Reviewed 2026-09-15 (10 open Dependabot alerts across four manifests — the two
+eval manifests plus `requirements-grpo.txt` / `requirements-grpo.lock.txt`, which
+Dependabot began covering on 2026-09-09):
 
 | advisory | package | status |
 |---|---|---|
 | `torch.jit.script` memory corruption (`<= 2.12.1`, fixed 2.13.0) | torch 2.10.0 | **NOT EXPOSED** |
-| `save_pretrained` path traversal via chat-template names (`< 5.10.0`, fixed 5.10.0) | transformers 5.5.0 | **ACCEPTED** |
+| `save_pretrained` path traversal via chat-template names (`< 5.10.0`, fixed 5.10.0) | transformers 5.5.0 (eval) | **ACCEPTED** |
+| same advisory, GRPO stack | transformers 5.9.0 (grpo) | **ACCEPTED — but the pin is not blocked, see below** |
+| `load_checkpoint_in_model` path traversal + named-pipe DoS via sharded `weight_map` (`<= 1.14.0`, **no fix released**) | accelerate 1.13.0 / 1.14.0 | **NOT EXPOSED** |
 
 **torch — not exposed.** `git grep -nE "torch\.jit|jit\.script|jit\.trace|TorchScript"`
 over the whole tracked tree returns zero hits. The vulnerable entry point is never
@@ -155,6 +158,47 @@ Mitigation until the pin moves: treat an untrusted checkpoint's `config.json` /
 `chat_template.jinja` as hostile input — prefer vendor and own-account repos, and
 check `save_pretrained` wrote only inside the intended output dir when merging a
 checkpoint from an unfamiliar author.
+
+**accelerate — not exposed (2026-09-15).** CVE-2026-69112: `load_checkpoint_in_model`
+and `load_checkpoint_and_dispatch` join a sharded index's `weight_map` values onto
+the checkpoint dir without sanitising them (`accelerate/utils/modeling.py`, the
+`os.path.join(checkpoint_folder, f)` after `index["weight_map"]`), so a crafted
+index can read outside the directory or block forever on a named pipe. **No patched
+version exists**, so "upgrade" is not available — the row rests entirely on
+reachability, and reachability was established by enumeration:
+
+- zero calls to either function anywhere in this repo;
+- zero callers anywhere in the environment **outside accelerate itself** (6 files
+  match, all under `accelerate/`);
+- transformers 5.5.0 never calls them — `from_pretrained(device_map=...)` uses its
+  own loader, so the repo's ~200 `device_map` sites do not reach this code;
+- the bitsandbytes bridge (`accelerate/utils/bnb.py` → `load_and_quantize_model`)
+  has zero callers too; transformers routes `BitsAndBytesConfig` through its own
+  `Bnb4BitHfQuantizer` / `Bnb8BitHfQuantizer`, which never touch it.
+
+Introducing a direct `load_checkpoint_in_model` / `load_checkpoint_and_dispatch`
+/ `load_and_quantize_model` call makes the advisory live and this row must be
+revisited.
+
+**transformers on the GRPO stack — accepted, but nothing technical blocks the fix.**
+This is the same advisory already accepted for the eval pins, and 5.9.0 is likewise
+`< 5.10.0`. It differs in one respect worth recording: the eval pins are held by
+*provenance* (moving them invalidates published bases), whereas the GRPO stack has
+no dependency-resolver obstacle — `vllm==0.27.1` requires `transformers>=5.5.3` and
+`trl==1.12.0` requires `>=4.56.2`, neither with an upper bound, so `5.10.0` satisfies
+both. What holds the GRPO pin is the same basis argument, not a conflict: moving it
+mid-campaign makes later runs incomparable to the arms already measured. So this row
+is a **decision**, not a constraint, and the fix is available the moment a GRPO
+cohort boundary opens.
+
+**A note on re-verifying any row here.** These statuses rest on "no caller exists"
+greps, and a grep that silently returns zero is indistinguishable from a clean
+result. In this environment the interactive `grep` is a shell *function* wrapping
+ugrep with `--ignore-files`, which skips ignored paths — over site-packages it
+reported **0 files** where `command grep` found **6**. Re-verify with `git grep`
+(tracked tree) or `command grep` (environment), never the bare wrapper, and quote
+`--include="*.py"`: unquoted, the shell expands it against the cwd, and in this
+repo root it collapses to `--include=omnimergekit.py`, silently searching one file.
 
 Revisit when a cohort boundary opens (no eval in flight, no run mid-campaign):
 that is the only cheap moment to move the pin.
