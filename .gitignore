@@ -166,3 +166,13 @@ recipes/qwen3_6_35b_a3b_prune/results/router_calib_corpus_ornith.jsonl
 **/router_calib_corpus*.jsonl
 eval/efficiency/grpo_pool_v*_*.jsonl
 eval_results_vllm_suite/**/samples_*.jsonl
+
+# The *.tsv rule above is for eval DATA dumps. The polyglot task manifests are
+# CONFIG — they define which tasks a targeting run sources its traces from, so
+# a run is not reproducible unless they are tracked.
+!eval/agentic/polyglot18.tsv
+!eval/agentic/polyglot18_reserve.tsv
+
+# editor/script backups (the pre-change state lives in git history)
+*.bak
+*.bak_*

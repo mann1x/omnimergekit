@@ -1,0 +1,53 @@
+# LiveCodeBench v6 MEDIUM-73 (lcb_v6_plus_73q) — the COMPANION half of a 150-problem
+# measurement. lcb_v6_77q holds every hard problem the v6 window offers (verified: the
+# pool at difficulty=hard, min_date=2024-01-01, testtype=functional is exactly 77, all
+# already in that set), so this half is drawn from the 132-problem medium pool, sorted by
+# task_id and asserted DISJOINT from the 77.
+#
+# USE: run both templates per cell and pool them. 77 + 73 = 150 problems. Every field
+# below that affects the measurement is byte-identical to lcb_v6_77q -- same greedy
+# generation block, same backend_args, same backend_overrides, same scorer -- so pooling
+# is legitimate. Only name / n / task-id file / cache prefix differ.
+#
+# Build script: eval/lcb/build_lcb_v6_plus_73q.py (deterministic, re-runnable).
+#
+# NOTE ON DIFFICULTY: these are medium problems and medium saturates for strong models.
+# Read the pooled 150 as the primary number, and keep the 77-hard split available --
+# a effect that lives only in the hard half is a real finding, not an artifact.
+name: lcb_v6_plus_73q
+backend: lcb_custom
+task: livecodebench
+n: 73
+selection:
+  type: filter           # filter + task_ids_file (the loader bypasses difficulty/date in task_ids mode)
+  task_ids_file: eval/lcb/lcb_v6_plus_73q_taskids.json
+  difficulty: medium          # inert in task_ids mode (loader bypasses); documents the build = all hard
+  min_date: "2024-01-01"    # inert in task_ids mode; documents the build window
+  testtype: functional
+generation:
+  max_gen_toks: 32768   # EXTENDED: hard problems were hitting the per-slot ctx wall at ~15-16k. ALWAYS 32k.
+  thinking_token_budget: 12288   # forcing-function: prevents pruned-variant rumination loops
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  http_timeout: 1200
+scoring:
+  scorer: lcb_helpers
+  validated_against: lcb_runner.evaluation.testing_util.grade_call_based
+backend_args:
+  apply_chat_template: true
+  llama_ctx: 262144        # -c 262144 (256k) / parallel 8 = 32768 per slot; no per-slot cap at 32k gen
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: lcb_v6_plus_73q
+reports:
+  token_stats: true
+dependencies:
+  python_modules: [datasets]
+backend_overrides:
+  llama:
+    backend_args:
+      llama_extra_replace: true
+      llama_extra: ["--reasoning-format", "deepseek", "--reasoning-budget", "12288"]
