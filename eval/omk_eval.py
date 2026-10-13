@@ -939,9 +939,15 @@ def dispatch_lm_eval(template: dict, model_tag: str, base_url: str,
     # them here for vLLM to avoid llama-server rejecting unknown per-request
     # fields. Populated only when a sampler profile carries them.
     if template.get("_runtime_backend") == "vllm":
-        for k in ("min_p", "repeat_penalty"):
+        for k in ("min_p", "repeat_penalty", "presence_penalty"):
             if k in g:
                 gen_kw_parts.append(f"{k}={g[k]}")
+        # vLLM's repetition penalty has no window. Never drop the key quietly:
+        # an unrecorded sampler axis is a basis violation.
+        if g.get("repeat_last_n") is not None:
+            log(f"WARN sampler: repeat_last_n={g['repeat_last_n']} is UNSUPPORTED on vLLM "
+                "(repetition penalty spans the whole context); recorded in summary.json.sampler.unsupported")
+            template.setdefault("_sampler_meta", {}).setdefault("unsupported", []).append("repeat_last_n")
     cmd = [
         os.environ.get("LM_EVAL_BIN", "lm-eval"),
         "--model", "local-chat-completions",
@@ -1057,7 +1063,9 @@ def dispatch_lcb(template: dict, model_tag: str, base_url: str,
     if _sm.get("name") and _sm.get("name") != "template_default":
         for _flag, _key in (("--temperature", "temperature"), ("--top-p", "top_p"),
                             ("--top-k", "top_k"), ("--min-p", "min_p"),
-                            ("--repeat-penalty", "repeat_penalty")):
+                            ("--repeat-penalty", "repeat_penalty"),
+                            ("--repeat-last-n", "repeat_last_n"),
+                            ("--presence-penalty", "presence_penalty")):
             if g.get(_key) is not None:
                 cmd += [_flag, str(g[_key])]
     log(f"lcb shim: {' '.join(shlex.quote(c) for c in cmd)}")
@@ -2656,12 +2664,13 @@ def main() -> None:
     }
     # Grep-able, always-emitted record of the EFFECTIVE sampler (in every logfile).
     log(">>> OMK_SAMPLER template={} name={} source={} profile={} "
-        "temp={} top_p={} top_k={} min_p={} rep={} do_sample={}".format(
+        "temp={} top_p={} top_k={} min_p={} rep={} rep_last_n={} presence={} do_sample={}".format(
             template["name"], _samp_name or "template_default", _samp_src,
             template["_sampler_meta"]["profile"],
             _gen.get("temperature", 0.0), _gen.get("top_p", 1.0),
             _gen.get("top_k", 0), _gen.get("min_p", "-"),
-            _gen.get("repeat_penalty", "-"), _gen.get("do_sample", False)))
+            _gen.get("repeat_penalty", "-"), _gen.get("repeat_last_n", "-"),
+            _gen.get("presence_penalty", "-"), _gen.get("do_sample", False)))
 
     # Runtime field overrides (--metadata). Applied LAST so the CLI is the most
     # authoritative layer (above template defaults and backend_overrides). Lets
@@ -2873,7 +2882,9 @@ def main() -> None:
             # shim additionally sends them per-request. No-op when no profile set.
             _sgen = template.get("generation", {}) or {}
             for _sk, _flag in (("min_p", "--min-p"),
-                               ("repeat_penalty", "--repeat-penalty")):
+                               ("repeat_penalty", "--repeat-penalty"),
+                               ("repeat_last_n", "--repeat-last-n"),
+                               ("presence_penalty", "--presence-penalty")):
                 if _sk in _sgen and _flag not in llama_extra:
                     llama_extra += [_flag, str(_sgen[_sk])]
             # Env override wins (LLAMA_EXTRA="--flag1 value1 --flag2 value2").
@@ -3138,6 +3149,8 @@ def main() -> None:
                 "top_k": _sg.get("top_k", 0),
                 "min_p": _sg.get("min_p"),
                 "repeat_penalty": _sg.get("repeat_penalty"),
+                "repeat_last_n": _sg.get("repeat_last_n"),
+                "presence_penalty": _sg.get("presence_penalty"),
                 "do_sample": _sg.get("do_sample", False),
             },
         },

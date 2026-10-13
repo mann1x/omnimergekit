@@ -45,6 +45,14 @@ samplers:
     min_p: 0.05
     repeat_penalty: 1.1
     do_sample: true
+  deployment_v9:          # gemma-4-A4B-20B-v9-agentic shipped sampler (owner, 2026-10-13)
+    temperature: 0.8      # a NEW entry: `deployment` above stays as measured, so its
+    top_p: 0.95           # cohort remains citable. No min_p in this one.
+    top_k: 64
+    repeat_penalty: 1.08
+    repeat_last_n: 96     # llama-server only; recorded as unsupported on vLLM
+    presence_penalty: 0.05
+    do_sample: true
 
 bench_policy:
   default: greedy

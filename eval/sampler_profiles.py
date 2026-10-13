@@ -47,8 +47,12 @@ MODELS_DIR = Path(__file__).resolve().parent / "models"
 # Sampler knobs we recognise. temperature/top_p/top_k/do_sample overlay the
 # template `generation:` block directly; min_p/repeat_penalty are routed
 # per-backend by the runner (server-launch flags for llama-server + MultiPL-E,
-# per-request fields for vLLM gen_kwargs + the LCB shim).
-SAMPLER_KEYS = ("temperature", "top_p", "top_k", "min_p", "repeat_penalty", "do_sample")
+# per-request fields for vLLM gen_kwargs + the LCB shim). repeat_last_n and
+# presence_penalty (2026-10-13) take the same route as repeat_penalty; vLLM has
+# no repetition window, so repeat_last_n is recorded there as UNSUPPORTED
+# instead of being dropped silently.
+SAMPLER_KEYS = ("temperature", "top_p", "top_k", "min_p", "repeat_penalty",
+                "repeat_last_n", "presence_penalty", "do_sample")
 
 
 def resolve_path(ref: str) -> Path:

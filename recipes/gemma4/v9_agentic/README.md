@@ -1,5 +1,15 @@
 # gemma-4-A4B-20B-v9-agentic — recipe
 
+> **CORRECTION 2026-10-13 — the recipe below is NOT the agentic-targeted v9-agentic.**
+> `v8coder_fk12_drop_map.json` ("STD12") is built on the **v7 code map**
+> (`expert_neuron_v7_code.json`): it is v7-coder with four experts swapped and uses no
+> agentic traces. It was mislabelled as a v9-agentic variant. The agentic-targeted line is
+> `maps/v9_agentic_drop_map.json` (data `expert_neuron_v9_agentic_code.json`, 43 multi-turn
+> tool-calling sessions as tier B). Two candidates on that map, each adding the 12
+> loop-specific pins, are being built by `scripts/build_v9_agentic_ab_solidpc.sh`; this
+> page will be rewritten for whichever is selected. Nothing has been published to
+> Hugging Face from the recipe below.
+
 Published as [`ManniX-ITA/gemma-4-A4B-20B-v9-agentic`](https://huggingface.co/ManniX-ITA/gemma-4-A4B-20B-v9-agentic).
 Internal build name: **STD12** (the K = 12 rung of the force-keep ladder). Successor of
 `gemma-4-A4B-98e-v7-coder-it` (STD16, K = 16).

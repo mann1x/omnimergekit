@@ -98,7 +98,8 @@ def chat_complete(base_url: str, model: str, prompt: str, max_tokens: int,
         "stream": False,
     }
     if sampler:
-        for _k in ("temperature", "top_p", "top_k", "min_p", "repeat_penalty"):
+        for _k in ("temperature", "top_p", "top_k", "min_p", "repeat_penalty",
+                   "repeat_last_n", "presence_penalty"):
             _v = sampler.get(_k)
             if _v is not None:
                 payload[_k] = _v
@@ -227,6 +228,8 @@ def main():
     ap.add_argument("--top-k", type=int, default=None)
     ap.add_argument("--min-p", type=float, default=None)
     ap.add_argument("--repeat-penalty", type=float, default=None)
+    ap.add_argument("--repeat-last-n", type=int, default=None)
+    ap.add_argument("--presence-penalty", type=float, default=None)
     args = ap.parse_args()
 
     # Collapse the sampler flags into a dict of only the explicitly-set knobs;
@@ -235,6 +238,8 @@ def main():
         "temperature": args.temperature, "top_p": args.top_p,
         "top_k": args.top_k, "min_p": args.min_p,
         "repeat_penalty": args.repeat_penalty,
+        "repeat_last_n": args.repeat_last_n,
+        "presence_penalty": args.presence_penalty,
     }.items() if v is not None} or None
     if sampler:
         print(f"[lcb] sampler override: {sampler}", flush=True)
