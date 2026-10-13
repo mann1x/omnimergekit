@@ -104,6 +104,35 @@ CD_MIX_HYBRID_QUANTS = [
     "CD-IQ2_M_h", "CD-IQ2_XS_h",
 ]
 
+# ── Ternary Bonsai 2 weight types (PQ2_0 / PTQ1_0) ───────────
+# Written by `opencoti-quantize` (tools/opencoti-quantize/), NOT by stock
+# llama-quantize, which does not know these ftypes. Ids are PrismML's, so a
+# file we write is byte-identical to a published Ternary-Bonsai-2 GGUF:
+#
+#   PQ2_0   ftype 141  ggml 142  group 128, fp16 scale + 2-bit codes, 2.13 bpw
+#   PTQ1_0  ftype 143  ggml 143  group 128, base-3 packed trits,      1.75 bpw
+#
+# OPT-IN ONLY, DELIBERATELY. Both codecs target ternary-TRAINED weights
+# (Bonsai-style QAT). Quantizing an ordinary model to them is mechanically
+# valid and runs, but the loss is heavy — they are not general low-bit tiers,
+# and putting them in DEFAULT_QUANTS would ship a bad tier on every sweep.
+# Request explicitly: `--only PQ2_0` / `--only PTQ1_0`.
+#
+# They also take NO imatrix: neither name matches the _K / IQ rule, and the
+# codecs do not consume one. `quantize_one` asserts that explicitly rather
+# than relying on the name rule staying true.
+BONSAI2_QUANTS = ["PQ2_0", "PTQ1_0"]
+
+# The ggml TYPE id each codec stamps on its tensors — distinct from the ftype
+# above, and the number a PRE-c11 engine prints when it rejects the file.
+BONSAI2_GGML_TYPE = {"PQ2_0": 142, "PTQ1_0": 143}
+
+# `general.file_type` the output MUST carry. Read back after every build:
+# asking for a tier is not proof of getting it (a stock llama-quantize on
+# PATH would silently produce something else entirely).
+BONSAI2_FTYPE = {"PQ2_0": 141, "PTQ1_0": 143}
+
+
 # Tiers the script knows how to build but does NOT include in a full sweep.
 # Users explicitly opt in by listing them in `--only`. Putting a tier here
 # (rather than deleting it outright) preserves the ability to reproduce older
@@ -117,7 +146,7 @@ OPT_IN_QUANTS = [
     # possible future testing (other archs / future parser / redefinition).
     # Validate carefully before any real use.
     "CD-IQ3_K_M", "CD-IQ2_K",
-] + CD_MIX_L_QUANTS + CD_MIX_HYBRID_QUANTS
+] + CD_MIX_L_QUANTS + CD_MIX_HYBRID_QUANTS + BONSAI2_QUANTS
 
 # Default sweep when --only is not given.
 DEFAULT_QUANTS = BARTOWSKI_QUANTS + CD_QUANTS
@@ -521,7 +550,12 @@ def run(cmd: list[str], desc: str = "", timeout: int = None, **kwargs) -> subpro
     """Run a command, print status, raise on failure."""
     if desc:
         print(f"  [{desc}]", flush=True)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kwargs)
+    # errors="replace": a tool is allowed to emit bytes that are not UTF-8, and
+    # a decode error in OUR capture layer must never masquerade as the tool
+    # failing. opencoti-quantize prints progress that is not clean UTF-8, which
+    # raised UnicodeDecodeError here and buried a successful quantize.
+    result = subprocess.run(cmd, capture_output=True, text=True,
+                            errors="replace", timeout=timeout, **kwargs)
     if result.returncode != 0:
         print(f"  FAILED: {' '.join(cmd[:4])}", flush=True)
         print(f"  stderr: {result.stderr[-500:]}", flush=True)
@@ -529,7 +563,7 @@ def run(cmd: list[str], desc: str = "", timeout: int = None, **kwargs) -> subpro
     return result
 
 
-def find_llama_cpp() -> dict[str, str]:
+def _find_llama_cpp_core() -> dict[str, str | None] | None:
     """Find llama.cpp binaries and scripts.
 
     LLAMA_CPP_HOME wins when set. A pinned engine matters: on 2026-09-03 a
@@ -592,6 +626,131 @@ def find_llama_cpp() -> dict[str, str]:
             }
 
     return None
+
+
+# ── opencoti tooling (Ternary Bonsai 2) ──────────────────────
+# Two separate binaries, resolved independently because they fail
+# independently: `opencoti-quantize` WRITES PQ2_0/PTQ1_0, `opencoti-llamafile`
+# is the only engine that can SERVE them. Having one is not having the other,
+# and neither is ever substituted by its stock llama.cpp counterpart — stock
+# does not know these ftypes, so a fallback would not be a degraded result,
+# it would be a different file or a false sanity verdict.
+
+_OPENCOTI_QUANTIZE_SEARCH = [
+    # In-repo, next to its README + SHA256SUMS (bin/ is gitignored: code only).
+    Path(__file__).resolve().parent.parent / "tools/opencoti-quantize/bin/opencoti-quantize",
+    Path("/srv/ml/opencoti-quantize/opencoti-quantize"),
+]
+
+_OPENCOTI_LLAMAFILE_SEARCH = [
+    # Same default omk_eval's --llamafile-bin uses, so one host install serves both.
+    Path("/srv/ml/opencoti-llamafile/llamafile"),
+]
+
+
+def _find_opencoti_quantize() -> str | None:
+    """Path to a `llama-quantize` that can write PQ2_0 / PTQ1_0, or None.
+
+    OPENCOTI_QUANTIZE_BIN wins when set, and is validated rather than trusted:
+    pointing at a stock llama-quantize must fail loudly here, not silently
+    produce a Q2_K named PQ2_0.
+    """
+    env = os.environ.get("OPENCOTI_QUANTIZE_BIN")
+    if env:
+        if not Path(env).is_file():
+            raise RuntimeError(
+                f"OPENCOTI_QUANTIZE_BIN={env} does not exist. Refusing to fall "
+                f"back to stock llama-quantize, which cannot write PQ2_0/PTQ1_0.")
+        return env
+    for cand in _OPENCOTI_QUANTIZE_SEARCH:
+        if cand.is_file():
+            return str(cand)
+    return shutil.which("opencoti-quantize")
+
+
+def _find_opencoti_llamafile() -> str | None:
+    """Path to the opencoti-llamafile server binary, or None.
+
+    OMK_LLAMAFILE_BIN is read first so this script and `omk_eval --backend
+    llamafile` resolve the SAME engine on a given host; OPENCOTI_LLAMAFILE_BIN
+    is accepted as the script-local alias.
+    """
+    for var in ("OPENCOTI_LLAMAFILE_BIN", "OMK_LLAMAFILE_BIN"):
+        env = os.environ.get(var)
+        if env:
+            if not Path(env).is_file():
+                raise RuntimeError(f"{var}={env} does not exist.")
+            return env
+    for cand in _OPENCOTI_LLAMAFILE_SEARCH:
+        if cand.is_file():
+            return str(cand)
+    return shutil.which("opencoti-llamafile")
+
+
+def _ape_argv(bin_path: str, prefix: list[str] | None = None) -> list[str]:
+    """argv head for a binary that may be a Cosmopolitan APE.
+
+    Both opencoti tools ship as APEs: they carry an MZ-DOS / shell polyglot
+    header, not ELF magic. A bare execve() returns ENOEXEC when no binfmt_misc
+    handler is registered; bash silently retries via /bin/sh, but
+    subprocess.Popen(argv) does not. Prepending /bin/sh lets the APE shell stub
+    trampoline into the real binary. A normal ELF keeps an empty head.
+
+    This applies to the QUANTIZER as well as the server (bug-448 was filed for
+    the server; the quantizer hits the identical errno 8).
+    """
+    head: list[str] = []
+    try:
+        with open(bin_path, "rb") as f:
+            if f.read(4) != b"\x7fELF":
+                head = ["/bin/sh"]
+    except OSError:
+        pass
+    return head + [bin_path] + list(prefix or [])
+
+
+def _opencoti_quantize_provenance(bin_path: str) -> str:
+    """One line naming WHICH opencoti-quantize build produced a tier.
+
+    The README states a rebuild from the same tree is reproducible, so the
+    sha256 identifies the build. A mismatch against the checked-in SHA256SUMS
+    is reported, never silently accepted and never fatal: a newer local build
+    is legitimate, but it is a different engine and that belongs in the log.
+    """
+    sha = _sha256_of(Path(bin_path))
+    expect_file = (Path(__file__).resolve().parent.parent
+                   / "tools/opencoti-quantize/SHA256SUMS")
+    note = ""
+    try:
+        for line in expect_file.read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].lstrip("*").endswith("opencoti-quantize"):
+                note = (" (matches SHA256SUMS)" if parts[0] == sha
+                        else f" (DIFFERS from SHA256SUMS {parts[0][:12]} — a different build)")
+                break
+    except OSError:
+        note = " (SHA256SUMS not readable)"
+    return f"{bin_path} sha256={sha[:12]}{note}"
+
+
+def find_llama_cpp() -> dict[str, str | None] | None:
+    """`_find_llama_cpp_core()` plus the opencoti tooling keys.
+
+    Added keys (either may be None — callers that need them must say so):
+      quantize_pq : writes PQ2_0 / PTQ1_0
+      llamafile   : serves PQ2_0 / PTQ1_0
+    """
+    tools = _find_llama_cpp_core()
+    extra = {"quantize_pq": _find_opencoti_quantize(),
+             "llamafile": _find_opencoti_llamafile()}
+    if tools is None:
+        # Stock llama.cpp missing is still fatal for the normal path, but keep
+        # the opencoti keys discoverable so the error message can be specific.
+        return None if not any(extra.values()) else {"base": None, "server": None,
+                                                     "quantize": None, "imatrix": None,
+                                                     "convert": None, **extra}
+    tools.update(extra)
+    return tools
 
 
 def install_pod_dependencies():
@@ -943,6 +1102,17 @@ def quantize_one(tools: dict, f16_gguf: Path, output_dir: Path,
                   f"quantize) — discarding and rebuilding", flush=True)
             out_path.unlink(missing_ok=True)
             (output_dir / f"{out_name}.sha256").unlink(missing_ok=True)
+        elif (quant in BONSAI2_QUANTS
+              and _gguf_file_type(out_path) != BONSAI2_FTYPE[quant]):
+            # GGUF magic is the first 4 bytes, so it survives truncation and
+            # says nothing about which codec is inside. For a Bonsai 2 tier the
+            # declared ftype is cheap to re-read, and a mismatch means the file
+            # is either incomplete or was written by a different quantizer.
+            print(f"  {quant}: existing file does not declare file_type="
+                  f"{BONSAI2_FTYPE[quant]} — discarding and rebuilding",
+                  flush=True)
+            out_path.unlink(missing_ok=True)
+            (output_dir / f"{out_name}.sha256").unlink(missing_ok=True)
         else:
             print(f"  {quant}: already exists, skipping", flush=True)
             return out_path
@@ -957,7 +1127,28 @@ def quantize_one(tools: dict, f16_gguf: Path, output_dir: Path,
     else:
         q_type = quant
 
-    cmd = [tools["quantize"]]
+    # Ternary Bonsai 2 tiers are written by opencoti-quantize, never by stock
+    # llama-quantize. HARD-FAIL when it is absent: stock either errors on an
+    # unknown ftype or, on a fork that reuses the name, writes a DIFFERENT
+    # codec under our filename. A missing tool is a setup problem and must read
+    # as one — the same reason the CD path refuses to fall back to uniform.
+    is_bonsai2 = quant in BONSAI2_QUANTS
+    if is_bonsai2:
+        pq_bin = tools.get("quantize_pq")
+        if not pq_bin:
+            raise RuntimeError(
+                f"{quant} needs opencoti-quantize (stock llama-quantize cannot "
+                f"write PQ2_0/PTQ1_0). Looked at: OPENCOTI_QUANTIZE_BIN, "
+                f"tools/opencoti-quantize/bin/opencoti-quantize, "
+                f"/srv/ml/opencoti-quantize/, PATH. Build it with "
+                f"tools/opencoti-quantize/build.sh, or drop {quant} from --only.")
+        print(f"  {quant}: quantizer = {_opencoti_quantize_provenance(pq_bin)}",
+              flush=True)
+        # opencoti-quantize is an APE: exec it bare and Python raises
+        # OSError(errno 8, Exec format error). Same trampoline as the server.
+        cmd = _ape_argv(pq_bin)
+    else:
+        cmd = [tools["quantize"]]
 
     # CD (ContribDynamic) quants: read the per-layer tensor type file, and
     # detect whether ANY tensor is assigned to an IQ*/Q2_K type that needs imatrix.
@@ -1007,7 +1198,13 @@ def quantize_one(tools: dict, f16_gguf: Path, output_dir: Path,
     # quants and any _K tier (minus IMATRIX_EXCLUDE, which is empty by default),
     # or CD- maps that assign at least one tensor to an IQ*/Q2_K tier
     # (a hard llama-quantize requirement, never suppressed by the exclude list).
-    if imatrix_file and (_uses_imatrix_by_rule(quant) or cd_needs_imatrix):
+    #
+    # Bonsai 2 is excluded explicitly, not by trusting the name rule: PQ2_0 /
+    # PTQ1_0 match neither the _K nor the IQ test today, but a future widening
+    # of that rule must not start feeding an imatrix to a codec that has no use
+    # for one.
+    if (imatrix_file and not is_bonsai2
+            and (_uses_imatrix_by_rule(quant) or cd_needs_imatrix)):
         cmd.extend(["--imatrix", str(imatrix_file)])
 
     # _L/_XL variants: keep embed/output at Q8_0 for better quality
@@ -1050,10 +1247,92 @@ def quantize_one(tools: dict, f16_gguf: Path, output_dir: Path,
     #     plain Q-* tier whose GGUF is already gone
     #   - the local dir keeps a tamper-evident audit trail of every produced quant
     #   - the sidecars are also uploaded to HF (~70 bytes each; trivial cost)
+    # Asking for a tier is not proof of getting it. Read `general.file_type`
+    # back out of the shipped bytes and refuse a file that is not the codec we
+    # requested, so a wrong quantizer on PATH cannot ship under our filename.
+    if is_bonsai2:
+        want = BONSAI2_FTYPE[quant]
+        got = _gguf_file_type(out_path)
+        if got != want:
+            out_path.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"{quant}: output carries general.file_type={got}, expected "
+                f"{want}. The quantizer did NOT write the requested codec — "
+                f"discarded. Check which binary {tools.get('quantize_pq')} "
+                f"actually is.")
+        print(f"  {quant}: file_type={got} verified", flush=True)
+
     digest = _write_sha256_sidecar(out_path)
     print(f"  {quant}: {size_gb:.2f} GB ({elapsed:.0f}s)  sha256={digest[:12]}",
           flush=True)
     return out_path
+
+
+# GGUF KV value types, and the byte width of the fixed-size ones.
+_GGUF_SCALAR_WIDTH = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1,
+                      10: 8, 11: 8, 12: 8}
+_GGUF_T_STRING, _GGUF_T_ARRAY = 8, 9
+
+
+def _gguf_file_type(gguf_path: Path):
+    """Read `general.file_type` from a GGUF header. None when unreadable.
+
+    Deliberately NOT via gguf-py. GGUFReader validates every tensor's type
+    against its GGMLQuantizationType enum, so a file holding a type the
+    installed gguf-py does not know raises before any KV is reachable:
+
+        ValueError: 142 is not a valid GGMLQuantizationType
+
+    142 / 143 are exactly PQ2_0 / PTQ1_0, so a gguf-py readback would report
+    "unreadable" for every CORRECT Bonsai 2 file and the assertion built on it
+    would reject the good case. This walks the KV section only — it never looks
+    at the tensor table, so it answers the same way for known and unknown
+    weight types.
+    """
+    try:
+        import struct
+        with open(gguf_path, "rb") as f:
+            if f.read(4) != b"GGUF":
+                return None
+            version, = struct.unpack("<I", f.read(4))
+            if version < 2:        # v1 used 32-bit counts; we never write it
+                return None
+            _n_tensors, n_kv = struct.unpack("<QQ", f.read(16))
+
+            def rd_str():
+                n, = struct.unpack("<Q", f.read(8))
+                return f.read(n)
+
+            def skip_value(vtype):
+                if vtype in _GGUF_SCALAR_WIDTH:
+                    f.seek(_GGUF_SCALAR_WIDTH[vtype], 1)
+                elif vtype == _GGUF_T_STRING:
+                    rd_str()
+                elif vtype == _GGUF_T_ARRAY:
+                    et, = struct.unpack("<I", f.read(4))
+                    cnt, = struct.unpack("<Q", f.read(8))
+                    if et in _GGUF_SCALAR_WIDTH:
+                        f.seek(_GGUF_SCALAR_WIDTH[et] * cnt, 1)
+                    elif et == _GGUF_T_STRING:
+                        for _ in range(cnt):
+                            rd_str()
+                    else:
+                        raise ValueError(f"nested array type {et}")
+                else:
+                    raise ValueError(f"unknown KV type {vtype}")
+
+            for _ in range(n_kv):
+                key = rd_str()
+                vtype, = struct.unpack("<I", f.read(4))
+                if key == b"general.file_type":
+                    if vtype not in (4, 5):      # uint32 / int32
+                        return None
+                    return struct.unpack("<i" if vtype == 5 else "<I",
+                                         f.read(4))[0]
+                skip_value(vtype)
+    except Exception:
+        return None
+    return None
 
 
 def _sha256_of(path: Path) -> str:
@@ -1211,15 +1490,210 @@ def verify_cd_distinct(cd_path: Path, quant: str, model_name: str,
 
 # ── Sanity check ─────────────────────────────────────────────
 
+# Tiers whose sanity check could not RUN (engine cannot serve the codec, or no
+# engine configured) as opposed to tiers that ran and failed. A skip returns
+# True so the post-push gate does not withdraw bytes over a harness limitation
+# (bug-665: a failure is a report, not a verdict) — but it is never silent:
+# main() prints this ledger as its own block at the end of the run.
+_SANITY_SKIPPED: list[tuple[str, str]] = []
+
+# An engine that cannot serve a weight type refuses it instead of running it
+# badly. That refusal is an ENGINE fact, not a model defect, so it must not
+# reach the gate as a FAIL. There are TWO distinct refusals, and only testing
+# against a real engine showed it:
+#
+#   PRE-c11 (every build shipped as of 2026-10-09, incl. dist 0.10.5-c7 and
+#   bs2 0.10.3-c6) does not know the type ids at all and dies in the GGUF
+#   loader, before any backend is consulted:
+#       gguf_init_from_reader: tensor 'fc.weight' has invalid ggml type 142.
+#       should be in [0, 52)
+#
+#   c11 row 3.1 onward parses the type and then declines for want of a kernel:
+#       type pq2_0: no backend in this build has a kernel for it
+#
+# The first message is matched on OUR ggml type id specifically, never on the
+# generic "failed to read tensor info" — that phrase also fires on a genuinely
+# corrupt file, which IS a defect and must stay a FAIL.
+_NO_KERNEL_MARKERS = (
+    "no backend in this build has a kernel",
+    "unknown ggml_type",
+    "unknown quantization type",
+    "unsupported quantization type",
+    "unsupported model file type",
+)
+
+
+def _sanity_check_bonsai2(tools: dict, gguf_path: Path, quant_name: str,
+                          port: int) -> bool:
+    """Sanity-check a PQ2_0 / PTQ1_0 GGUF on opencoti-llamafile.
+
+    A separate path because stock llama-server CANNOT load these types at all:
+    running the normal check against it would report a clean build as a model
+    failure on every Bonsai 2 tier. Three distinct outcomes, kept distinct:
+
+      no engine configured        -> SKIP (True, recorded)
+      engine has no kernel yet    -> SKIP (True, recorded)
+      engine serves it and answers-> real PASS / FAIL on the answers
+
+    As of 2026-10-09 every shipped opencoti build (newest dist 0.10.5-c7,
+    bs2 0.10.3-c6) predates the PQ kernels: the types LOAD from c11 row 3.1,
+    CPU kernels are row 3.2 and CUDA / Vulkan rows 3.3 / 3.7. So the expected
+    outcome today is the second one, and it must read as "not checked", never
+    as "bad quant".
+    """
+    import requests
+
+    bin_path = tools.get("llamafile")
+    if not bin_path:
+        reason = ("no opencoti-llamafile configured (set OMK_LLAMAFILE_BIN or "
+                  "install /srv/ml/opencoti-llamafile/llamafile); stock "
+                  "llama-server cannot load this codec")
+        print(f"  {quant_name}: sanity SKIPPED — {reason}", flush=True)
+        _SANITY_SKIPPED.append((quant_name, reason))
+        return True
+
+    log_path = Path(str(gguf_path) + ".sanity.log")
+    args = _ape_argv(bin_path, ["--server"]) + [
+        "-m", str(gguf_path), "--port", str(port),
+        # Flag set verified against opencoti-llamafile 0.10.5-c7 --server
+        # --help. `--nobrowser` does NOT exist (it exits "invalid argument"),
+        # and --jinja is default-enabled — passed explicitly so the model's own
+        # template is on the record rather than assumed.
+        "-c", "4096", "--no-warmup", "-t", "4", "--jinja",
+    ]
+
+    def _spawn(argv, mode):
+        # Server output goes to a FILE, never to a pipe nobody drains: a
+        # PIPE that fills blocks the child mid-load and the readiness probe
+        # then times out against a server that was merely gagged.
+        f = open(log_path, mode)
+        try:
+            return subprocess.Popen(argv, stdout=f, stderr=subprocess.STDOUT)
+        finally:
+            f.close()   # the child holds its own dup of the fd
+
+    def _log_text() -> str:
+        try:
+            return log_path.read_text(errors="replace")
+        except OSError:
+            return ""
+
+    def _no_kernel() -> str | None:
+        """The engine's own words when it cannot serve THIS codec, else None."""
+        low = _log_text().lower()
+        ggml_id = BONSAI2_GGML_TYPE.get(quant_name)
+        if ggml_id is not None and f"invalid ggml type {ggml_id}" in low:
+            return (f"invalid ggml type {ggml_id} — this build predates the "
+                    f"Bonsai 2 types (c11 row 3.1)")
+        for m in _NO_KERNEL_MARKERS:
+            if m in low:
+                return m
+        return None
+
+    def _ready(proc, deadline_s: int) -> bool:
+        for _ in range(deadline_s):
+            if proc.poll() is not None:
+                return False
+            try:
+                r = requests.get(f"http://localhost:{port}/health", timeout=2)
+                if '"status":"ok"' in r.text.replace(" ", ""):
+                    return True
+            except Exception:
+                pass
+            time.sleep(1)
+        return False
+
+    proc = _spawn(args, "w")
+    ready = _ready(proc, 240)
+
+    if not ready and proc.poll() is not None:
+        marker = _no_kernel()
+        if marker:
+            reason = (f"opencoti-llamafile at {bin_path} has no kernel for "
+                      f"{quant_name} yet (log: '{marker}'); PQ kernels land in "
+                      f"c11 rows 3.2/3.3/3.7")
+            print(f"  {quant_name}: sanity SKIPPED — {reason}", flush=True)
+            print(f"      engine log: {log_path}", flush=True)
+            _SANITY_SKIPPED.append((quant_name, reason))
+            return True
+        # Could be a flag this build does not know. Retry bare before calling
+        # the quant bad — a harness limitation must never read as a defect.
+        print(f"  {quant_name}: sanity: llamafile exited; retrying with a "
+              f"minimal arg set", flush=True)
+        bare = _ape_argv(bin_path, ["--server"]) + [
+            "-m", str(gguf_path), "--port", str(port), "-c", "4096"]
+        proc = _spawn(bare, "a")
+        ready = _ready(proc, 240)
+        if not ready and proc.poll() is not None and _no_kernel():
+            reason = (f"opencoti-llamafile at {bin_path} has no kernel for "
+                      f"{quant_name} yet")
+            print(f"  {quant_name}: sanity SKIPPED — {reason}", flush=True)
+            _SANITY_SKIPPED.append((quant_name, reason))
+            return True
+
+    if not ready:
+        proc.kill()
+        proc.wait()
+        print(f"  {quant_name}: sanity FAIL — opencoti-llamafile didn't start",
+              flush=True)
+        print(f"      engine log: {log_path}", flush=True)
+        return False
+
+    passed = 0
+    for prompt, expected in SANITY_QUESTIONS:
+        try:
+            r = requests.post(
+                f"http://localhost:{port}/v1/chat/completions",
+                json={"model": "test",
+                      "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": 768, "temperature": 0},
+                timeout=180,
+            )
+            msg = r.json()["choices"][0]["message"]
+            content = (msg.get("content", "") or "") + " " + \
+                      (msg.get("reasoning_content", "") or "")
+            if expected.lower() in content.lower():
+                passed += 1
+            else:
+                print(f"  {quant_name}: sanity: expected '{expected}', "
+                      f"got '{content[:100]}'", flush=True)
+        except Exception as e:
+            print(f"  {quant_name}: sanity error: {e}", flush=True)
+
+    proc.kill()
+    proc.wait()
+
+    # A ternary codec on a model that was NOT ternary-trained is expected to be
+    # a heavy loss, so a content FAIL here is a legitimate quality signal about
+    # that pairing — reported as a FAIL, with the engine named so the reader can
+    # tell codec loss apart from an engine problem.
+    ok = passed >= 2
+    print(f"  {quant_name}: sanity {'PASS' if ok else 'FAIL'} "
+          f"({passed}/{len(SANITY_QUESTIONS)}) on {Path(bin_path).name}",
+          flush=True)
+    return ok
+
+
 def sanity_check(tools: dict, gguf_path: Path, quant_name: str,
                  port: int = 18099) -> bool:
     """Quick sanity check: load model, ask capital questions, validate JSON answers.
-    Uses --fit to auto-adjust GPU offloading to available VRAM."""
+    Uses --fit to auto-adjust GPU offloading to available VRAM.
+
+    Ternary Bonsai 2 tiers (PQ2_0 / PTQ1_0) are routed to
+    `_sanity_check_bonsai2`, which serves them on opencoti-llamafile: stock
+    llama-server has no kernel for those weight types and would fail every one
+    of them for an engine reason.
+    """
     import requests
+
+    if quant_name in BONSAI2_QUANTS:
+        return _sanity_check_bonsai2(tools, gguf_path, quant_name, port)
 
     server_bin = tools.get("server")
     if not server_bin:
-        print(f"  {quant_name}: sanity check skipped (no llama-server)", flush=True)
+        reason = "no llama-server found"
+        print(f"  {quant_name}: sanity SKIPPED — {reason}", flush=True)
+        _SANITY_SKIPPED.append((quant_name, reason))
         return True
 
     # Serve on the model's OWN chat template (--jinja) with a small but NON-ZERO
@@ -1234,10 +1708,20 @@ def sanity_check(tools: dict, gguf_path: Path, quant_name: str,
     # reasoning and still answer, and is harmless on a model that never thinks.
     base_args = [server_bin, "-m", str(gguf_path), "--port", str(port),
                  "-c", "4096", "--fit", "on", "--no-warmup", "-t", "4", "--jinja"]
-    proc = subprocess.Popen(
-        base_args + ["--reasoning-budget", "256"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-    )
+    # Server output goes to a FILE next to the GGUF, not to a PIPE: an undrained
+    # pipe that fills blocks the child mid-load, and the readiness probe then
+    # times out against a server that was only gagged. The log also survives the
+    # run as RCA material for a FAIL.
+    sanity_log = Path(str(gguf_path) + ".sanity.log")
+
+    def _spawn(argv, mode="w"):
+        f = open(sanity_log, mode)
+        try:
+            return subprocess.Popen(argv, stdout=f, stderr=subprocess.STDOUT)
+        finally:
+            f.close()   # the child holds its own dup of the fd
+
+    proc = _spawn(base_args + ["--reasoning-budget", "256"])
 
     # Readiness is `"status":"ok"`, NOT HTTP 200. llama-server answers /health with
     # HTTP 200 and {"error":"Loading model"} for the whole load, so a status-code
@@ -1263,13 +1747,14 @@ def sanity_check(tools: dict, gguf_path: Path, quant_name: str,
         # model defect.
         print(f"  {quant_name}: sanity: server exited; retrying without "
               f"--reasoning-budget", flush=True)
-        proc = subprocess.Popen(base_args, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.PIPE)
+        proc = _spawn(base_args, "a")
         ready = _ready(180)
 
     if not ready:
         proc.kill()
+        proc.wait()
         print(f"  {quant_name}: sanity FAIL — server didn't start", flush=True)
+        print(f"      engine log: {sanity_log}", flush=True)
         return False
 
     # Ask questions
@@ -2084,7 +2569,18 @@ def upload_worker(upload_queue: Queue, repo_id: str, stop_event: Event,
 
             # Optional: push to ollama.com from the SAME local file (no re-download).
             # Skip the F16/F32 base (no one runs an F16 GGUF on ollama).
-            if (ollama_target and gguf_path.exists()
+            #
+            # Bonsai 2 tiers are skipped for a harder reason: ollama's engine has
+            # no ggml type 142/143, so the tag would publish and then fail to load
+            # for everyone who pulled it. A tier nobody can run must not get a
+            # tag — and ollama.com has no delete API, so this is not a mistake
+            # that can be taken back.
+            if (ollama_target and quant_name in BONSAI2_QUANTS):
+                print(f"  {quant_name}: ollama push SKIPPED — ollama's engine has "
+                      f"no kernel for ggml type "
+                      f"{BONSAI2_GGML_TYPE[quant_name]}; the tag would be "
+                      f"unloadable and ollama.com has no delete API", flush=True)
+            elif (ollama_target and gguf_path.exists()
                     and not quant_name.upper().startswith(("F16", "F32"))):
                 pushed = push_to_ollama_from_local(
                     gguf_path, ollama_target,
@@ -3275,6 +3771,24 @@ def main():
             print("  https://ollama.com/<namespace>/<model> -> tag -> Delete.", flush=True)
         print(f"  Local GGUFs were KEPT for RCA under {output_dir}", flush=True)
         print(f"{'!'*60}", flush=True)
+
+    # ── Sanity checks that could not RUN ─────────────────────
+    # A skip is not a pass. These tiers were published without a verdict,
+    # because no configured engine can serve their weight type — print it as
+    # its own block so "sanity PASS" in the log above is never read as
+    # covering them.
+    if _SANITY_SKIPPED:
+        print(f"\n{'~'*60}", flush=True)
+        print(f"  {len(_SANITY_SKIPPED)} TIER(S) WERE NOT SANITY-CHECKED "
+              f"(skipped, NOT passed)", flush=True)
+        print(f"{'~'*60}", flush=True)
+        for q, reason in _SANITY_SKIPPED:
+            print(f"  {q}: {reason}", flush=True)
+        print("  These tiers carry NO serving verdict. Re-run the gate once an "
+              "engine", flush=True)
+        print("  with a kernel for the type is installed "
+              "(gate_published_tiers.py).", flush=True)
+        print(f"{'~'*60}", flush=True)
 
     # ── Summary ──────────────────────────────────────────────
     elapsed = time.time() - t_total

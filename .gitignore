@@ -176,3 +176,9 @@ eval_results_vllm_suite/**/samples_*.jsonl
 # editor/script backups (the pre-change state lives in git history)
 *.bak
 *.bak_*
+
+# LSP engine server map. Generated per machine from the language
+# servers actually installed there, and reconciled by claude-hooks'
+# scripts/sync_cclsp.py — so it is host state, not project state.
+# Committing it would push one host's server set onto every other.
+cclsp.json

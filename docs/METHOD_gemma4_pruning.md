@@ -62,7 +62,7 @@ The 109e model is the headline artifact — well-balanced, fits 12 GB Q4_K_M.
                                 │
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│ 5. Quantize with CD-maps (quantization/quantize_gguf.py)            │
+│ 5. Quantize with CD-maps (scripts/quantize_gguf.py)            │
 │    CD = Contribution-Dynamic. Per-expert quant tier varies by       │
 │    aggregated score from step 1: hot experts get Q6_K, cool         │
 │    experts get Q4_K_M. Combined with imatrix → CD-Q4_K_M.           │

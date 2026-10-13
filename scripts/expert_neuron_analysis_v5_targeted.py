@@ -486,9 +486,58 @@ def tier_b_run(model, tokenizer, num_layers, num_experts, intermediate_size,
             "skipped_by_checkpoint": total - n_multi - n_single}
 
 
+# Gemma-4 turn framing. `<|turn>` opens a turn and is IMMEDIATELY followed by a role
+# marker, so a single left-to-right pass tells us who owns every terminator.
+EOG_TURN_OPEN = 105
+EOG_ROLE_IDS = {"system": 9731, "user": 2364, "model": 4368}
+
+
+def emit_mask_full(ids_row, emit_token_id: int, role: str, mode: str = "emit"):
+    """Boolean mask over positions t of the FULL sequence: True iff the NEXT token is the
+    terminator, and -- when role != 'any' -- the turn open at t belongs to that role.
+
+    WHY THE ROLE FILTER EXISTS. The mask used to be just `ids[t+1] == emit`, which
+    accumulates PROMPT-SIDE terminators too: the system turn close and every user turn
+    close. Those are context the model conditions on, never output it produces, so the
+    routing there is not "the routing that predicts the terminator" at all. Measured
+    2026-09-16 on the manic-v4 delivery corpus: **213 `<turn|>` in total, only 71
+    model-owned — 66.7% of the masked positions would have been prompt-side.** The same
+    defect in the agreement probe made it read 6.8% on the teacher's own traces.
+
+    Not every terminator needs this. `<tool_call|>` (49) is emitted only by the model:
+    2523 closes against 2523 tool calls in the v4 corpus, 573 against 573 in qset_A --
+    1:1, so role='any' and role='model' agree there. It matters for turn terminators.
+
+    mode == "background" selects the COMPLEMENT: same role, next token is NOT the
+    terminator. That arm is not optional if the map is going to be ranked. Ranking raw
+    emit-position mass is confounded -- a globally hot expert tops it simply by being hot
+    everywhere, not by having anything to do with stopping. The correct statistic is
+
+        lift(e) = share of emit-position routing / share of background routing
+
+    which is what the Qwen3.6 emit-map was rebuilt to use on 2026-08-20 after raw-mass
+    ranking produced a hypothesis that did not survive the cross-check. The Gemma-4 T202
+    ranker (`rank_agentic_eog_pins.py`) still ranks "highest emit-position RMS wnorm",
+    so it inherits that confound; this mode supplies the denominator it needs.
+    """
+    ids = ids_row.tolist() if hasattr(ids_row, "tolist") else list(ids_row)
+    n = len(ids)
+    keep_role = None if role == "any" else EOG_ROLE_IDS[role]
+    want_emit = (mode == "emit")
+    mask = [False] * n
+    cur = None
+    for t in range(n):
+        if ids[t] == EOG_TURN_OPEN and t + 1 < n:
+            cur = ids[t + 1]
+        if t + 1 < n and (ids[t + 1] == emit_token_id) == want_emit:
+            mask[t] = keep_role is None or cur == keep_role
+    return mask
+
+
 def tier_eog_run(model, tokenizer, num_layers, num_experts, intermediate_size,
                  corpus_path, emit_token_id, window, overlap,
-                 all_cats: dict, done_keys: set, checkpoint_cb=None) -> None:
+                 all_cats: dict, done_keys: set, checkpoint_cb=None,
+                 emit_role: str = "model", emit_mode: str = "emit") -> dict:
     """T202: emit-position competence map. Teacher-forces the 128e teacher over a
     corpus of chat-formatted agentic transcripts (JSONL {"text": ...}) and
     accumulates per-expert wnorm/tc ONLY at positions t where
@@ -501,12 +550,13 @@ def tier_eog_run(model, tokenizer, num_layers, num_experts, intermediate_size,
     (cost-free). overlap MUST be 0 (the per-position emit mask would otherwise
     double-count terminator positions in overlap zones)."""
     lines = [json.loads(x)["text"] for x in open(corpus_path) if x.strip()]
-    cat_key = "agentic_eog"
+    cat_key = "agentic_eog" if emit_mode == "emit" else "agentic_eog_bg"
     if cat_key not in all_cats:
         all_cats[cat_key] = _new_per_layer_tracker(num_layers, num_experts, intermediate_size)
     tracker = all_cats[cat_key]
-    holder = {"mask": None}
-    total_emit = 0
+    holder: dict[str, object] = {"mask": None}
+    total_emit = 0          # raw terminator occurrences, before the role filter
+    total_kept = 0          # positions actually accumulated
     n_lines_with_emit = 0
     overall_t0 = time.time()
     for i, text in enumerate(lines):
@@ -520,17 +570,35 @@ def tier_eog_run(model, tokenizer, num_layers, num_experts, intermediate_size,
         if line_emit == 0:
             done_keys.add(item_key)
             continue
+        full_mask = emit_mask_full(ids[0], emit_token_id, emit_role, emit_mode)
+        line_kept = sum(full_mask)
+        if line_kept == 0:
+            # emit mode: every terminator on this line is prompt-side, so accumulating it
+            # would be pure contamination and forwarding it is wasted GPU time.
+            # background mode: the line has no model-owned non-terminator positions.
+            done_keys.add(item_key)
+            continue
         total_emit += line_emit
+        total_kept += line_kept
         n_lines_with_emit += 1
         hooks = make_hooks(model, num_layers, tracker, weight=1.0, emit_holder=holder)
         try:
+            # overlap MUST be 0 here (docstring), so chunks are contiguous and the
+            # full-sequence mask slices directly. Deriving it per chunk cannot work:
+            # the role marker that owns a terminator may sit in an EARLIER chunk.
+            if overlap != 0:
+                raise SystemExit("[tier_eog] FATAL: --window-overlap must be 0 for the "
+                                 "emit-position map (got %d); a non-zero overlap both "
+                                 "double-counts terminators and breaks role tracking."
+                                 % overlap)
+            off = 0
             for chunk_ids in chunk_input(ids, window, overlap):
                 L = chunk_ids.shape[1]
-                m = torch.zeros(L, dtype=torch.bool, device=chunk_ids.device)
-                if L > 1:
-                    m[:-1] = (chunk_ids[0, 1:] == emit_token_id)
+                m = torch.tensor(full_mask[off:off + L], dtype=torch.bool,
+                                 device=chunk_ids.device)
                 holder["mask"] = m
                 forward_pass(model, chunk_ids)
+                off += L
         finally:
             holder["mask"] = None
             for h in hooks:
@@ -539,14 +607,33 @@ def tier_eog_run(model, tokenizer, num_layers, num_experts, intermediate_size,
         if i % 50 == 0:
             elapsed = (time.time() - overall_t0) / 60
             print(f"  [tier_eog {i+1}/{len(lines)}] lines_with_emit={n_lines_with_emit} "
-                  f"emit_positions={total_emit} (elapsed {elapsed:.0f}m)", flush=True)
+                  f"emit_positions={total_emit} kept({emit_role})={total_kept} "
+                  f"(elapsed {elapsed:.0f}m)", flush=True)
             if checkpoint_cb is not None:
                 checkpoint_cb(done_keys)
-    print(f"[tier_eog] DONE: {n_lines_with_emit} lines, {total_emit} emit positions "
-          f"→ category 'agentic_eog'", flush=True)
-    if total_emit == 0:
-        raise SystemExit(f"[tier_eog] FATAL: zero emit positions — wrong "
-                         f"--emit-token-id ({emit_token_id}) or corpus has no terminators")
+    # The "dropped as prompt-side" ratio is only meaningful in emit mode, where numerator
+    # and denominator are both terminator positions. In background mode total_emit counts
+    # terminators (213) while total_kept counts NON-terminator positions (1,950,232), so
+    # the same formula printed "-915501.9% dropped" -- arithmetic on two different
+    # populations. Report each mode in its own terms.
+    if emit_mode == "emit":
+        drop = total_emit - total_kept
+        print(f"[tier_eog] DONE: {n_lines_with_emit} lines, {total_emit} terminator "
+              f"occurrences, {total_kept} ACCUMULATED with emit_role={emit_role} "
+              f"({100.0 * drop / max(total_emit, 1):.1f}% dropped as prompt-side) "
+              f"→ category '{cat_key}'", flush=True)
+    else:
+        print(f"[tier_eog] DONE (BACKGROUND arm): {n_lines_with_emit} lines, "
+              f"{total_kept} non-terminator positions ACCUMULATED with "
+              f"emit_role={emit_role}; the corpus also holds {total_emit} terminator "
+              f"occurrences, which this arm EXCLUDES by construction "
+              f"→ category '{cat_key}'", flush=True)
+    if total_kept == 0:
+        raise SystemExit(f"[tier_eog] FATAL: zero accumulated positions — wrong "
+                         f"--emit-token-id ({emit_token_id}), wrong --emit-role "
+                         f"({emit_role}), or corpus has no model-owned terminators")
+    return {"lines": n_lines_with_emit, "terminator_occurrences": total_emit,
+            "accumulated": total_kept, "emit_role": emit_role, "emit_mode": emit_mode}
 
 
 def serialize(categories: dict[str, list], num_layers: int, num_experts: int) -> dict:
@@ -734,6 +821,19 @@ def main():
     ap.add_argument("--emit-token-id", type=int, default=50,
                     help="T202: terminator token id whose emit positions are measured "
                          "(default 50 = <|tool_response> for Gemma 4).")
+    ap.add_argument("--emit-role", choices=["model", "any"], default="model",
+                    help="Whose terminators to accumulate. 'model' (default) keeps only "
+                         "positions inside a MODEL turn — prompt-side system/user turn "
+                         "closes are context, not predictions, and on the v4 delivery "
+                         "corpus they are 66.7%% of all <turn|>. 'any' is the legacy "
+                         "behaviour and is only correct for a terminator the model alone "
+                         "emits, such as <tool_call|> (49).")
+    ap.add_argument("--emit-mode", choices=["emit", "background"], default="emit",
+                    help="'emit' accumulates the terminator positions; 'background' the "
+                         "COMPLEMENT (same role, next token is not the terminator). The "
+                         "background arm is the denominator for lift = emit share / bg "
+                         "share. Without it a ranking is raw mass, which a globally hot "
+                         "expert tops just by being hot. Writes category 'agentic_eog_bg'.")
     ap.add_argument("--emit-token", default=None,
                     help="T202: terminator token STRING; if given, resolved against the "
                          "tokenizer and overrides --emit-token-id (robust to vocab shifts).")
@@ -979,6 +1079,8 @@ def main():
                                   all_cats, done_keys, checkpoint_cb=_ckpt_cb_b)
 
     # ── T202: agentic_eog emit-position tier (standalone) ────────────────────
+    emit_id = None
+    eog_stats = None
     if args.variant == "agentic_eog":
         emit_id = args.emit_token_id
         if args.emit_token:
@@ -986,11 +1088,13 @@ def main():
             if isinstance(_tid, int) and _tid >= 0:
                 emit_id = _tid
         print(f"\n=== agentic_eog: emit-position map — next-token=={emit_id} "
-              f"({tokenizer.convert_ids_to_tokens(emit_id)!r}) over {args.eog_corpus} ===",
-              flush=True)
-        tier_eog_run(model, tokenizer, num_layers, num_experts, intermediate_size,
-                     args.eog_corpus, emit_id, args.window_tokens, args.window_overlap,
-                     all_cats, done_keys, checkpoint_cb=_ckpt_cb_b)
+              f"({tokenizer.convert_ids_to_tokens(emit_id)!r}) emit_role={args.emit_role} "
+              f"emit_mode={args.emit_mode} over {args.eog_corpus} ===", flush=True)
+        eog_stats = tier_eog_run(
+            model, tokenizer, num_layers, num_experts, intermediate_size,
+            args.eog_corpus, emit_id, args.window_tokens, args.window_overlap,
+            all_cats, done_keys, checkpoint_cb=_ckpt_cb_b, emit_role=args.emit_role,
+            emit_mode=args.emit_mode)
 
     print(f"\nSerializing {len(all_cats)} categories …", flush=True)
     save = {
@@ -1009,6 +1113,15 @@ def main():
             "tier_b_set_counts": tier_b["metadata"]["set_counts"] if tier_b else {},
             "tier_b_set_weights": tier_b["metadata"]["set_weights"] if tier_b else {},
             "tier_b_shape": tier_b_shape,   # T203: multi-turn vs single-turn census
+            # bug-361: the emit axis was never recorded, leaving the FILENAME as the only
+            # provenance for which terminator a map was built on. Record it.
+            "agentic_eog_emit_token_id": emit_id,
+            "agentic_eog_emit_token": (tokenizer.convert_ids_to_tokens(emit_id)
+                                       if emit_id is not None else None),
+            "agentic_eog_emit_role": (args.emit_role if emit_id is not None else None),
+            "agentic_eog_emit_mode": (args.emit_mode if emit_id is not None else None),
+            "agentic_eog_corpus": (args.eog_corpus if emit_id is not None else None),
+            "agentic_eog_stats": eog_stats,
             "chat_template_file": args.chat_template_file,
             "device": args.device,
             "dtype": args.dtype,

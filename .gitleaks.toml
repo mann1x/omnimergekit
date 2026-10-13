@@ -21,6 +21,10 @@ regexes = [
     # identifier cannot be a credential. Added 2026-09-08 after
     # Gemma4ForConditionalGeneration blocked recipes/gemma4/ream/.
     '''\b[A-Z][A-Za-z0-9]*For(CausalLM|ConditionalGeneration|SequenceClassification|TokenClassification|MaskedLM|QuestionAnswering)\b''',
+    # Maven forbidden-apis log line inside an agentic trace: "Reading bundled API
+    # signatures: jdk-unsafe-1.8". A signature-bundle name, not a key. Added 2026-10-13
+    # for recipes/gemma4/v9_agentic/traces/qset_FULL.json.
+    '''jdk-(unsafe|deprecated|system-out|non-portable|reflection|internal)-\d+(\.\d+)?''',
 ]
 
 # ---------------------------------------------------------------------------
