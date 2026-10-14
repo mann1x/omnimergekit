@@ -177,10 +177,9 @@ What a restart needs:
 - **Teacher caches:** rebuild them with `--phase cache`. `bonsai27_ac_cache.py` contains
   the reproduction gate showing that a rebuild matches the original exactly (top-1
   agreement 1.0000).
-- **Kept outside the repo:** every log, eval result and HumanEval sample, the generated
-  replay corpora (1.7B / 4B / 27B), and the final trained models. These are the 27B
-  `PQ2_0` file, sha `7ab4658b…`, and the dense exports of the four final 4B arms. The
-  latent checkpoints and caches were not kept.
+- **Kept outside the repo:** every log, eval result and HumanEval sample, and the
+  generated replay corpora (1.7B / 4B / 27B). No trained model, latent checkpoint or
+  teacher cache was kept: a restart begins from scratch.
 
 ## Script index
 
