@@ -22,7 +22,6 @@ Usage:
 """
 from __future__ import annotations
 
-import re
 import sys
 import pathlib
 import statistics as st
@@ -32,8 +31,11 @@ try:
 except ImportError:
     sys.exit("FAIL: use the agentic env python (eval/agentic/setup_agentic_env.sh)")
 
-RE_REPEAT = re.compile(r"(.{2,40}?)\1{7,}", re.S)
-RE_RUNCHAR = re.compile(r"(.)\1{40,}", re.S)
+# THE detector — never redeclare the patterns. Until 2026-10-13 this script had
+# its own copy with no letters rule (fired on indentation) and no sentence
+# detector; numbers printed by that copy are not comparable to these.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from loop_detect import DETECTOR_VERSION, MATCHING, detect  # noqa: E402
 
 
 def reasoning_parts(sample):
@@ -56,9 +58,11 @@ def census(d: pathlib.Path, runaway: int):
     for s in (log.samples or []):
         texts = list(reasoning_parts(s))
         lens = [len(t) for t in texts]
-        n_rep = sum(1 for t in texts if RE_REPEAT.search(t))
-        n_run = sum(1 for t in texts if RE_RUNCHAR.search(t))
-        n_away = sum(1 for L in lens if L >= runaway)
+        dets = [detect(t, runaway) for t in texts]
+        n_rep = sum(d["rep"] for d in dets)
+        n_run = sum(d["runchar"] for d in dets)
+        n_away = sum(d["runaway"] for d in dets)
+        n_sent = sum(d["sentence"] for d in dets)
         val = None
         for sc in (s.scores or {}).values():
             val = sc.value
@@ -68,8 +72,9 @@ def census(d: pathlib.Path, runaway: int):
             "rep_turns": n_rep,
             "run_turns": n_run,
             "away_turns": n_away,
+            "sent_turns": n_sent,
             # a sample is "looped" if ANY of its turns degenerated
-            "looped": bool(n_rep or n_run or n_away),
+            "looped": any(d["looped"] for d in dets),
             "maxlen": max(lens) if lens else 0,
             "lens": lens,
             "correct": (val == "C") or (val is True) or (val == 1) or (val == 1.0),
@@ -104,10 +109,11 @@ def main(argv):
             continue
         arms[p.name] = r
 
-    print(f"runaway threshold = {runaway} chars\n")
+    print(f"runaway threshold = {runaway} chars | detector v{DETECTOR_VERSION} "
+          f"({MATCHING})\n")
     print(f"{'arm':22} {'n':>4} {'LOOPED':>7} {'rate':>7} {'rep_t':>6} {'run_t':>6} "
-          f"{'away_t':>7} {'turns':>6} {'p50':>6} {'p90':>7} {'max':>8}")
-    print("-" * 100)
+          f"{'sent_t':>6} {'away_t':>7} {'turns':>6} {'p50':>6} {'p90':>7} {'max':>8}")
+    print("-" * 107)
     for name, rows in arms.items():
         n = len(rows)
         looped = sum(v["looped"] for v in rows.values())
@@ -118,6 +124,7 @@ def main(argv):
         print(f"{name:22} {n:4d} {looped:7d} {looped/max(n,1):7.3f} "
               f"{sum(v['rep_turns'] for v in rows.values()):6d} "
               f"{sum(v['run_turns'] for v in rows.values()):6d} "
+              f"{sum(v['sent_turns'] for v in rows.values()):6d} "
               f"{sum(v['away_turns'] for v in rows.values()):7d} "
               f"{turns:6d} {p50:6d} {p90:7d} {max(allen) if allen else 0:8d}")
 

@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import sys
 import pathlib
-from collections import defaultdict
 
 try:
     from inspect_ai.log import read_eval_log

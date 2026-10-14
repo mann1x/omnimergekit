@@ -34,7 +34,7 @@ from pathlib import Path
 # _mcnemar/_q from this module and reads harbor job dirs, which have nothing to
 # do with inspect .eval logs. A top-level import made the harbor census
 # unrunnable on any interpreter without the BFCL venv (bs2, 2026-09-13).
-from loop_detect import detect, message_texts  # THE detector — never redeclare
+from loop_detect import DETECTOR_VERSION, MATCHING, detect, message_texts  # THE detector — never redeclare
 
 
 def _usage(s):
@@ -273,7 +273,8 @@ def main() -> int:
 
     if a.json_out:
         Path(a.json_out).write_text(json.dumps(
-            {"shared": len(shared), "status_a": sa, "status_b": sb,
+            {"detector_version": DETECTOR_VERSION, "matching": MATCHING,
+             "shared": len(shared), "status_a": sa, "status_b": sb,
              "interim": sa == "started" or sb == "started", **rows},
             indent=2, default=str))
         print(f"\nwrote {a.json_out}")

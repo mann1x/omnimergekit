@@ -21,7 +21,7 @@ import json
 import statistics as st
 from pathlib import Path
 
-from loop_detect import detect
+from loop_detect import DETECTOR_VERSION, MATCHING, detect
 from paired_context_census import _mcnemar, _q
 
 
@@ -195,7 +195,8 @@ def main() -> int:
 
     if a.json_out:
         Path(a.json_out).write_text(json.dumps(
-            {"shared": len(shared), "pass_a": pa, "pass_b": pb,
+            {"detector_version": DETECTOR_VERSION, "matching": MATCHING,
+             "shared": len(shared), "pass_a": pa, "pass_b": pb,
              "mcnemar_pass": _mcnemar(b_, c_),
              "per_task": {i: {"a": A[i], "b": B[i]} for i in shared}},
             indent=2, default=str))

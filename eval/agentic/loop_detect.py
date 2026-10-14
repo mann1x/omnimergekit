@@ -43,6 +43,11 @@ SENT_MIN_REP = 3
 SENT_MIN_SHARE = 0.30
 SENT_ABS_CATASTROPHIC = 8
 
+# Version 1 (to 2026-10-13): first match only. Version 2: every match. Loop rates
+# published before the change were produced by version 1 and stay as published.
+DETECTOR_VERSION = 2
+MATCHING = "every_match"
+
 _SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
 
 # A repeated unit must contain real WORD content. Without this the char
@@ -84,12 +89,13 @@ def detect(text: str, runaway_chars: int = 10000) -> dict:
     """Per-block detector flags. `looped` is the OR — the four detectors catch
     different failures and must also be reported separately, never collapsed."""
     n_sent, unit, n_units = sentence_repeat(text)
-    mrep = RE_REPEAT.search(text)
+    # EVERY match is examined (detector version 2, 2026-10-13). Version 1 used
+    # .search(), i.e. only the FIRST match: an indentation run or a "=====" rule
+    # ahead of a real repeat failed the letters rule and hid the repeat behind it.
     # the repeated unit itself must be language, not indentation/rules/digits
-    rep_ok = bool(mrep) and _has_word_content(mrep.group(1))
-    mrun = RE_RUNCHAR.search(text)
+    rep_ok = any(_has_word_content(m.group(1)) for m in RE_REPEAT.finditer(text))
     # a run of 41 '=' or '-' is a separator; a run of 41 'a' is degeneration
-    run_ok = bool(mrun) and mrun.group(1).isalpha()
+    run_ok = any(m.group(1).isalpha() for m in RE_RUNCHAR.finditer(text))
     d = {
         "rep": rep_ok,
         "runchar": run_ok,
@@ -100,6 +106,10 @@ def detect(text: str, runaway_chars: int = 10000) -> dict:
         "sentence_share": (n_sent / n_units) if n_units else 0.0,
         "sentence_unit": (unit[:200] if unit else None),
         "chars": len(text),
+        # Which detector produced these flags. A rate must always say so: counts
+        # from version 1 (first_match) are not comparable to version 2.
+        "detector_version": DETECTOR_VERSION,
+        "matching": MATCHING,
     }
     d["looped"] = d["rep"] or d["runchar"] or d["sentence"] or d["runaway"]
     return d
@@ -136,6 +146,11 @@ def selftest() -> int:
                                   "I will now verify the directory contents before proceeding "
                                   "with the next tool call in this sequence. ") * 4, "sentence"),
         ("real: search x402",    'I\'ll try to search for "revenue" in all files in the current directory. ' * 402, "sentence"),
+    ]
+    # The version-1 blind spot: a layout run AHEAD of a real repeat must not hide it.
+    cases += [
+        ("indent then unit x10", "  " * 20 + " " + "hello wor " * 10,   "rep"),
+        ("rule then char x41",   "=" * 41 + " " + "a" * 41,             "runchar"),
     ]
     bad = 0
     for name, text, want in cases:

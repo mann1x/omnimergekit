@@ -27,14 +27,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import statistics as st
 import subprocess
 from pathlib import Path
 
-from loop_detect import detect  # noqa: E402
-RE_REPEAT = re.compile(r"(.{2,40}?)\1{7,}", re.S)
-RE_RUNCHAR = re.compile(r"(.)\1{40,}", re.S)
+from loop_detect import DETECTOR_VERSION, MATCHING, detect  # noqa: E402
 
 
 def log(m: str) -> None:
@@ -76,13 +73,16 @@ import json, re, sys, statistics as st
 from pathlib import Path
 from inspect_ai.log import read_eval_log
 out, runaway = Path(sys.argv[1]), int(sys.argv[2])
-RE_REPEAT = re.compile(r"(.{2,40}?)\1{7,}", re.S)
-RE_RUNCHAR = re.compile(r"(.)\1{40,}", re.S)
+# THE detector (stdlib-only, so it imports under the harness interpreter too).
+# Never redeclare the patterns here: the copy that used to live in this script
+# had no letters rule and no sentence detector.
+sys.path.insert(0, sys.argv[3])
+from loop_detect import detect
 logs = sorted(out.glob("*.eval"))
 if not logs:
     print(json.dumps({"error": "no .eval log produced"})); raise SystemExit
 lg = read_eval_log(str(logs[-1]))
-n=n_pass=n_loop=rep_t=run_t=away_t=turns=errs=caps=otok=itok=crtok=0
+n=n_pass=n_loop=rep_t=run_t=away_t=sent_t=turns=errs=caps=otok=itok=crtok=0
 lens=[]
 for s in (lg.samples or []):
     n += 1
@@ -99,10 +99,11 @@ for s in (lg.samples or []):
         for p in c:
             if getattr(p, "type", "") != "reasoning": continue
             t = getattr(p, "reasoning", "") or ""
-            turns += 1; lens.append(len(t))
-            if RE_REPEAT.search(t): rep_t += 1; looped = True
-            if RE_RUNCHAR.search(t): run_t += 1; looped = True
-            if len(t) >= runaway: away_t += 1; looped = True
+            det = detect(t, runaway)
+            turns += 1; lens.append(det["chars"])
+            rep_t += det["rep"]; run_t += det["runchar"]
+            away_t += det["runaway"]; sent_t += det["sentence"]
+            looped = looped or det["looped"]
     if looped: n_loop += 1
     for ev in (getattr(s, "events", None) or []):
         o = getattr(ev, "output", None)
@@ -112,11 +113,12 @@ for s in (lg.samples or []):
         itok += getattr(u, "input_tokens", 0) or 0
         crtok += getattr(u, "input_tokens_cache_read", 0) or 0
 print(json.dumps({"n":n,"n_pass":n_pass,"n_loop":n_loop,"rep_t":rep_t,"run_t":run_t,
-                  "away_t":away_t,"turns":turns,"lens":lens,"caps":caps,"errs":errs,
+                  "away_t":away_t,"sent_t":sent_t,"turns":turns,"lens":lens,"caps":caps,"errs":errs,
                   "otok":otok,"itok":itok,"crtok":crtok}))
 """
     py = str(Path(a.harness_env) / "bin" / "python")
-    r = subprocess.run([py, "-c", script, str(a.out), str(a.runaway_chars)],
+    r = subprocess.run([py, "-c", script, str(a.out), str(a.runaway_chars),
+                        str(Path(__file__).resolve().parent)],
                        capture_output=True, text=True)
     line = (r.stdout or "").strip().splitlines()
     if not line:
@@ -128,9 +130,11 @@ print(json.dumps({"n":n,"n_pass":n_pass,"n_loop":n_loop,"rep_t":rep_t,"run_t":ru
         return {"error": f"scorer output not JSON: {e}: {line[-1][:200]}"}
     if "error" in d:
         return d
-    return _pack(a, d["n"], d["n_pass"], d["n_loop"], d["rep_t"], d["run_t"],
-                 d["away_t"], d["turns"], d["lens"], d["caps"], d["errs"],
-                 d["otok"], d["itok"], d["crtok"])
+    res = _pack(a, d["n"], d["n_pass"], d["n_loop"], d["rep_t"], d["run_t"],
+                d["away_t"], d["turns"], d["lens"], d["caps"], d["errs"],
+                d["otok"], d["itok"], d["crtok"])
+    res["sentence_turns"] = d["sent_t"]
+    return res
 
 
 # -------------------------------------------------------------- harbor ------
@@ -393,14 +397,19 @@ def _pack(a, n, n_pass, n_loop, rep_t, run_t, away_t, turns, lens,
         # THE DEGENERATION ENDPOINT
         "loop_rate": (n_loop / n) if n else None,
         "n_looped": n_loop,
-        # THREE DISTINCT detectors — do not collapse them. rep = a 2-40 char
-        # unit repeated >=8x; runchar = one char repeated >=41x; runaway = a
-        # reasoning block over runaway_chars. They catch different failures and
-        # a sample is "looped" if ANY fires.
+        # DISTINCT detectors — do not collapse them. rep = a 2-40 char unit
+        # with letters repeated >=8x; runchar = one letter repeated >=41x;
+        # runaway = a reasoning block over runaway_chars; sentence_turns (added
+        # by the callers) = a whole sentence repeated. They catch different
+        # failures and a sample is "looped" if ANY fires.
         "rep_turns": rep_t,
         "runchar_turns": run_t,
         "runaway_turns": away_t,
         "runaway_chars": a.runaway_chars,
+        # Which detector counted these. Rates from different versions are not
+        # comparable; results written before 2026-10-13 carry no such field.
+        "detector_version": DETECTOR_VERSION,
+        "matching": MATCHING,
         "reasoning_turns": turns,
         "reasoning_p50": p50,
         "reasoning_p90": p90,
