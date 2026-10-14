@@ -190,13 +190,13 @@ What a restart needs:
 | `bonsai_hadamard_fold.py` | Fold a qwen35 GGUF into the Bonsai 2 Hadamard basis (`--override-dir` writes trained trits) |
 | `gguf_read_prism_meta.py` | Dump a GGUF's KV section without gguf-py (which rejects the PrismML types) |
 | `bonsai_scale_rule.py`, `bonsai_layer_lab.py`, `bonsai_layer_gptq.py`, `bonsai_prefix_test.py`, `bonsai_capture_acts.py` | Single-layer forensics of PrismML's trits and scales on real activations |
-| `bonsai_qat_pilot.py`, `bonsai_pt2_blocks.py` | First-L-blocks pilots: rotation-in-the-loop QAT, and PT2 |
+| `bonsai_qat_pilot.py`, `bonsai_pt2_blocks.py`, `bonsai_pilot_run.sh`, `bonsai_pt2_run.sh` | First-L-blocks pilots: rotation-in-the-loop QAT, and PT2, with their runners |
 | `bonsai_v6_ternarize_sweep.sh`, `bonsai_base_vs_prism.sh`, `bonsai_v6_fold_quant.sh`, `bonsai_v6_fold_quant_mtp.sh` | Training-free ternarizers on 27B and the like-for-like comparison with Bonsai 2 |
 | `bonsai_rsprot_ablation.sh`, `bonsai_rsprot_prism.sh` | PrismML's one documented gen1→gen2 method change, measured |
 | `bonsai_pt2_full.py`, `bonsai_pt2_export.sh`, `bonsai_pt2_combined.sh`, `bonsai_pt2_selftrace.sh`, `bonsai_pt2_mix_finish.sh` | Whole-model PT2-style ternarization of 27B, and its calibration-corpus arms |
 | `bonsai_gen_self_traces.py`, `bonsai_trace_domain_kld.sh`, `bonsai_trace_spotcheck.py` | Teacher self-traces as calibration text; held-out-trace KL |
 | `bonsai_corpus_plan.py`, `bonsai_gen_corpus_srv.py`, `bonsai_gen_corpus_srv2.py`, `bonsai_corpus_stats.py` | Replay-corpus plan, generation (vLLM) and completeness table |
-| `bonsai17_*.py/.sh` | Qwen3-1.7B: baselines, trace generation and filtering, QAT trainer, rounds r2–r5 |
+| `bonsai17_*.py/.sh` | Qwen3-1.7B: baselines, trace generation and filtering, QAT trainer, rounds r2–r5. `bonsai17_qat.py` is the final trainer (identical to `.v4`). `bonsai17_qat.v1.py`–`.v4.py` are the exact files the rounds ran (v1 = baselines and r2, v2 = r3, v3 = r4, v4 = r5), kept because each round script names its own version |
 | `bonsai4b_*.py/.sh` | Qwen3.5-4B: corpus, AdamW QAT trainer, export, round r1, HumanEval chain, sample sanity |
 | `bonsai27_qat.py`, `bonsai27_export.py` | Memory-lean QAT trainer (27B on one 96 GB GPU) and dense export |
 | `bonsai27_val4b_g1.sh`, `bonsai27_full4b.sh` | Validation of `bonsai27_qat.py` on 4B against the AdamW run, then the full 4B run |
