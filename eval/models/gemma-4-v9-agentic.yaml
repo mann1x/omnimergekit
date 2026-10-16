@@ -1,0 +1,85 @@
+# gemma-4-A4B-20B-v9-agentic and its derivatives (v9-ml arms) — the model's OWN sampler.
+#
+# Owner 2026-10-15: "all the evaluations done without are useless" — every eval of this
+# family runs greedy decoding PLUS the shipped repetition/presence penalties
+# (repeat_penalty 1.06 / repeat_last_n 96 / presence_penalty 0.025, the 2026-10-14 publish
+# sampler). Plain greedy (no penalties) is NOT this model's eval basis.
+#
+# `require_profile: true` makes omk_eval REFUSE to run a model matching these globs unless a
+# sampler profile is passed (`--sampler-profile auto` picks this file). It exists because the
+# penalties were silently left out twice. Sorted-filename auto-match: this file sorts before
+# gemma-4.yaml ('-' < '.'), so v9 names resolve here, not to the generic gemma-4 profile.
+family: gemma-4-A4B-20B-v9-agentic
+require_profile: true
+match:
+  - "*v9-agentic*"
+  - "*v9agentic*"
+  - "*v9ml*"
+  - "*v9-ml*"
+samplers:
+  greedy_pen:             # the eval sampler: greedy + shipped penalties (DEFAULT)
+    temperature: 0.0
+    top_p: 1.0
+    top_k: 0
+    do_sample: false
+    repeat_penalty: 1.06
+    repeat_last_n: 96     # llama-server only; recorded as unsupported on vLLM
+    presence_penalty: 0.025
+  shipped:                # the published ollama/llama.cpp sampler (2026-10-14)
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 64
+    min_p: 0.0
+    repeat_penalty: 1.06
+    repeat_last_n: 96
+    presence_penalty: 0.025
+    do_sample: true
+  greedy_pen107:          # owner candidate penalties (2026-10-16 test): greedy + rep 1.07 / presence 0.03
+    temperature: 0.0      # a NEW entry -- greedy_pen above stays the canonical eval sampler
+    top_p: 1.0
+    top_k: 0
+    do_sample: false
+    repeat_penalty: 1.07
+    repeat_last_n: 96
+    presence_penalty: 0.03
+  greedy_pen1055:         # owner test 2026-10-16: greedy + rep 1.055 / presence 0.025 (rest = greedy_pen)
+    temperature: 0.0
+    top_p: 1.0
+    top_k: 0
+    do_sample: false
+    repeat_penalty: 1.055
+    repeat_last_n: 96
+    presence_penalty: 0.025
+  greedy_pen102:          # owner test 2026-10-16: greedy + rep 1.02 / presence 0.275 (rest = greedy_pen)
+    temperature: 0.0
+    top_p: 1.0
+    top_k: 0
+    do_sample: false
+    repeat_penalty: 1.02
+    repeat_last_n: 96
+    presence_penalty: 0.275
+  greedy_pen1055p02:      # owner test 2026-10-16: greedy + rep 1.055 / presence 0.02 (rest = greedy_pen)
+    temperature: 0.0
+    top_p: 1.0
+    top_k: 0
+    do_sample: false
+    repeat_penalty: 1.055
+    repeat_last_n: 96
+    presence_penalty: 0.02
+  candidate107:           # owner candidate deployment sampler (2026-10-16 test), not shipped
+    temperature: 0.8
+    top_p: 0.95
+    top_k: 64
+    min_p: 0.0
+    repeat_penalty: 1.07
+    repeat_last_n: 96
+    presence_penalty: 0.03
+    do_sample: true
+  greedy:                 # plain greedy, NO penalties — only to compare with old greedy cohorts
+    temperature: 0.0
+    top_p: 1.0
+    top_k: 0
+    do_sample: false
+bench_policy:
+  default: greedy_pen
+protocol_overrides: {}

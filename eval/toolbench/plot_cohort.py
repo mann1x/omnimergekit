@@ -41,6 +41,8 @@ FAMILY = {  # colour by provenance
     # 2026-09-09. NOTE ornith-1.5-35b is deliberately NOT here: that row is
     # bartowski's quant of a third-party model, carried as an external anchor.
     "ornith-27b-coder": "ours", "ornith-27b-coderx": "ours",
+    # gemma-4-20B-v9-agentic (ManniX-ITA, Gemma-4 26B-A4B expert cut), added 2026-10-14.
+    "v9-agentic": "ours",
 }
 
 
@@ -69,6 +71,22 @@ def served_quant(W, model):
         m = re.search(r"((?:UD-)?(?:IQ|Q)\d+(?:_[A-Z0-9]+)*)\.gguf$", nm.split("/")[-1])
         if m:
             return m.group(1)
+    return ""
+
+
+def served_quant_table(W, model):
+    """Fallback for a results dir that carries cells but not the server logs (the
+    repo copy: logs are ~400 KB each and are not committed). served_quants.tsv is
+    WRITTEN FROM those logs by served_quant(), never typed by hand."""
+    path = os.path.join(W, "served_quants.tsv")
+    if not os.path.exists(path):
+        return ""
+    for ln in open(path, errors="replace"):
+        if ln.startswith("#") or "\t" not in ln:
+            continue
+        m, q = ln.rstrip("\n").split("\t", 1)
+        if m == model:
+            return q
     return ""
 
 
@@ -105,6 +123,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-o", "--out", default="toolbench_scores.png")
     ap.add_argument("--title", default="Tool-calling benchmark — hardmode (88 scenarios, 176 pts)")
+    ap.add_argument("--note", action="append", default=[],
+                    help="extra footer note (repeatable), e.g. the basis of an arm added later")
     a = ap.parse_args()
 
     W = sc.results_dir()
@@ -169,7 +189,7 @@ def main():
     # Model name with its SERVED quant beneath it (smaller, grey). Drawn as two
     # texts rather than one tick label because a tick label cannot carry two
     # sizes/colours. get_yaxis_transform: x in axes fraction, y in data coords.
-    quants = [served_quant(W, m) for m in names]
+    quants = [served_quant(W, m) or served_quant_table(W, m) for m in names]
     ax.set_yticks(list(y)); ax.set_yticklabels([])
     _tr = ax.get_yaxis_transform()
     for _i, (_m, _q) in enumerate(zip(names, quants)):
@@ -190,14 +210,20 @@ def main():
     ax.set_title(a.title, fontsize=13.5, fontweight="bold",
                  color="#0f172a", loc="left", pad=26)
     hv, hv_mixed = harness_version(W)
+    # MEASURED 2026-10-14: tool-eval-bench sends "temperature": 0.0 in every request
+    # unless --temperature is passed, and a request temp 0 is GREEDY on llama-server
+    # whatever --temp the server was started with. Every cohort64k report says
+    # "Temperature | 0.0". The old text here ("greedy-off (temp 0.6/top-p 0.95/top-k 20)")
+    # described server flags that never applied.
     sub = (f"n={n} paired seeds {sorted(common)} · 64k ctx · context-pressure 0.25 · "
-           f"greedy-off (temp 0.6/top-p 0.95/top-k 20)"
+           f"greedy decode (harness temperature 0.0)"
            + (f" · scorer {hv}" if hv else ""))
     ax.annotate(sub, (0, 1), xycoords="axes fraction", xytext=(0, 12),
                 textcoords="offset points", fontsize=8.8, color="#64748b")
 
     handles = [
-        Line2D([], [], marker="o", ls="", color=C["ours"], ms=8, label="ours (Omnimerge / A3B / Ornith-27B)"),
+        Line2D([], [], marker="o", ls="", color=C["ours"], ms=8,
+               label="ours (Omnimerge / A3B / Ornith-27B" + (" / Gemma-4 v9" if "v9-agentic" in names else "") + ")"),
         Line2D([], [], marker="o", ls="", color=C["base"], ms=8, label="vendor / third-party base"),
         Line2D([], [], marker="|", ls="", color="#94a3b8", ms=11, mew=2,
                label="r/LocalLLaMA published (256k, v2.6.0 — NOT comparable)"),
@@ -210,6 +236,7 @@ def main():
     if n < 2:     notes.append("n=1 — no confidence interval yet")
     if ragged:    notes.append("in-flight cells excluded to keep the cohort balanced")
     if pending:   notes.append("awaiting cells (re-running, not yet plotted): " + ", ".join(pending))
+    notes.extend(a.note)
     if hv_mixed:  notes.insert(0, "!! MIXED SCORER VERSIONS ACROSS CELLS (" + hv + ") — these rows are NOT one basis")
     # Footer. The notes and the credit used to share one baseline, so a long note
     # ran straight through the right-hand credit and made the scorer version --

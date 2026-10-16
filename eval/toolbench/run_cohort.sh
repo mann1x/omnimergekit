@@ -123,6 +123,11 @@ MODELS=(
   "ornith-27b-coderx|Ornith-1.5-27B-A3B-CoderX-IQ4_XS.gguf"
 )
 
+# OMK_TB_MODELS_LIST — optional, whitespace-separated entries in the MODELS format
+# (name|gguf[|drafter]). Adds a new arm to an existing cohort without re-running the
+# others: point OMK_TB_OUT at a dir and only the listed models run. Unset = MODELS above.
+if [ -n "${OMK_TB_MODELS_LIST:-}" ]; then read -r -a MODELS <<<"$OMK_TB_MODELS_LIST"; fi
+
 log(){ echo "[$(date +%H:%M:%S)] $*"; }
 server_pid(){ local l; l=$(ss -ltnp 2>/dev/null || true); grep ":$PORT" <<<"$l" | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2 || true; }
 kill_server(){
@@ -170,7 +175,29 @@ PY
 for SEED in $SEEDS; do
 log "######## SEED $SEED — balanced pass over all ${#MODELS[@]} models ########"
 for entry in "${MODELS[@]}"; do
-  IFS="|" read -r NAME GGUF DRAFTER <<<"$entry"
+  IFS="|" read -r NAME GGUF DRAFTER SAMPLER <<<"$entry"
+  # 4th field: the MODEL's own sampler, comma-separated key=value over the cohort default
+  # (temp top_p top_k min_p presence_penalty repeat_penalty repeat_last_n). Every arm runs on
+  # its own family's sampler; the default below is the Qwen one the original 10 arms used.
+  declare -A SP=([temp]=0.6 [top_p]=0.95 [top_k]=20 [min_p]=0.0 [presence_penalty]=0.0 [repeat_penalty]=1.0)
+  IFS="," read -r -a _kv <<<"${SAMPLER:-}"
+  for _p in "${_kv[@]}"; do [ -n "$_p" ] && SP[${_p%%=*}]=${_p#*=}; done
+  SFLAGS="--temp ${SP[temp]} --top-p ${SP[top_p]} --top-k ${SP[top_k]} --min-p ${SP[min_p]} --presence-penalty ${SP[presence_penalty]} --repeat-penalty ${SP[repeat_penalty]}"
+  [ -n "${SP[repeat_last_n]:-}" ] && SFLAGS="$SFLAGS --repeat-last-n ${SP[repeat_last_n]}"
+  # MEASURED 2026-10-14: tool-eval-bench puts "temperature": <--temperature, default 0.0>
+  # into EVERY request, and a request temperature of 0 decodes GREEDY on llama-server
+  # whatever --temp/--top-k/--top-p the server was started with (probe: temp-0 output
+  # hash == explicit top_k=1 hash across seeds; the penalties DO still apply). So the
+  # server flags above only set the penalties unless the client forwards the sampler.
+  # An entry WITH an explicit SAMPLER field forwards it (llama.cpp key names, merged
+  # last via --backend-kwargs). An entry without one sends nothing extra -> greedy,
+  # which is exactly how the original 10 arms (2026-09-05..09) were decoded.
+  CLIENT=()
+  if [ -n "${SAMPLER:-}" ]; then
+    BK="{\"temperature\":${SP[temp]},\"top_p\":${SP[top_p]},\"top_k\":${SP[top_k]},\"min_p\":${SP[min_p]},\"presence_penalty\":${SP[presence_penalty]},\"repeat_penalty\":${SP[repeat_penalty]}${SP[repeat_last_n]:+,\"repeat_last_n\":${SP[repeat_last_n]}}}"
+    CLIENT=(--temperature "${SP[temp]}" --backend-kwargs "$BK")
+  fi
+  unset SP
   MODEL="$MDIR/$GGUF"
 
   # wait up to 40 min for a still-downloading file
@@ -210,11 +237,10 @@ for entry in "${MODELS[@]}"; do
     mtp)       SPEC="--spec-type draft-mtp --spec-draft-n-max $DRAFT_N" ;;
     *)         SPEC="" ;;
   esac
-  log "== $NAME ($GGUF) nextn=$MTP spec=$SPEC_KIND${DRAFTER:+ drafter=$DRAFTER} seed=$SEED"
+  log "== $NAME ($GGUF) nextn=$MTP spec=$SPEC_KIND${DRAFTER:+ drafter=$DRAFTER} seed=$SEED sampler: $SFLAGS client: ${CLIENT[*]:-greedy (harness temperature 0.0)}"
 
   nohup "$BIN" --server -m "$MODEL" --host 127.0.0.1 --port "$PORT" \
-      --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0 \
-      --presence-penalty 0.0 --repeat-penalty 1.0 \
+      $SFLAGS \
       -ngl 99 --ubatch-size 2048 --fit-target 256 \
       -ctk q8_0 -ctv q8_0 -c "$CTX" --seed 42 --parallel 1 \
       $SPEC --jinja --metrics --alias "$NAME" > "$W/$NAME.server.log" 2>&1 &
@@ -255,7 +281,7 @@ for entry in "${MODELS[@]}"; do
     tool-eval-bench run --hardmode --weight-by-difficulty --backend llamacpp \
         --base-url "http://127.0.0.1:$PORT" \
         --context-size "$CTX" --context-pressure "$PRESSURE" \
-        --seed "$s" --model "$NAME" --timeout "$TIMEOUT" --output-dir "$OUT" > "$W/$NAME-s$s.log" 2>&1
+        --seed "$s" --model "$NAME" --timeout "$TIMEOUT" "${CLIENT[@]}" --output-dir "$OUT" > "$W/$NAME-s$s.log" 2>&1
     rc=$?; el=$(( $(date +%s) - t0 ))
     pts=$(grep -rhoE "\*\*Total Points\*\*:[[:space:]]*[0-9]+[[:space:]]*/[[:space:]]*[0-9]+" "$OUT" 2>/dev/null | head -1)
     log "     rc=$rc  $((el/60))m$((el%60))s  ${pts:-NO_POINTS}"
@@ -276,4 +302,6 @@ log "######## SEED $SEED PASS COMPLETE — balanced cohort at n=$(ls -d "$W"/*-s
 done
 
 log "COHORT COMPLETE"
-[ -f "$W/SKIPPED.txt" ] && { echo "--- ANOMALIES ---"; cat "$W/SKIPPED.txt"; }
+# `[ -f ] && {...}` as the LAST command made a clean cohort (no SKIPPED.txt) exit 1.
+if [ -f "$W/SKIPPED.txt" ]; then echo "--- ANOMALIES ---"; cat "$W/SKIPPED.txt"; fi
+exit 0

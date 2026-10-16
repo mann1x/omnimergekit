@@ -1,0 +1,33 @@
+# ifeval_v9fail10 — IFEval restricted to the 10 keys gemma-4-20B-v9-agentic fails at greedy
+# (see utils_ifeval.py). Identical to the stock ifeval task except process_docs; scorers are
+# re-exported from lm_eval.tasks.ifeval.utils. n=10: a directional probe, not an IFEval score.
+task: ifeval_v9fail10
+dataset_path: google/IFEval
+dataset_name: null
+output_type: generate_until
+test_split: train
+num_fewshot: 0
+process_docs: !function utils_ifeval.select_ifeval_v9fail10
+doc_to_text: prompt
+doc_to_target: 0
+generation_kwargs:
+  until: []
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 16384
+process_results: !function utils_ifeval.process_results
+metric_list:
+  - metric: prompt_level_strict_acc
+    aggregation: mean
+    higher_is_better: true
+  - metric: inst_level_strict_acc
+    aggregation: !function utils_ifeval.agg_inst_level_acc
+    higher_is_better: true
+  - metric: prompt_level_loose_acc
+    aggregation: mean
+    higher_is_better: true
+  - metric: inst_level_loose_acc
+    aggregation: !function utils_ifeval.agg_inst_level_acc
+    higher_is_better: true
+metadata:
+  version: 1.0

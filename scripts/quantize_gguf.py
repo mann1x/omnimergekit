@@ -42,6 +42,9 @@ from pathlib import Path
 from queue import Queue
 from threading import Thread, Event
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gguf_kld  # noqa: E402  -- sibling module; KLD/PPL stats per tier
+
 # ── Quant definitions ────────────────────────────────────────
 
 # Bartowski standard quants in the DEFAULT sweep (ordered large → small).
@@ -2504,7 +2507,8 @@ def upload_worker(upload_queue: Queue, repo_id: str, stop_event: Event,
                   tools: dict = None,
                   sanity_enabled: bool = True,
                   sanity_failed: list = None,
-                  withdraw_on_fail: bool = False):
+                  withdraw_on_fail: bool = False,
+                  kld: dict | None = None):
     """Worker thread: uploads completed quants from queue, optionally pushes
     to ollama.com, then deletes the local file.
 
@@ -2525,6 +2529,9 @@ def upload_worker(upload_queue: Queue, repo_id: str, stop_event: Event,
     withdraw_on_fail: delete a failing tier from HF. Default False — see the
                    comment at the gate. A failed check is a REPORT, not a
                    verdict, because the check cannot certify its own engine.
+    kld: KLD context from main() (bin, basis, data, dir, failed) or None. Each
+                   tier is scored against the reference logits on the SAME local
+                   bytes, after the sanity gate and before the file is deleted.
     """
     while not stop_event.is_set() or not upload_queue.empty():
         try:
@@ -2626,6 +2633,11 @@ def upload_worker(upload_queue: Queue, repo_id: str, stop_event: Event,
                            if ollama_target else None)
                     if sanity_failed is not None:
                         sanity_failed.append((quant_name, repo_id, removed, tag))
+
+            # ── KLD / PPL vs the unquantized reference (gguf_kld) ────────
+            if (kld and sanity_ok and gguf_path.exists()
+                    and not quant_name.upper().startswith(("F16", "F32"))):
+                _kld_measure(kld, gguf_path, quant_name)
 
             # Delete the GGUF after successful upload to save disk (unless
             # keep_base=None = keep all). The `.sha256` sidecar is deliberately
@@ -2806,6 +2818,52 @@ def normalize_gemma4_eog(base_gguf: Path, template_file=None, template_sha=None)
 
 # ── Main pipeline ────────────────────────────────────────────
 
+def _kld_setup(args, tools: dict, base_gguf: Path, output_dir: Path) -> dict | None:
+    """Reference logits for the per-tier KLD stats. A failure here DISABLES the
+    stats for the run and says so loudly, it never takes the publish down."""
+    ref = Path(args.kld_ref) if args.kld_ref else base_gguf
+    kdir = output_dir / "kld"
+    print(f"\n=== KLD reference ({ref.name}, {args.kld_chunks} chunks x "
+          f"{args.kld_ctx} ctx, wiki.test.raw) ===", flush=True)
+    try:
+        ppl = gguf_kld.find_perplexity(tools)
+        data = gguf_kld.fetch_wikitext(kdir)
+        basis = gguf_kld.ref_pass(ppl, ref, data, kdir, args.kld_ctx, args.kld_chunks)
+    except Exception as e:  # noqa: BLE001 -- reported in the summary
+        print(f"  !! KLD DISABLED for this run — {e}", flush=True)
+        return None
+    return {"bin": ppl, "basis": basis, "data": data, "dir": kdir, "failed": []}
+
+
+def _kld_measure(kld: dict, gguf_path: Path, quant: str) -> None:
+    if quant in BONSAI2_QUANTS:      # stock llama-perplexity has no kernel for 142/143
+        kld["failed"].append((quant, "no llama.cpp kernel for this type"))
+        return
+    try:
+        row = gguf_kld.measure(kld["bin"], gguf_path, quant, kld["basis"], kld["data"])
+        gguf_kld.append_row(kld["dir"], row)
+    except Exception as e:  # noqa: BLE001 -- a stats failure never blocks a publish
+        print(f"  {quant}: KLD FAILED — {e}", flush=True)
+        kld["failed"].append((quant, str(e)))
+
+
+def _kld_finish(kld: dict, hf_repo: str | None, model_name: str) -> None:
+    # load_rows() reads the whole append-only jsonl, so an --only rerun extends
+    # the table instead of replacing it.
+    rows = gguf_kld.load_rows(kld["dir"])
+    if not rows:
+        return
+    md = gguf_kld.write_reports(kld["dir"], kld["basis"], rows, model_name)
+    print(f"\n  KLD report: {md} ({len(rows)} tiers)", flush=True)
+    if hf_repo:
+        try:
+            gguf_kld.upload_reports(hf_repo, kld["dir"])
+            print(f"  KLD report uploaded to {hf_repo}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"  !! KLD report upload failed — {e}", flush=True)
+            kld["failed"].append(("perplexity.md", f"upload failed: {e}"))
+
+
 def main():
     parser = argparse.ArgumentParser(description="GGUF Quantization Pipeline")
     parser.add_argument("--chat-template-file", default=None,
@@ -2833,8 +2891,9 @@ def main():
                         default=True,
                         help="Run the sanity check on every quant AFTER it is "
                              "uploaded to HF and pushed to ollama (default: ON). "
-                             "A failing tier is withdrawn from HF automatically and "
-                             "its ollama tag is reported for manual removal. "
+                             "A failing tier is reported and LEFT on HF (pass "
+                             "--withdraw-on-sanity-fail to remove it); its ollama "
+                             "tag is reported for manual removal. "
                              "Disable with --no-sanity-check.")
     parser.add_argument("--withdraw-on-sanity-fail", action="store_true",
                         help="Delete a tier from HF when it fails the post-push "
@@ -2843,6 +2902,20 @@ def main():
                              "cannot certify that its own engine can run the "
                              "artifact. Only pass this when you have confirmed the "
                              "engine is current for the model architecture.")
+    parser.add_argument("--kld", action=argparse.BooleanOptionalAction, default=True,
+                        help="Measure PPL / mean KLD / same top-p of every tier against "
+                             "the unquantized reference on wiki.test.raw (bartowski's "
+                             "basis) and publish perplexity.md + kld_results.json "
+                             "(default: ON; always skipped for Gemma-4 A4B, whose PPL is "
+                             "meaningless). Disable with --no-kld.")
+    parser.add_argument("--kld-ref", default=None,
+                        help="Reference GGUF for --kld (default: the base GGUF the "
+                             "tiers are quantized from). Pass a BF16 GGUF to match "
+                             "bartowski's bf16 reference exactly.")
+    parser.add_argument("--kld-chunks", type=int, default=gguf_kld.DEFAULT_CHUNKS,
+                        help="wiki.test.raw chunks for --kld (default: 100)")
+    parser.add_argument("--kld-ctx", type=int, default=gguf_kld.DEFAULT_CTX,
+                        help="context per chunk for --kld (default: 512)")
     parser.add_argument("--no-upload", action="store_true",
                         help="Don't upload to HF, just quantize locally")
     parser.add_argument("--no-imatrix", action="store_true",
@@ -3511,6 +3584,22 @@ def main():
         else:
             print("  tensor_types_CD-*.txt already present (matching provenance) — keeping existing maps", flush=True)
 
+    # ── Step 2c: KLD reference logits (once, before any tier) ────────────
+    kld = None
+    kld_skipped = None
+    if args.kld:
+        try:
+            a4b = gguf_kld.is_gemma4_a4b(Path(args.kld_ref) if args.kld_ref else base_gguf)
+        except Exception as e:  # noqa: BLE001 -- unreadable header: keep the default behaviour
+            print(f"  KLD: architecture check failed ({e}); measuring as usual", flush=True)
+            a4b = False
+        if a4b:
+            kld_skipped = gguf_kld.A4B_SKIP_REASON
+            print(f"\n=== KLD reference: SKIPPED -- {kld_skipped} ===", flush=True)
+            args.kld = False
+        else:
+            kld = _kld_setup(args, tools, base_gguf, output_dir)
+
     # ── Step 3: Quantize + Upload ────────────────────────────
     print(f"\n=== Quantizing ({len(quants)} variants) ===", flush=True)
 
@@ -3533,7 +3622,8 @@ def main():
                                args=(upload_queue, hf_repo, stop_upload, keep_files,
                                      args.ollama_target, args.ollama_template,
                                      ollama_failed, tools, args.sanity_check,
-                                     sanity_failed, args.withdraw_on_sanity_fail),
+                                     sanity_failed, args.withdraw_on_sanity_fail,
+                                     kld),
                                daemon=True)
         upload_thread.start()
 
@@ -3605,6 +3695,8 @@ def main():
                     print(f"  {quant}: FAILED sanity check", flush=True)
                     failed.append((quant, "sanity check failed"))
                     continue
+            if kld and not hf_repo:
+                _kld_measure(kld, gguf_path, quant)
 
             # Queue for upload
             if hf_repo:
@@ -3622,6 +3714,9 @@ def main():
         upload_queue.join()
         stop_upload.set()
         upload_thread.join(timeout=10)
+
+    if kld:
+        _kld_finish(kld, hf_repo, model_name)
 
     # ── Optional: retry failed ollama pushes by re-downloading from HF ─────
     # This mirrors scripts/ollama_push_generic.sh: the local files are gone
@@ -3739,13 +3834,18 @@ def main():
 
     # ── Post-push sanity failures ────────────────────────────
     # These tiers were published, then failed the gate on the shipped bytes.
-    # HF was cleaned up automatically; ollama.com has no delete API, so the
-    # operator has to remove the tag by hand. Make that unmissable.
+    # By default they are LEFT on HF (a failure is a report, not a verdict);
+    # only --withdraw-on-sanity-fail removes them. ollama.com has no delete API,
+    # so the operator removes the tag by hand. Make that unmissable -- and say
+    # which of the two actually happened: on 2026-10-15 this line claimed
+    # "withdrawn from HF" for v9-agentic CD-IQ2_XS_L, which was still there.
     if sanity_failed:
         for q, _repo, _removed, _tag in sanity_failed:
             if q in succeeded:
                 succeeded.remove(q)
-            failed.append((q, "post-push sanity check failed (withdrawn from HF)"))
+            where = ("withdrawn from HF" if _removed
+                     else "STILL ON HF -- left in place, decide by hand")
+            failed.append((q, f"post-push sanity check failed ({where})"))
         print(f"\n{'!'*60}", flush=True)
         print(f"  {len(sanity_failed)} TIER(S) FAILED THE POST-PUSH SANITY CHECK",
               flush=True)
@@ -3799,6 +3899,16 @@ def main():
         print(f"  Failed: {len(failed)}", flush=True)
         for q, reason in failed:
             print(f"    {q}: {reason}", flush=True)
+    if kld_skipped:
+        print(f"  KLD: SKIPPED -- {kld_skipped}", flush=True)
+    if args.kld:
+        if not kld:
+            print("  KLD: DISABLED — reference pass failed (see '!! KLD' above); "
+                  "no tier carries KLD stats", flush=True)
+        elif kld["failed"]:
+            print(f"  KLD: {len(kld['failed'])} tier(s) not measured:", flush=True)
+            for q, reason in kld["failed"]:
+                print(f"    {q}: {reason}", flush=True)
     if hf_repo:
         print(f"  HF repo: https://huggingface.co/{hf_repo}", flush=True)
     print(f"  Output: {output_dir}", flush=True)

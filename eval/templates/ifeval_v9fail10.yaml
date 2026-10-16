@@ -1,0 +1,43 @@
+# ifeval_v9fail10 — the 10 IFEval prompts v9-agentic map A fails at greedy (ifeval_100,
+# 2026-10-15). Purpose: a cheap directional probe for a multilingual/IFEval-targeted
+# variant of map A.
+#
+# The `generation:` block is copied VERBATIM from ifeval_100.yaml / ifeval_full.yaml so the
+# subset measures the same thing as the parent cell.
+#
+# READ THE DENOMINATOR. n=10, selected on failure. Run map A on this task in the SAME session
+# (host, llama.cpp build, --parallel) as the variant; the A-vs-variant difference is the
+# reading, not variant-vs-0/10. Never tabulate beside ifeval_100. The regression check for
+# the other 90 prompts is a full ifeval_100 re-run.
+name: ifeval_v9fail10
+backend: lm-eval
+task: ifeval_v9fail10
+n: 10
+selection:
+  type: filter
+  all: true
+generation:
+  max_gen_toks: 16384
+  thinking_token_budget: 12288    # 2026-05-12: clip Gemma 4 reasoning loops; see EVAL_PROTOCOL §3
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+scoring:
+  metric: prompt_level_strict_acc
+  filter: none
+  validated_against: google/ifeval
+  validation_date: "2026-10-15"
+sanity:
+  min_p10_chars: 5
+backend_args:
+  apply_chat_template: true
+  num_fewshot: 0
+  batch_size: 1
+  lm_eval_include_path: lm_eval_tasks/ifeval_v9fail
+  vllm_reasoning_parser: gemma4
+  vllm_default_chat_template_kwargs: {enable_thinking: true}
+cache:
+  sqlite_prefix: ifeval_v9fail10
+reports:
+  token_stats: true

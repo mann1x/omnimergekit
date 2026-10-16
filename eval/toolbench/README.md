@@ -55,8 +55,15 @@ is logged and ignored; it can never take down the cohort.
 
 - harness `--hardmode --weight-by-difficulty --backend llamacpp`
 - `--context-size 65536 --context-pressure 0.25` → ~10 K filler tokens
-- server: temp 0.6 / top-p 0.95 / top-k 20 / min-p 0 / presence 0 / repeat 1,
+- server: `--temp 0.6 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 0 --repeat-penalty 1`,
   `-ngl 99 --ubatch-size 2048 --fit-target 256 -ctk q8_0 -ctv q8_0 --parallel 1`
+- **decode is GREEDY, not the server sampler** (measured 2026-10-14). tool-eval-bench puts
+  `"temperature": 0.0` (its `--temperature` default) into every request, and a request
+  temperature of 0 decodes greedy on llama-server whatever `--temp` says; only the
+  penalties survive. Every original cell reports `Temperature | 0.0`. To run a model on
+  its own sampler, give its `OMK_TB_MODELS_LIST` entry a 4th `|sampler` field: the runner
+  then also forwards it per request (`--temperature` + `--backend-kwargs`, llama.cpp key
+  names). Verify with `GET /slots` while a scenario is running.
 - seeds are **paired** across models, so comparisons are paired
 - **pin the harness commit.** Between v2.6.0 and v2.6.0-45 there are ~45 commits that
   are almost entirely scorer fixes crediting previously-penalised behaviour. A newer

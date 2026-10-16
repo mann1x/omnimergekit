@@ -2646,6 +2646,16 @@ def main() -> None:
         _sprofile = sampler_profiles.load(args.sampler_profile)
     elif args.sampler_profile == "auto" or args.sampler:
         _sprofile = sampler_profiles.match_profile(_served_for_match, args.model)
+    else:
+        # A profile may declare `require_profile: true` (e.g. gemma-4-v9-agentic: its eval
+        # basis is greedy + the shipped penalties). Running such a model with no profile flag
+        # would silently fall back to the frozen template sampler, so refuse instead.
+        _req = sampler_profiles.match_profile(_served_for_match, args.model)
+        if _req and _req.get("require_profile"):
+            sys.exit(f"REFUSING: {_served_for_match!r} matches {_req['__source__']} which sets "
+                     f"require_profile (bench_policy default="
+                     f"{(_req.get('bench_policy') or {}).get('default')!r}). Pass "
+                     f"--sampler-profile auto, or --sampler-profile auto --sampler <name>.")
     _samp_name, _samp, _samp_src = sampler_profiles.resolve(
         _sprofile, template["name"], args.sampler or None)
     _gen = template.setdefault("generation", {})

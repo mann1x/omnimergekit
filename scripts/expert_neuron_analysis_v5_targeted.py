@@ -42,9 +42,11 @@ transformers 5.5.0 (Gemma 4 support).
 """
 from __future__ import annotations
 import argparse
+import hashlib
 import json
 import math
 import os
+import re
 import time
 from pathlib import Path
 
@@ -765,6 +767,11 @@ def main():
                     help="JSONL of {\"prompt\": ...} lines. Injects a 'multilingual' "
                          "Tier-A category, appended LAST so it serializes as "
                          "generic_multilingual at the end of the generic block (T176).")
+    ap.add_argument("--tier-a-extra", action="append", default=[], metavar="NAME=JSONL",
+                    help="Repeatable. JSONL of {\"prompt\": ...} lines injected as an extra "
+                         "Tier-A category generic_<NAME>, after --multilingual-calib, in the "
+                         "order given. NAME must be [a-z][a-z0-9_]* and must not collide "
+                         "with an existing category. Recorded (path, n, sha256) in metadata.")
     ap.add_argument("--gpu-budget-gib", type=int, default=18,
                     help="Per-GPU bf16 weight budget for device_map='auto'. 18 suits a "
                          "24 GB 3090 (CPU-spills cold layers = SLOW). On a 97 GB Blackwell "
@@ -862,6 +869,25 @@ def main():
         print(f"[multilingual] injected {len(mlp)} Tier-A prompts → generic_multilingual",
               flush=True)
 
+    # v9-ml: generalised Tier-A injection (one category per --tier-a-extra), so a map
+    # can carry e.g. generic_multilingual AND generic_ifeval with separate class weights.
+    tier_a_extra_meta = {}
+    for spec in args.tier_a_extra:
+        name, sep, path = spec.partition("=")
+        if not sep or not re.fullmatch(r"[a-z][a-z0-9_]*", name) or not path:
+            raise SystemExit(f"--tier-a-extra: expected NAME=JSONL with NAME [a-z][a-z0-9_]*, got {spec!r}")
+        if name in TIER_A_PROMPTS:
+            raise SystemExit(f"--tier-a-extra: category {name!r} already exists")
+        raw = Path(path).read_bytes()
+        prompts = [json.loads(x)["prompt"] for x in raw.decode().splitlines() if x.strip()]
+        if not prompts:
+            raise SystemExit(f"--tier-a-extra: no prompts in {path}")
+        TIER_A_PROMPTS[name] = prompts
+        tier_a_extra_meta[f"generic_{name}"] = {
+            "path": path, "n": len(prompts), "sha256": hashlib.sha256(raw).hexdigest()}
+        print(f"[tier-a-extra] injected {len(prompts)} Tier-A prompts → generic_{name}",
+              flush=True)
+
     # T176: a base map is Tier-A only. No tier-b-json ⇒ force --skip-tier-b.
     if not args.tier_b_json:
         args.skip_tier_b = True
@@ -943,7 +969,6 @@ def main():
         if not _tpl.exists():
             raise SystemExit(f"--chat-template-file: {_tpl} does not exist")
         tokenizer.chat_template = _tpl.read_text()
-        import hashlib
         _sha = hashlib.sha256(_tpl.read_bytes()).hexdigest()[:16]
         print(f"[chat-template] OVERRIDE {_tpl.name} sha={_sha}", flush=True)
     model.eval()
@@ -1123,6 +1148,7 @@ def main():
             "agentic_eog_corpus": (args.eog_corpus if emit_id is not None else None),
             "agentic_eog_stats": eog_stats,
             "chat_template_file": args.chat_template_file,
+            "tier_a_extra": tier_a_extra_meta,
             "device": args.device,
             "dtype": args.dtype,
             "categories": list(all_cats.keys()),
