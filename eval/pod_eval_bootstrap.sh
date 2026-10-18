@@ -222,7 +222,15 @@ if [ "$BUILD_LLAMA" = 1 ]; then
             -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
             -DLLAMA_CURL="$LLAMA_CURL" \
             -DCMAKE_BUILD_TYPE=Release >/dev/null
-        cmake --build build --target llama-server llama-quantize llama-imatrix --parallel 2>&1 | tail -3
+        # Bounded parallelism. A bare --parallel hands Ninja its default (nproc+2): on a
+        # 72-vCPU / 62 GB pod that is 74 concurrent nvcc jobs, the container runs out of
+        # memory and the host RESTARTS it (vast 55941424, 2026-10-14). ~4 GB per job.
+        _mem_gb=$(free -g | awk '/^Mem:/{print $2}')
+        _jobs="${BUILD_JOBS:-$(( _mem_gb / 4 ))}"
+        [ "$_jobs" -gt "$(nproc)" ] && _jobs=$(nproc)
+        [ "$_jobs" -lt 1 ] && _jobs=1
+        log "   build jobs $_jobs (RAM ${_mem_gb} GB, $(nproc) cpus)"
+        cmake --build build --target llama-server llama-quantize llama-imatrix --parallel "$_jobs" 2>&1 | tail -3
         cd - >/dev/null
     else
         log "4. llama.cpp already built"
