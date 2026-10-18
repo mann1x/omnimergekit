@@ -25,6 +25,12 @@ regexes = [
     # signatures: jdk-unsafe-1.8". A signature-bundle name, not a key. Added 2026-10-13
     # for recipes/gemma4/v9_agentic/traces/qset_FULL.json.
     '''jdk-(unsafe|deprecated|system-out|non-portable|reflection|internal)-\d+(\.\d+)?''',
+    # toolbench fixture data inside agentic transcripts (eval/toolbench/cohort64k): the
+    # synthetic credential-service scenario's idempotency keys ("idemp_2a2864_0005") and
+    # IANA timezone names ("key point: \"Europe/Lisbon\""). Fixture strings, not keys.
+    # Added 2026-10-18 when the cohort64k transcripts were committed.
+    '''\bidemp_[0-9a-f]{6}_\d{4}\b''',
+    '''^(Africa|America|Antarctica|Asia|Atlantic|Australia|Europe|Indian|Pacific)/[A-Z][A-Za-z_]+$''',
 ]
 
 # ---------------------------------------------------------------------------

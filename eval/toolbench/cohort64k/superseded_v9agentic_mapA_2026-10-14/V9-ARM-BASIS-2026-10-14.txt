@@ -1,0 +1,9 @@
+v9-agentic arm added to the cohort64k tool-eval-bench cohort (2026-10-14)
+model    ManniX-ITA/gemma-4-20B-v9-agentic-GGUF gemma-4-20B-v9-agentic-Q4_K_M.gguf sha256 1daa692543cc056a1350d94f0321ff022943553b9fc249a0973deed75304858e
+drafter  ManniX-ITA/gemma-4-26B-A4B-it-assistant-GGUF gemma-4-26B-A4B-it-assistant.Q8_0.gguf sha256 5963a2edfb516fbd… (--spec-type draft-assistant, n-max 3)
+sampler  the MODEL's own (owner): temp 1 / top_k 64 / top_p 0.95 / min_p 0 / repeat_last_n 96 / repeat_penalty 1.06 / presence_penalty 0.025
+         (the original 10 arms ran their own family's Qwen sampler 0.6 / 0.95 / 20)
+server   opencoti-llamafile c13-r2 (pin llamafile-v0.10.5+opencoti.c13-r2, git b9a74a38911f, host-binary sha 7cf42f68…, ggml-cuda.so sha 1beda05b… side-loaded from the exe dir)
+         -- the original 10 arms ran opencoti-0.10.5-c7 (2026-09-05/09); owner instruction: use the latest release
+host     solidpc RTX 3090 (same host/GPU as the original cohort)
+harness  tool-eval-bench 2.6.0 (uv tool), --hardmode --weight-by-difficulty, ctx 65536, pressure 0.25, timeout 600, seeds 42..46

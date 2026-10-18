@@ -1,0 +1,8 @@
+v9-agentic (re-published from v9-ml ml_k8) arm, cohort64k basis, 2026-10-16
+model    ManniX-ITA/gemma-4-20B-v9-agentic-GGUF gemma-4-20B-v9-agentic-Q4_K_M.gguf sha256 a8723288f9b4acc1edb56a136e1d4daed1927461859f330980325bc2e016cde6
+drafter  none (owner: no drafter; speculation does not change scores)
+sampler  greedy + penalties: temp 0 / top_k 0 / top_p 1 / min_p 0 / repeat_penalty 1.06 / repeat_last_n 96 / presence_penalty 0.025 (forwarded per request)
+server   STOCK llama.cpp version: 9700 (9724f664e) llama-server (the cohort rows ran opencoti-llamafile c7 / c13-r2; c13-r2 cannot use this pod's driver 560)
+host     vast pod 55947563 RTX 3090 GPU1 (the 2026-10-14 v9 arm ran on solidpc RTX 3090)
+harness  tool-eval-bench 2.6.0 (992a6978), --hardmode --weight-by-difficulty, ctx 65536, pressure 0.25, timeout 600, seeds 42..46
+chart    toolbench_scores_v9_agentic.png rebuilt 2026-10-16 with this arm replacing the 2026-10-14 map-A arm (moved to superseded_v9agentic_mapA_2026-10-14/)
