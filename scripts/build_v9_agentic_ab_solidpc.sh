@@ -19,11 +19,15 @@
 #   CANDS="A B"        which candidates
 #   SHARED_ALPHA=1.2   router_shared_upweight alpha on mlp.down_proj.weight; "none" skips the upweight
 #   SUFFIX=""          appended to the build name, e.g. SUFFIX=-noshared -> gemma-4-A4B-20B-v9-agentic-A-noshared
+#   BF16_ONLY=0        1 = stop after the bf16 (the v10 quant path, v10_recipe/run_v10_quant_solidpc.sh, takes it from there)
 # e.g. the A-without-shared-upweight looping test (owner 2026-10-21):
 #   CANDS=A SHARED_ALPHA=none SUFFIX=-noshared bash build_v9_agentic_ab_solidpc.sh
+# and the intermediate alphas (owner 2026-10-21: 1.2 loops, none cannot converge):
+#   CANDS=A SHARED_ALPHA=1.05 SUFFIX=-shared105 BF16_ONLY=1 bash build_v9_agentic_ab_solidpc.sh
 set -uo pipefail
 SHARED_ALPHA=${SHARED_ALPHA:-1.2}
 SUFFIX=${SUFFIX:-}
+BF16_ONLY=${BF16_ONLY:-0}
 [ "$SHARED_ALPHA" = none ] || [ -n "$SUFFIX" ] || [ "$SHARED_ALPHA" = 1.2 ] || { echo "a non-default SHARED_ALPHA needs a SUFFIX"; exit 1; }
 PY=/root/anaconda3/envs/omnimergekit/bin/python
 OMK=/shared/dev/omnimergekit
@@ -66,6 +70,7 @@ PYEOF
   cp "$TMPL" "$BF/chat_template.jinja"
   grep -o '"drop_map_file": "[^"]*"' "$BF/expert_drop_metadata.json"
   echo "[$(ts)] bf16 OK $(du -sh "$BF" | cut -f1)"
+  [ "$BF16_ONLY" = 1 ] && { echo "[$(ts)] BF16_ONLY: $C done at $BF"; continue; }
   mkdir -p "$GG"
   if ! ls "$GG"/*-Q4_K_M.gguf >/dev/null 2>&1; then
     LLAMA_CPP_HOME=/opt/llama.cpp "$PY" $OMK/scripts/quantize_gguf.py --model "$BF" --output-dir "$GG" --only Q4_K_M \

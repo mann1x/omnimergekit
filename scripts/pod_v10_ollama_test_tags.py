@@ -16,6 +16,9 @@ The model is private on ollama.com, so its new tags are too. Gates, reused from 
 A push is never trusted from its exit code. Report lines go to --report (TSV).
 
 usage: pod_v10_ollama_test_tags.py --gguf <file> --prefix hub_k12 [--quant Q4_K_M]
+
+Local-only (owner 2026-10-21, "don't publish them"): --no-push builds and checks the tags (gates 0-2) and KEEPS them
+in the local store, for osync to other hosts; --variants picks which of the four; --host is the xollama to use.
 """
 from __future__ import annotations
 
@@ -41,10 +44,20 @@ def main() -> int:
     ap.add_argument("--ref-modelfile", default="/workspace/ollama_scratch/Modelfile.Q4_K_M")
     ap.add_argument("--scratch", default="/workspace/v10/ollama")
     ap.add_argument("--report", default="/workspace/v10/logs/ollama_test_tags.tsv")
+    ap.add_argument("--variants", default="plain,vision,mtp,mtp-vision", help="subset of plain,vision,mtp,mtp-vision")
+    ap.add_argument("--no-push", action="store_true", help="create + check only, keep the tags local (no registry)")
+    ap.add_argument("--host", default=P.HOST, help="the xollama to create and check on (host:port)")
+    ap.add_argument("--store", default=str(P.STORE), help="that xollama's OLLAMA_MODELS (manifests are read from it)")
     a = ap.parse_args()
+    P.HOST, P.STORE = a.host, Path(a.store)
+    want = set(a.variants.split(","))
+    if not want <= {"plain", "vision", "mtp", "mtp-vision"}:
+        P.log(f"FATAL unknown --variants {a.variants}")
+        return 2
 
     gguf, mmproj, drafter = Path(a.gguf), Path(a.mmproj), Path(a.drafter)
-    for p in (gguf, mmproj, drafter):
+    need = [gguf] + ([mmproj] if want & {"vision", "mtp-vision"} else []) + ([drafter] if want & {"mtp", "mtp-vision"} else [])
+    for p in need:
         if not p.exists():
             P.log(f"FATAL missing {p}")
             return 2
@@ -62,8 +75,10 @@ def main() -> int:
     t = f"{a.prefix}-{a.quant}"
     scratch = Path(a.scratch)
     scratch.mkdir(parents=True, exist_ok=True)
-    for tag, vis, mtp in [(t, False, False), (f"vision-{t}", True, False),
-                          (f"mtp-{t}", False, True), (f"mtp-vision-{t}", True, True)]:
+    for kind, tag, vis, mtp in [("plain", t, False, False), ("vision", f"vision-{t}", True, False),
+                                ("mtp", f"mtp-{t}", False, True), ("mtp-vision", f"mtp-vision-{t}", True, True)]:
+        if kind not in want:
+            continue
         p = dict(base_params)
         if mtp:
             p["draft_num_predict"] = P.DRAFT_N
@@ -77,6 +92,11 @@ def main() -> int:
                 P.local_check(ref, p, vis, mtp)
                 made = P.model_digest(a.ollama, tag)
                 P.generation_check(ref)
+                if a.no_push:
+                    P.log(f"  {ref} CREATED locally on {P.HOST} (checked, not pushed), model {made[:19]}")
+                    with open(a.report, "a") as f:
+                        f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\t{ref}\t{made}\tlocal\n")
+                    break
                 P.xo("push", ref)
                 info = P.registry_readback(a.ollama, tag)
                 ok, why = P.tag_ok(info, p, vis, mtp)
@@ -95,7 +115,8 @@ def main() -> int:
                     P.log(f"FATAL {ref}")
                     return 2
                 time.sleep(60 * attempt)
-        P.xo("rm", ref, check=False)
+        if not a.no_push:
+            P.xo("rm", ref, check=False)
     P.log(f"###### TEST_TAGS_DONE {t} ######")
     return 0
 
