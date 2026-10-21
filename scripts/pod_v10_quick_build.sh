@@ -7,7 +7,10 @@
 #   bf16  = expert_drop <map> -> router_shared_upweight a1.2 (the v9-agentic recipe, only the map changes),
 #           + the shipped v9-agentic chat_template / generation_config / preprocessor_config (official template)
 #   quant = quantize_gguf.py with LLAMA_CPP_HOME=llama.cpp-latest (b11707): convert -> F16 -> imatrix on
-#           calibration_datav5.txt (all chunks) on GPU0+GPU1 -> Q4_K_M with that imatrix. --no-kld (Gemma-4 A4B).
+#           calibration_datav5.txt, IMATRIX_CHUNKS chunks (default 128 = the QUICK imatrix the owner asked for) on
+#           GPU0+GPU1 -> Q4_K_M with that imatrix. --no-kld (Gemma-4 A4B).
+#           bug-818: the 2026-10-17/18 pod builds (a_ref, a_ml3, a_core5, hub_k9, hub_k12) ran --imatrix-chunks -1
+#           (all 822 chunks). Only the AC imatrix goes full corpus; IMATRIX_CHUNKS=-1 reproduces those pushed builds.
 #           imatrix.dat is kept next to the quant; the F16 intermediate is removed after the Q4_K_M is verified.
 # usage: pod_v10_quick_build.sh base | bf16 <name> | quant <name> | rmbase
 set -uo pipefail
@@ -49,9 +52,9 @@ quant)
   [ "$(sha256sum $CAL | cut -c1-16)" = $CALSHA ] || die "calib sha"
   [ -f $GG/imatrix.dat ] && die "$GG/imatrix.dat exists — refusing to clobber an imatrix"
   mkdir -p $GG
-  say "$n: convert + imatrix (v5, all chunks, GPU0+GPU1) + Q4_K_M on llama.cpp b11707 ($LCREV)"
+  say "$n: convert + imatrix (v5, ${IMATRIX_CHUNKS:-128} chunks, GPU0+GPU1) + Q4_K_M on llama.cpp b11707 ($LCREV)"
   CUDA_VISIBLE_DEVICES=0,1 LLAMA_CPP_HOME=$LC "$PY" $OMK/scripts/quantize_gguf.py --model $BF --output-dir $GG \
-    --only Q4_K_M --cal-data $CAL --imatrix-chunks -1 --imatrix-timeout 14400 --no-kld \
+    --only Q4_K_M --cal-data $CAL --imatrix-chunks ${IMATRIX_CHUNKS:-128} --imatrix-timeout 14400 --no-kld \
     --chat-template-file $BF/chat_template.jinja --chat-template-sha256 $TSHA \
     --base-model-id google/gemma-4-26B-A4B-it --no-upload --keep-local > $V/logs/$n.quant.log 2>&1 \
     || die "$n quantize_gguf (see $V/logs/$n.quant.log)"
