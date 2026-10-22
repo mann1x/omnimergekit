@@ -169,10 +169,10 @@ QWEN35_CD = {
 QWEN35_FILL_ROLES = ("ffn_down",)
 # One step up per fill pass; bits/weight for the size estimate (the final map
 # is always re-measured by a real --dry-run, the estimate only orders bumps).
-QWEN35_STEP_UP = {"q2_K": "q3_K", "q3_K": "q4_K", "iq4_xs": "q5_K", "q4_K": "q5_K",
-                  "q5_K": "q6_K", "q6_K": "q8_0"}
-QWEN35_BPW = {"q2_K": 2.625, "q3_K": 3.4375, "iq4_xs": 4.25, "q4_K": 4.5, "q5_K": 5.5,
-              "q6_K": 6.5625, "q8_0": 8.5}
+QWEN35_STEP_UP = {"q2_K": "q3_K", "q3_K": "q4_K", "iq4_xs": "q5_K", "iq4_nl": "q5_K",
+                  "q4_K": "q5_K", "q5_K": "q6_K", "q6_K": "q8_0"}
+QWEN35_BPW = {"q2_K": 2.625, "q3_K": 3.4375, "iq4_xs": 4.25, "iq4_nl": 4.5, "q4_K": 4.5,
+              "q5_K": 5.5, "q6_K": 6.5625, "q8_0": 8.5}
 QWEN35_SIZE_MARGIN = 0.003  # stay >=0.3% under the counterpart, not merely equal
 QWEN35_FILL_PASSES = 2
 DRY_TENSOR_RE = re.compile(r"\] (\S+)\s+- \[.*?->\s+([\d.]+) MiB \((\w+)\)")

@@ -10,7 +10,9 @@
 set -uo pipefail
 : "${MODEL:?}" "${OUT:?}" "${IMATRIX_SHA:?}" "${LC:?}" "${OMK:?}"
 PY="${PY:-python}"; REPO=ManniX-ITA/JackOD-9B-Coder-MTP-GGUF
-TIERS="CD-IQ4_K_M,CD-Q2_K,CD-Q3_K_L,CD-Q4_K_M,CD-Q5_K_M,CD-Q6_K,IQ2_M,IQ2_S,IQ2_XS,IQ3_M,IQ3_XS,IQ3_XXS,IQ4_NL,IQ4_XS,Q2_K_L,Q3_K_L,Q3_K_M,Q3_K_S,Q3_K_XL,Q4_K_L,Q4_K_M,Q4_K_S,Q5_K_L,Q5_K_M,Q5_K_S,Q6_K_L,Q8_0"
+# No CD-IQ4_K_M for this model: on an IQ4_XS base it only matches IQ4_XS (0.02608 vs 0.02615,
+# 22 MB smaller); on IQ4_NL it gains 0.0004 for +0.23 GB — CD-Q4_K_M covers that slot (bm-884).
+TIERS="CD-Q2_K,CD-Q3_K_L,CD-Q4_K_M,CD-Q5_K_M,CD-Q6_K,IQ2_M,IQ2_S,IQ2_XS,IQ3_M,IQ3_XS,IQ3_XXS,IQ4_NL,IQ4_XS,Q2_K_L,Q3_K_L,Q3_K_M,Q3_K_S,Q3_K_XL,Q4_K_L,Q4_K_M,Q4_K_S,Q5_K_L,Q5_K_M,Q5_K_S,Q6_K_L,Q8_0"
 [ "$(basename "$MODEL")" = JackOD-9B-Coder ] || { echo "FATAL: weights dir must be named JackOD-9B-Coder"; exit 3; }
 [ "$(sha256sum "$OUT/imatrix.dat" | cut -d' ' -f1)" = "$IMATRIX_SHA" ] || { echo "FATAL: staged imatrix is not $IMATRIX_SHA"; exit 3; }
 export LLAMA_CPP_HOME="$LC" OMK_NO_README=1
