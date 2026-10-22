@@ -57,13 +57,19 @@ A4B_SKIP_REASON = ("Gemma-4 A4B (MoE) has no working llama-perplexity PPL "
                    "(v9 BF16 reference PPL 32682 on wiki.test.raw)")
 
 
+def gguf_arch(gguf_path) -> str:
+    """general.architecture of a GGUF ('' when absent)."""
+    from gguf import GGUFReader
+    arch = GGUFReader(str(gguf_path)).fields.get("general.architecture")
+    return "" if arch is None else bytes(arch.parts[arch.data[0]]).decode("utf-8", "replace")
+
+
 def is_gemma4_a4b(gguf_path) -> bool:
     """True for a Gemma-4 MoE GGUF: general.architecture == gemma4 AND gemma4.expert_count > 0.
     E2B / E4B / 31B are dense and carry no expert_count, so they return False."""
     from gguf import GGUFReader
     f = GGUFReader(str(gguf_path)).fields
-    arch = f.get("general.architecture")
-    if arch is None or bytes(arch.parts[arch.data[0]]).decode("utf-8", "replace") != "gemma4":
+    if gguf_arch(gguf_path) != "gemma4":
         return False
     ec = f.get("gemma4.expert_count")
     return ec is not None and int(ec.parts[ec.data[0]][0]) > 0

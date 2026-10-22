@@ -127,6 +127,138 @@ ATTN_VK_PROTECT = {
 }
 
 
+# ── Qwen3.5 hybrid (general.architecture == qwen35) ──────────────────────
+# The Gemma tables above do not fit this chassis: 3/4 of the layers are
+# linear-attention (attn_qkv / attn_gate / ssm_out, none of which the Gemma
+# roles name), and the 248k vocab makes token_embd + output ~1B params each,
+# so the Gemma Q8_0-globals rule alone adds ~0.76 GB. Every Gemma-shaped CD
+# tier came out LARGER than its stock counterpart with WORSE KLD (bm-884).
+#
+# A CD tier here = a stock file-base FTYPE + anchored role overrides measured
+# on JackOD-9B-Coder (KLD vs F16, wiki.test 100x512, llama.cpp 311d4211b):
+#   - ssm_out (the linear-attention output projection) is the KLD driver: Q6_K
+#     on it alone takes stock Q4_K_M from 0.0367 to 0.0194 for +0.10 GB;
+#     attn_gate / qkv / full-attn / ffn_down at the same cost buy ~0.003.
+#   - output.weight Q6_K -> Q5_K and token_embd demotion pay for it: output
+#     Q5_K is KLD-neutral at -0.12 GB.
+# Whatever budget is left under the counterpart's size goes to ffn_down, one
+# type step per layer, in imatrix layer-rank order (the "dynamic" part).
+# Patterns are ANCHORED: llama-quantize regex_searches and the first match
+# wins, so a bare `output` would also hit every blk.N.attn_output.
+QWEN35_ROLE_PATTERN = {
+    "token_embd": r"^token_embd\.weight$",
+    "output": r"^output\.weight$",
+}
+QWEN35_CD = {
+    # tier: (file-base FTYPE, stock counterpart whose size it must beat, role overrides)
+    # At Q6 token_embd precision beats attn_gate: q5_K embd 0.00564 vs attn_gate q8_0 + q4_K embd
+    # 0.00613 (stock Q6_K 0.0059); output stays q6_K (q5_K there costs ~0.001 at this level).
+    "CD-Q6_K":    ("Q6_K",   "Q6_K",   {"ssm_out": "q8_0", "token_embd": "q5_K"}),
+    "CD-Q5_K_M":  ("Q5_K_M", "Q5_K_M", {"ssm_out": "q8_0", "attn_gate": "q8_0", "output": "q5_K",
+                                        "attn_output": "q5_K", "token_embd": "q3_K"}),
+    "CD-Q4_K_M":  ("Q4_K_M", "Q4_K_M", {"ssm_out": "q6_K", "attn_gate": "q6_K", "output": "q5_K",
+                                        "attn_output": "q5_K", "token_embd": "q3_K"}),
+    # IQ4_XS already holds ssm_out well (0.0261 vs Q4_K_M 0.0367); q5_K there is WORSE
+    # than iq4_xs (0.0435), output iq4_xs costs 0.006, token_embd q3_K + fill 0.0004.
+    # ssm_out q6_K + output q5_K: 0.02608 at 5.308 GB vs 0.02615 at 5.326 — a size win only.
+    "CD-IQ4_K_M": ("IQ4_XS", "IQ4_XS", {"ssm_out": "q6_K", "output": "q5_K"}),
+    "CD-Q3_K_L":  ("Q3_K_L", "Q3_K_L", {"ssm_out": "q6_K", "attn_gate": "q6_K", "output": "q5_K",
+                                        "attn_output": "q5_K", "ffn_down": "q4_K"}),
+    "CD-Q2_K":    ("Q2_K",   "Q2_K",   {"ssm_out": "q6_K", "attn_gate": "q4_K", "output": "q3_K"}),
+}
+QWEN35_FILL_ROLES = ("ffn_down",)
+# One step up per fill pass; bits/weight for the size estimate (the final map
+# is always re-measured by a real --dry-run, the estimate only orders bumps).
+QWEN35_STEP_UP = {"q2_K": "q3_K", "q3_K": "q4_K", "iq4_xs": "q5_K", "q4_K": "q5_K",
+                  "q5_K": "q6_K", "q6_K": "q8_0"}
+QWEN35_BPW = {"q2_K": 2.625, "q3_K": 3.4375, "iq4_xs": 4.25, "q4_K": 4.5, "q5_K": 5.5,
+              "q6_K": 6.5625, "q8_0": 8.5}
+QWEN35_SIZE_MARGIN = 0.003  # stay >=0.3% under the counterpart, not merely equal
+QWEN35_FILL_PASSES = 2
+DRY_TENSOR_RE = re.compile(r"\] (\S+)\s+- \[.*?->\s+([\d.]+) MiB \((\w+)\)")
+
+
+def gguf_arch(gguf_path: Path) -> str:
+    sys.path.insert(0, "/opt/llama.cpp/gguf-py")
+    from gguf import GGUFReader
+    f = GGUFReader(str(gguf_path)).fields.get("general.architecture")
+    return bytes(f.parts[f.data[0]]).decode("utf-8", "replace") if f else ""
+
+
+def qwen35_role_pattern(role: str) -> str:
+    return QWEN35_ROLE_PATTERN.get(role, rf"^blk\.\d+\.{role}\.weight$")
+
+
+def dry_run(llama_quantize: str, imatrix: Path, gguf: Path, ftype: str,
+            map_lines: list[str]) -> tuple[float, dict[str, tuple[str, float]]]:
+    """llama-quantize --dry-run: (total MiB, {tensor: (type, MiB)}) — exact, ~seconds."""
+    import subprocess
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tf:
+        tf.write("\n".join(map_lines) + "\n")
+        tt = tf.name
+    try:
+        cmd = [llama_quantize, "--dry-run", "--imatrix", str(imatrix)]
+        if map_lines:
+            cmd += ["--tensor-type-file", tt]
+        r = subprocess.run(cmd + [str(gguf), "/dev/null", ftype],
+                           capture_output=True, text=True, timeout=600)
+    finally:
+        Path(tt).unlink(missing_ok=True)
+    txt = r.stdout + r.stderr
+    m = re.search(r"quant size\s*=\s*([\d.]+) MiB", txt)
+    if r.returncode or m is None:
+        raise RuntimeError(f"llama-quantize --dry-run {ftype} failed:\n{txt[-3000:]}")
+    return float(m.group(1)), {n: (t, float(mib)) for n, mib, t in DRY_TENSOR_RE.findall(txt)}
+
+
+def build_qwen35_map(cd_name: str, ranking: list[int], imatrix: Path, gguf: Path,
+                     llama_quantize: str, counterpart_mib: dict[str, float]) -> tuple[list[str], dict]:
+    base, counterpart, roles = QWEN35_CD[cd_name]
+    if counterpart not in counterpart_mib:
+        counterpart_mib[counterpart] = dry_run(llama_quantize, imatrix, gguf, counterpart, [])[0]
+    budget = counterpart_mib[counterpart] * (1 - QWEN35_SIZE_MARGIN)
+    role_lines = [f"{qwen35_role_pattern(r)}={t}" for r, t in roles.items()]
+    total, tensors = dry_run(llama_quantize, imatrix, gguf, base, role_lines)
+    if total >= budget:
+        raise RuntimeError(f"{cd_name}: role recipe alone is {total:.1f} MiB, over the "
+                           f"{counterpart} budget {budget:.1f} MiB — the recipe is wrong")
+    # Greedy fill: one step per layer per pass, most important layer first.
+    cur = {n: t for n, (t, _) in tensors.items()}
+    bumps: dict[str, str] = {}
+    est = total
+    for _ in range(QWEN35_FILL_PASSES):
+        for li in ranking:
+            for role in QWEN35_FILL_ROLES:
+                name = f"blk.{li}.{role}.weight"
+                t = cur.get(name, "")
+                nxt = QWEN35_STEP_UP.get(t)
+                if nxt is None:
+                    continue
+                stock_t, stock_mib = tensors[name]
+                delta = stock_mib * (QWEN35_BPW[nxt] - QWEN35_BPW[t]) / QWEN35_BPW[stock_t]
+                if est + delta > budget:
+                    continue
+                cur[name] = bumps[name] = nxt
+                est += delta
+    # Per-layer lines go FIRST (first match wins), then the role-wide lines.
+    while True:
+        lines = [rf"^{re.escape(n)}$={t}" for n, t in bumps.items()] + role_lines
+        final, got = dry_run(llama_quantize, imatrix, gguf, base, lines)
+        wrong = [n for n, t in bumps.items() if got[n][0] != t]
+        if wrong:
+            raise RuntimeError(f"{cd_name}: llama-quantize did not apply {wrong[:4]}")
+        if final < budget or not bumps:
+            break
+        bumps.pop(next(reversed(bumps)))  # estimate overshot: drop the last bump
+    if final >= budget:
+        raise RuntimeError(f"{cd_name}: {final:.1f} MiB is not under {counterpart} ({budget:.1f})")
+    meta = {"arch": "qwen35", "file_base_ftype": base, "counterpart": counterpart,
+            "counterpart_mib": counterpart_mib[counterpart], "dry_mib": final,
+            "role_overrides": roles, "fill_bumps": bumps}
+    return lines, meta
+
+
 def load_imatrix_importance(imatrix_path: Path) -> tuple[dict[int, float], int]:
     """Load imatrix.dat and return (per-layer importance dict, num_layers)."""
     sys.path.insert(0, "/opt/llama.cpp/gguf-py")
@@ -293,6 +425,14 @@ def main():
                          "the v4_layer_floor_map.json shape with 'top98_mean_per_layer'.")
     ap.add_argument("--out-dir", default=".", help="Output directory for tensor_types_*.txt")
     ap.add_argument("--dry-run", action="store_true", help="Only print ranking, no files")
+    ap.add_argument("--gguf",
+                    help="F16/BF16 source GGUF. Selects the per-arch recipe (qwen35 has its "
+                         "own; every other arch uses the CD_TIERS tables) and is what the "
+                         "qwen35 size budget is dry-run against.")
+    ap.add_argument("--llama-quantize", default="llama-quantize",
+                    help="llama-quantize binary for the qwen35 --dry-run size budget")
+    ap.add_argument("--recipes", nargs="*",
+                    help="Only emit these CD tiers (default: every tier of the arch)")
     args = ap.parse_args()
 
     imatrix_path = Path(args.imatrix)
@@ -361,7 +501,27 @@ def main():
     importance_file_name = (
         Path(args.layer_importance).name if args.layer_importance else None
     )
-    for cd_name in CD_TIERS:
+    arch = gguf_arch(Path(args.gguf)) if args.gguf else ""
+    if arch == "qwen35":
+        counterpart_mib: dict[str, float] = {}
+        for cd_name in args.recipes or QWEN35_CD:
+            lines, meta = build_qwen35_map(cd_name, ranking, imatrix_path, Path(args.gguf),
+                                           args.llama_quantize, counterpart_mib)
+            out_path = out_dir / f"tensor_types_{cd_name}.txt"
+            out_path.write_text("\n".join(lines) + "\n")
+            ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+            meta.update({"generated_from_imatrix_sha256": imatrix_sha,
+                         "importance_source": importance_source,
+                         "importance_file_sha256": importance_file_sha,
+                         "importance_file_name": importance_file_name,
+                         "generated_at": ts, "tier_profile": cd_name,
+                         "num_layers": num_layers, "layer_ranking": ranking})
+            out_path.with_name(out_path.name + META_SUFFIX).write_text(json.dumps(meta, indent=2) + "\n")
+            print(f"  wrote {out_path}: base {meta['file_base_ftype']}, {meta['dry_mib']:.1f} MiB "
+                  f"< {meta['counterpart']} {meta['counterpart_mib']:.1f} MiB, "
+                  f"{len(meta['fill_bumps'])} fill bumps")
+        return
+    for cd_name in args.recipes or CD_TIERS:
         path = write_tensor_types_file(
             cd_name, tiers, num_layers, out_dir,
             imatrix_sha=imatrix_sha,
