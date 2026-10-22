@@ -19,6 +19,7 @@ Usage:
     python scripts/router_shared_upweight.py \
         --model-dir google/gemma-4-A4B-98e-v5fixed-sweep-A2_lp4_uni-NVFP4A16 \
         --alpha 1.2
+    python scripts/router_shared_upweight.py --model-dir <dir> --alpha 1.2 --layers 0-9   # some layers only
     python scripts/router_shared_upweight.py --model-dir <dir> --restore   # undo
 
 Reversible: backs up edited shards once, restore touches `down_proj.weight_scale_2`
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -37,6 +39,16 @@ from safetensors.torch import save_file
 
 
 BACKUP_SUFFIX = ".pre_shared_upweight"
+LAYER_RE = re.compile(r"\.layers\.(\d+)\.")
+
+
+def parse_layers(spec: str) -> set[int]:
+    """'0-9' / '0,1,28,29' / '0-4,6-10' -> set of layer indices."""
+    out: set[int] = set()
+    for part in spec.split(","):
+        a, _, b = part.strip().partition("-")
+        out.update(range(int(a), int(b or a) + 1))
+    return out
 
 
 def main() -> int:
@@ -48,6 +60,8 @@ def main() -> int:
                     help="Restore shards from .pre_shared_upweight backups (undo)")
     ap.add_argument("--target", default="mlp.down_proj.weight_scale_2",
                     help="Tensor name suffix to scale (default: down_proj.weight_scale_2)")
+    ap.add_argument("--layers", default=None,
+                    help="Only scale these layer indices, e.g. 0-9 or 0-4,6-10 (default: every layer)")
     args = ap.parse_args()
 
     d = Path(args.model_dir)
@@ -68,6 +82,15 @@ def main() -> int:
               f"Inspect {idx_path}.")
         return 2
     targets.sort()
+    if args.layers:
+        want = parse_layers(args.layers)
+        have = {int(m.group(1)): k for k in targets if (m := LAYER_RE.search(k))}
+        missing = sorted(want - set(have))
+        if missing:
+            print(f"FAIL: --layers {args.layers}: no '{args.target}' tensor for layer(s) {missing}")
+            return 2
+        targets = sorted(have[i] for i in want)
+        print(f"layers: {sorted(want)}")
 
     # Group by shard
     shards: dict[str, list[str]] = {}

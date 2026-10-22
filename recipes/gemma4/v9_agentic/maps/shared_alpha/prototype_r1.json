@@ -1,0 +1,39 @@
+{
+  "name": "v9-agentic per-layer shared alpha, prototype round 1",
+  "created": "2026-10-22",
+  "base": "A-noshared bf16 (map A 24c7b6cb, no upweight) = google/v9_agentic_ab/gemma-4-A4B-20B-v9-agentic-A-noshared",
+  "tensor": "model.language_model.layers.{L}.mlp.down_proj.weight (shared dense FFN output projection, bf16)",
+  "rule": "alpha on the listed layers, 1.0 (untouched) on every other layer",
+  "alpha": 1.2,
+  "endpoints_already_built": {
+    "a_noshared": {"layers": [], "verdict_2026_10_21": "loops less; cannot solve manic_miner, weak coding, long thinking"},
+    "a_shared105": {"layers": "all", "alpha": 1.05},
+    "a_shared110": {"layers": "all", "alpha": 1.1},
+    "a_ref": {"layers": "all", "alpha": 1.2, "verdict_2026_10_21": "solves manic_miner in 5-10 min, shorter thinking, loops more"}
+  },
+  "architecture": {
+    "num_layers": 30,
+    "global_attention_layers": [5, 11, 17, 23, 29],
+    "global": "head_dim 512, 2 KV heads, attention_k_eq_v",
+    "sliding": "window 1024, head_dim 256, 8 KV heads",
+    "num_kv_shared_layers": 0
+  },
+  "arms": {
+    "sa_early":   {"layers": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+                   "why": "map A drops 12-13.5% of code output energy in L0-1 (mean 1.8%); loop-excess routing (v8 trace) sits in L0-8"},
+    "sa_mid":     {"layers": [10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+                   "why": "generic output energy dropped most in L7-15 (L15 28%)"},
+    "sa_late":    {"layers": [20, 21, 22, 23, 24, 25, 26, 27, 28, 29],
+                   "why": "near the head; loop-excess ~0 in L26-29; tests whether alpha's effect on thinking length is an output-side effect"},
+    "sa_sliding": {"layers": [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 24, 25, 26, 27, 28],
+                   "why": "skip the 5 global (long-context KV) layers: the loop is a long-context phenomenon"},
+    "sa_noio":    {"layers": [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27],
+                   "why": "skip input (L0-1) and output (L28-29) layers"}
+  },
+  "evidence": {
+    "dropped_energy": "competence/expert_neuron_v9_agentic_code.slim.json x maps/candidates/A_lift120_plus_fk12.json: per-layer share of rnsq / wsum on the 30 dropped experts, code vs generic classes",
+    "loop_excess": "traces/expert_neuron_v8_agentic_diff.json: 48 stored candidates of 899, v8 map, 128e, 8 loop / 46 clean seqs -> orientation only"
+  },
+  "readout": "per arm vs a_noshared and a_ref: Cerebriline manic_miner (owner), loop gate, coding score, thinking length",
+  "round_2": "bisect the third(s) that carry the coding gain; if the gain is early and the loops late (or the reverse), ship the split"
+}

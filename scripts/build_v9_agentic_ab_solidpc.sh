@@ -18,17 +18,22 @@
 # Knobs (defaults reproduce the 2026-10-13 A/B builds exactly):
 #   CANDS="A B"        which candidates
 #   SHARED_ALPHA=1.2   router_shared_upweight alpha on mlp.down_proj.weight; "none" skips the upweight
+#   SHARED_LAYERS=""   only these layers get the upweight (router_shared_upweight --layers, e.g. 0-9); "" = all 30
 #   SUFFIX=""          appended to the build name, e.g. SUFFIX=-noshared -> gemma-4-A4B-20B-v9-agentic-A-noshared
 #   BF16_ONLY=0        1 = stop after the bf16 (the v10 quant path, v10_recipe/run_v10_quant_solidpc.sh, takes it from there)
 # e.g. the A-without-shared-upweight looping test (owner 2026-10-21):
 #   CANDS=A SHARED_ALPHA=none SUFFIX=-noshared bash build_v9_agentic_ab_solidpc.sh
 # and the intermediate alphas (owner 2026-10-21: 1.2 loops, none cannot converge):
 #   CANDS=A SHARED_ALPHA=1.05 SUFFIX=-shared105 BF16_ONLY=1 bash build_v9_agentic_ab_solidpc.sh
+# and per-layer alpha (owner 2026-10-22, maps/shared_alpha/prototype_r1.json in recipes/gemma4/v9_agentic):
+#   CANDS=A SHARED_LAYERS=0-9 SUFFIX=-sa_early BF16_ONLY=1 bash build_v9_agentic_ab_solidpc.sh
 set -uo pipefail
 SHARED_ALPHA=${SHARED_ALPHA:-1.2}
+SHARED_LAYERS=${SHARED_LAYERS:-}
 SUFFIX=${SUFFIX:-}
 BF16_ONLY=${BF16_ONLY:-0}
 [ "$SHARED_ALPHA" = none ] || [ -n "$SUFFIX" ] || [ "$SHARED_ALPHA" = 1.2 ] || { echo "a non-default SHARED_ALPHA needs a SUFFIX"; exit 1; }
+[ -z "$SHARED_LAYERS" ] || [ -n "$SUFFIX" ] || { echo "SHARED_LAYERS needs a SUFFIX"; exit 1; }
 PY=/root/anaconda3/envs/omnimergekit/bin/python
 OMK=/shared/dev/omnimergekit
 BM=/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models
@@ -60,10 +65,10 @@ PYEOF
     rm -rf "$BF"
     CUDA_VISIBLE_DEVICES="" "$PY" $OMK/scripts/expert_drop.py --source-dir "$SRC" --drop-map "$MAP" --output-dir "$BF" > $W/expert_drop_$C$SUFFIX.log 2>&1 || die "expert_drop $C"
     if [ "$SHARED_ALPHA" != none ]; then
-      CUDA_VISIBLE_DEVICES="" "$PY" $OMK/recipes/gemma4/v5_moe_sweep/router_shared_upweight.py --model-dir "$BF" --alpha "$SHARED_ALPHA" --target mlp.down_proj.weight > $W/upweight_$C$SUFFIX.log 2>&1 || die "upweight $C"
+      CUDA_VISIBLE_DEVICES="" "$PY" $OMK/recipes/gemma4/v5_moe_sweep/router_shared_upweight.py --model-dir "$BF" --alpha "$SHARED_ALPHA" --target mlp.down_proj.weight ${SHARED_LAYERS:+--layers "$SHARED_LAYERS"} > $W/upweight_$C$SUFFIX.log 2>&1 || die "upweight $C"
       rm -f "$BF"/*.pre_shared_upweight
     fi
-    printf '{"candidate": "%s", "shared_alpha": "%s", "target": "mlp.down_proj.weight"}\n' "$C" "$SHARED_ALPHA" > "$BF/shared_upweight.json"
+    printf '{"candidate": "%s", "shared_alpha": "%s", "target": "mlp.down_proj.weight", "layers": "%s"}\n' "$C" "$SHARED_ALPHA" "${SHARED_LAYERS:-all}" > "$BF/shared_upweight.json"
     touch "$MARK"
   fi
   echo "  shared upweight: $(cat "$BF/shared_upweight.json" 2>/dev/null || echo 'alpha 1.2 (2026-10-13 build)')"
