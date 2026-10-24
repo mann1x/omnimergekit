@@ -62,6 +62,15 @@ PRESSURE="${OMK_TB_PRESSURE:-0.25}"
 # tool-eval-bench removes those from the DENOMINATOR rather than scoring them
 # 0 — so a timing-out cell is graded on fewer points and is not comparable.
 TIMEOUT="${OMK_TB_TIMEOUT:-600}"
+# Sampler. Default = the greedy basis above. A model whose ONLY supported sampler is not
+# greedy (eval/models/<family>.yaml, e.g. jackod: temp .7 / seed 42) overrides BOTH halves:
+#   OMK_TB_SAMPLER       client flags for tool-eval-bench (temperature/top-p/top-k)
+#   OMK_TB_SERVER_EXTRA  llama-server launch flags for knobs the client does not send
+#                        (--repeat-penalty/--repeat-last-n/--presence-penalty/--seed)
+# A non-greedy cell is a DIFFERENT cohort from every greedy cell; the sampler is echoed below
+# and written to <ARM>_sampler.txt so the two can never be pooled silently.
+TB_SAMPLER="${OMK_TB_SAMPLER:---temperature 0.0 --top-p 1.0 --top-k 0}"
+TB_SERVER_EXTRA="${OMK_TB_SERVER_EXTRA:-}"
 
 command -v tool-eval-bench >/dev/null || { echo "FAIL: tool-eval-bench not on PATH"; exit 1; }
 [ -f "$GGUF" ] || { echo "FAIL: no such GGUF: $GGUF"; exit 1; }
@@ -71,6 +80,8 @@ PY=$(head -1 "$(command -v tool-eval-bench)" | sed 's|^#!||')
 VER=$("$PY" -c 'import importlib.metadata as m; print(m.version("tool-eval-bench"))' 2>/dev/null)
 echo ">>> harness tool-eval-bench $VER   (resolved via the CLI interpreter)"
 echo ">>> arm=$ARM gguf=$(basename "$GGUF") ctx=$CTX pressure=$PRESSURE timeout=${TIMEOUT}s seeds=${SEEDS[*]}"
+echo ">>> sampler client: $TB_SAMPLER | server extra: ${TB_SERVER_EXTRA:-<none>}"
+printf 'client: %s\nserver_extra: %s\nseeds: %s\n' "$TB_SAMPLER" "${TB_SERVER_EXTRA:-}" "${SEEDS[*]}" > "$OUT/${ARM}_sampler.txt"
 
 if [ "${#SEEDS[@]}" -lt 5 ]; then
     echo ">>> PARTIAL BASIS: ${#SEEDS[@]}/5 seeds (${SEEDS[*]}) -- canonical cell is the mean over 42..46."
@@ -80,7 +91,7 @@ fi
 
 echo ">>> starting llama-server on :$PORT"
 "$LLAMA_BIN/llama-server" -m "$GGUF" --port "$PORT" -c "$CTX" -ngl 99 \
-    --jinja --parallel 1 --no-warmup \
+    --jinja --parallel 1 --no-warmup $TB_SERVER_EXTRA \
     > "$OUT/${ARM}_server.log" 2>&1 &
 SRV=$!
 # A sleep is not a readiness predicate — poll the endpoint, and give up loudly.
@@ -103,7 +114,7 @@ for S in "${SEEDS[@]}"; do
         --base-url "http://localhost:$PORT/v1" \
         --hardmode --weight-by-difficulty \
         --context-size "$CTX" --context-pressure "$PRESSURE" \
-        --temperature 0.0 --top-p 1.0 --top-k 0 \
+        $TB_SAMPLER \
         --variant-seed "$S" --seed "$S" \
         --timeout "$TIMEOUT" \
         --json-file "$J" --no-live

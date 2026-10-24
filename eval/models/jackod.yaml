@@ -1,0 +1,33 @@
+# JackOD-9B-Coder (Qwen3.5-9B hybrid merges: v1, v2/JackODF, F15O30 = v3) — the model's OWN sampler.
+#
+# Owner 2026-10-24: this is the ONLY supported sampler for JackOD; it goes into the HF
+# generation_config.json, the ollama Modelfiles and every eval of this family:
+#   temperature 0.7 / top_k 20 / top_p 0.95 / repeat_penalty 1.002 / repeat_last_n 96 /
+#   presence_penalty 0.0375 / seed 42.
+# Seed 42 is part of the sampler, not an eval convenience: the owner observed (and confirmed
+# on an ollama Qwen3.5-9B model) that other seeds loop. Temperature is held at 0.7 because the
+# model is loop-prone above and below it. Toolbench therefore runs ONE pass at seed 42
+# (other seeds are "not supported"), not the 42..46 greedy basis of the earlier cohort.
+#
+# require_profile: a JackOD eval without --sampler-profile is refused, so no greedy row can
+# be produced by accident and pooled with this cohort. The earlier greedy JackOD cells
+# (v1 / v2 cohorts, template_default) are a DIFFERENT cohort — never tabulate them together.
+family: jackod-9b
+require_profile: true
+match:
+  - "*jackod*"
+  - "*JackOD*"
+samplers:
+  owner_s42:
+    temperature: 0.7
+    top_p: 0.95
+    top_k: 20
+    min_p: 0.0
+    repeat_penalty: 1.002
+    repeat_last_n: 96
+    presence_penalty: 0.0375
+    seed: 42
+    do_sample: true
+bench_policy:
+  default: owner_s42
+protocol_overrides: {}

@@ -916,6 +916,10 @@ def dispatch_lm_eval(template: dict, model_tag: str, base_url: str,
         f"max_length={max_length}",
         f"max_gen_toks={g.get('max_gen_toks', 2048)}",
     ])
+    # lm-eval puts `seed` (default 1234) in every request body, overriding any server
+    # default, so a profile seed must go through model_args. Absent -> byte-identical args.
+    if g.get("seed") is not None:
+        model_args += f",seed={int(g['seed'])}"
     # Build --gen_kwargs from the template's generation block plus any
     # extras (e.g. thinking_token_budget). Scalar values pass straight
     # through simple_parse_args_string; dict values do not, so any
@@ -1065,7 +1069,8 @@ def dispatch_lcb(template: dict, model_tag: str, base_url: str,
                             ("--top-k", "top_k"), ("--min-p", "min_p"),
                             ("--repeat-penalty", "repeat_penalty"),
                             ("--repeat-last-n", "repeat_last_n"),
-                            ("--presence-penalty", "presence_penalty")):
+                            ("--presence-penalty", "presence_penalty"),
+                            ("--seed", "seed")):
             if g.get(_key) is not None:
                 cmd += [_flag, str(g[_key])]
     log(f"lcb shim: {' '.join(shlex.quote(c) for c in cmd)}")
@@ -2674,13 +2679,13 @@ def main() -> None:
     }
     # Grep-able, always-emitted record of the EFFECTIVE sampler (in every logfile).
     log(">>> OMK_SAMPLER template={} name={} source={} profile={} "
-        "temp={} top_p={} top_k={} min_p={} rep={} rep_last_n={} presence={} do_sample={}".format(
+        "temp={} top_p={} top_k={} min_p={} rep={} rep_last_n={} presence={} seed={} do_sample={}".format(
             template["name"], _samp_name or "template_default", _samp_src,
             template["_sampler_meta"]["profile"],
             _gen.get("temperature", 0.0), _gen.get("top_p", 1.0),
             _gen.get("top_k", 0), _gen.get("min_p", "-"),
             _gen.get("repeat_penalty", "-"), _gen.get("repeat_last_n", "-"),
-            _gen.get("presence_penalty", "-"), _gen.get("do_sample", False)))
+            _gen.get("presence_penalty", "-"), _gen.get("seed", "-"), _gen.get("do_sample", False)))
 
     # Runtime field overrides (--metadata). Applied LAST so the CLI is the most
     # authoritative layer (above template defaults and backend_overrides). Lets
@@ -2894,7 +2899,8 @@ def main() -> None:
             for _sk, _flag in (("min_p", "--min-p"),
                                ("repeat_penalty", "--repeat-penalty"),
                                ("repeat_last_n", "--repeat-last-n"),
-                               ("presence_penalty", "--presence-penalty")):
+                               ("presence_penalty", "--presence-penalty"),
+                               ("seed", "--seed")):
                 if _sk in _sgen and _flag not in llama_extra:
                     llama_extra += [_flag, str(_sgen[_sk])]
             # Env override wins (LLAMA_EXTRA="--flag1 value1 --flag2 value2").
@@ -3161,6 +3167,7 @@ def main() -> None:
                 "repeat_penalty": _sg.get("repeat_penalty"),
                 "repeat_last_n": _sg.get("repeat_last_n"),
                 "presence_penalty": _sg.get("presence_penalty"),
+                "seed": _sg.get("seed"),
                 "do_sample": _sg.get("do_sample", False),
             },
         },

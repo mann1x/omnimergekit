@@ -50,9 +50,12 @@ MODELS_DIR = Path(__file__).resolve().parent / "models"
 # per-request fields for vLLM gen_kwargs + the LCB shim). repeat_last_n and
 # presence_penalty (2026-10-13) take the same route as repeat_penalty; vLLM has
 # no repetition window, so repeat_last_n is recorded there as UNSUPPORTED
-# instead of being dropped silently.
+# instead of being dropped silently. seed (2026-10-24) is the sampling RNG seed: a
+# llama-server launch default (--seed, reaches MultiPL-E whose payload carries no seed),
+# the lm-eval model_args seed (lm-eval otherwise sends seed=1234 in EVERY request, which
+# overrides the server default) and the LCB shim payload.
 SAMPLER_KEYS = ("temperature", "top_p", "top_k", "min_p", "repeat_penalty",
-                "repeat_last_n", "presence_penalty", "do_sample")
+                "repeat_last_n", "presence_penalty", "seed", "do_sample")
 
 
 def resolve_path(ref: str) -> Path:
