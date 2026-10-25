@@ -24,7 +24,25 @@ quantize_gguf.py uploads BEFORE it checks and leaves failures in place):
   2. every created tag must answer the same three questions through xollama itself, as
      deployed (renderer, params, drafter, projector), before it is pushed.
 The second gate runs on THIS host's GPU and engine: it cannot see a fault that only shows on
-another GPU architecture or KV-cache type. The HF token is read from ~/.cache/huggingface/token and never printed.
+another GPU architecture or KV-cache type. The HF token is read from $HF_TOKEN, else
+~/.cache/huggingface/token, and never printed.
+
+OTHER MODELS (2026-10-25, JackOD-9B-Coder v3): every gemma-4 value above is a default, not a fork.
+--renderer/--parser/--requires set the tag config; --drafter-repo/--drafter-file/--drafter-rev/
+--drafter-sha pick the external drafter (a DFlash drafter is attached exactly like the gemma
+assistant: one DRAFT layer, xollama infers draft-dflash from its arch); --draft-n is its
+draft_num_predict; --mmproj none publishes no vision tags; --variants picks the tag kinds and
+--mtp-prefix their names (an empty prefix puts the drafter tags at plain <T>, for a model name
+that is itself the drafter variant, e.g. mannix/JackOD-9B-Coder-dflash). A built-in MTP head
+needs no DRAFT layer: its draft_num_predict goes in --params like any other PARAMETER.
+--sanity-log takes a comma list (the tiers can come from more than one quantize run).
+
+--no-gate publishes without either GPU gate (no verdict wait, no generation check; the
+registry read-back still runs), for a host whose GPU is busy. --sanity-round is the separate
+action that certifies what is ALREADY published: every --tiers x --variants tag is pulled from
+the registry, asked the three questions, and removed again; the failing tags are printed as
+SANITY_ROUND_FAIL lines for manual removal (ollama.com has no delete API). No HF token is
+needed for public repos.
 """
 from __future__ import annotations
 
@@ -160,6 +178,9 @@ def expected_layers(vision: bool, mtp: bool) -> dict:
     return exp
 
 
+TAG_CFG = {"renderer": "gemma4", "parser": "gemma4", "requires": None}   # set from argv in main()
+
+
 def tag_ok(info: dict | None, want_params: dict, vision: bool, mtp: bool) -> tuple[bool, str]:
     if info is None:
         return False, "absent"
@@ -176,8 +197,10 @@ def tag_ok(info: dict | None, want_params: dict, vision: bool, mtp: bool) -> tup
     extra = set(info["params"]) - set(want_params)
     if extra:
         return False, f"unexpected params {sorted(extra)}"
-    if info["config"].get("renderer") != "gemma4" or info["config"].get("parser") != "gemma4":
+    if info["config"].get("renderer") != TAG_CFG["renderer"] or info["config"].get("parser") != TAG_CFG["parser"]:
         return False, f"renderer/parser {info['config'].get('renderer')}/{info['config'].get('parser')}"
+    if TAG_CFG["requires"] and info["config"].get("requires") != TAG_CFG["requires"]:
+        return False, f"requires {info['config'].get('requires')!r}"
     return True, "ok"
 
 
@@ -189,11 +212,12 @@ def sha256(p: Path) -> str:
     return h.hexdigest()
 
 
-def hf_lfs(api_, repo: str) -> dict:
-    return {s.rfilename: s.lfs.sha256 for s in api_.model_info(repo, files_metadata=True).siblings if s.lfs}
+def hf_lfs(api_, repo: str, revision: str | None = None) -> dict:
+    info = api_.model_info(repo, revision=revision, files_metadata=True)
+    return {s.rfilename: s.lfs.sha256 for s in info.siblings or [] if s.lfs}
 
 
-def download(repo: str, fname: str, sha: str, dest: Path, token: str) -> Path:
+def download(repo: str, fname: str, sha: str, dest: Path, token: str | None, rev: str = "main") -> Path:
     out = dest / fname
     if out.exists() and sha256(out) == sha:
         return out
@@ -201,8 +225,8 @@ def download(repo: str, fname: str, sha: str, dest: Path, token: str) -> Path:
     inp = dest / ".aria_in"
     fd = os.open(inp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
-        f.write(f"https://huggingface.co/{repo}/resolve/main/{fname}\n  out={fname}\n"
-                f"  header=Authorization: Bearer {token}\n")
+        f.write(f"https://huggingface.co/{repo}/resolve/{rev}/{fname}\n  out={fname}\n"
+                + (f"  header=Authorization: Bearer {token}\n" if token else ""))
     r = subprocess.run(["aria2c", "-x", "16", "-s", "16", "-k", "64M", "-c", "--file-allocation=none",
                         "--console-log-level=warn", "--summary-interval=0", "-d", str(dest), "-i", str(inp)],
                        capture_output=True, text=True)
@@ -221,7 +245,9 @@ def modelfile(gguf: Path, mmproj: Path | None, drafter: Path | None, params: dic
         lines.append(f"FROM {mmproj}")
     if drafter:
         lines.append(f"DRAFT {drafter}")
-    lines += ["RENDERER gemma4", "PARSER gemma4"]
+    lines += [f"RENDERER {TAG_CFG['renderer']}", f"PARSER {TAG_CFG['parser']}"]
+    if TAG_CFG["requires"]:
+        lines.append(f"REQUIRES {TAG_CFG['requires']}")
     for k, v in params.items():
         if isinstance(v, str) and k == "think_budget_message":
             assert '"' not in v, "message must not contain a double quote"
@@ -234,13 +260,13 @@ def modelfile(gguf: Path, mmproj: Path | None, drafter: Path | None, params: dic
 def local_check(ref: str, want: dict, vision: bool, mtp: bool) -> None:
     show = api("/api/show", {"model": ref})
     mf = show.get("modelfile", "")
-    if "RENDERER gemma4" not in mf or "PARSER gemma4" not in mf:
+    if f"RENDERER {TAG_CFG['renderer']}" not in mf or f"PARSER {TAG_CFG['parser']}" not in mf:
         raise RuntimeError(f"{ref}: renderer/parser missing in the created model")
     # /api/show has no top-level think_budget: it is a line of the `parameters` text,
     # e.g. `think_budget                   "medium"`.
     tb = next((ln.split(None, 1)[1].strip().strip('"') for ln in show.get("parameters", "").splitlines()
                if ln.split(None, 1)[:1] == ["think_budget"]), None)
-    if tb != want["think_budget"]:
+    if "think_budget" in want and tb != want["think_budget"]:
         raise RuntimeError(f"{ref}: think_budget {tb!r}")
     if want.get("think_budget_message") and want["think_budget_message"] not in show.get("parameters", "") \
             and json.dumps(want["think_budget_message"])[1:-1] not in show.get("parameters", ""):
@@ -251,18 +277,23 @@ def local_check(ref: str, want: dict, vision: bool, mtp: bool) -> None:
         raise RuntimeError(f"{ref}: no vision capability ({show.get('capabilities')})")
 
 
-def sanity_verdict(log_path: Path, tier: str) -> str | None:
-    """quantize_gguf's verdict for one tier: 'PASS', 'FAIL', or None while it is not written yet."""
-    if not log_path.exists():
-        return None
+def sanity_verdict(log_paths: list[Path], tier: str) -> str | None:
+    """quantize_gguf's verdict for one tier: 'PASS', 'FAIL', or None while it is not written yet.
+    Several logs (several quantize runs) may be given; any FAIL wins over a PASS."""
     pat = re.compile(rf"^\s+{re.escape(tier)}: sanity (PASS|FAIL) \(")
-    verdict = None
-    with open(log_path, errors="replace") as f:
-        for line in f:
-            m = pat.match(line)
-            if m:
-                verdict = m.group(1)    # the last verdict wins (a resumed run re-checks)
-    return verdict
+    verdicts = []
+    for log_path in log_paths:
+        if not log_path.exists():
+            continue
+        verdict = None
+        with open(log_path, errors="replace") as f:
+            for line in f:
+                m = pat.match(line)
+                if m:
+                    verdict = m.group(1)    # the last verdict wins (a resumed run re-checks)
+        if verdict:
+            verdicts.append(verdict)
+    return "FAIL" if "FAIL" in verdicts else ("PASS" if verdicts else None)
 
 
 def generation_check(ref: str) -> None:
@@ -284,21 +315,61 @@ def generation_check(ref: str) -> None:
     log(f"  {ref} generation check {passed}/3: {'; '.join(seen)}")
 
 
+def sanity_round(ns_name: str, tags: list[str], report: Path) -> int:
+    """--sanity-round: certify tags that are ALREADY on the registry, as a user gets them.
+    Each tag is pulled from ollama.com (authenticated, so a private model works too), asked the
+    three questions of generation_check through xollama, then removed from the local store so
+    one tag's blobs are resident at a time. Nothing is pushed or deleted on the registry:
+    ollama.com has no delete API, so the failing tags are listed for the owner to remove by hand.
+    Sentinel: SANITY_ROUND_DONE pass=<n> fail=<n>, then one SANITY_ROUND_FAIL line per failing tag."""
+    failed = []
+    for tag in tags:
+        ref = f"{ns_name}:{tag}"
+        xo("rm", ref, check=False)    # the read-back must be the registry's, not a stale local copy
+        try:
+            if registry_readback(ns_name, tag) is None:
+                raise RuntimeError("pull failed (tag absent or key not registered)")
+            generation_check(ref)
+            verdict = "PASS"
+        except Exception as e:  # noqa: BLE001 — a failing tag is the finding, not a crash
+            log(f"  {ref} SANITY FAIL: {e}")
+            verdict, _ = "FAIL", failed.append(tag)
+        with open(report, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\t{ref}\tsanity_{verdict}\n")
+        xo("rm", ref, check=False)
+    log(f"###### SANITY_ROUND_DONE pass={len(tags) - len(failed)} fail={len(failed)} ######")
+    for tag in failed:
+        print(f"SANITY_ROUND_FAIL {ns_name}:{tag}", flush=True)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--hf-repo", default="ManniX-ITA/gemma-4-20B-v9-agentic-GGUF")
     ap.add_argument("--ollama", default="mannix/gemma-4-20B-v9-agentic")
     ap.add_argument("--stem", default="gemma-4-20B-v9-agentic")
     ap.add_argument("--tiers", required=True, help="comma list, in publish order")
-    ap.add_argument("--params", required=True, help="JSON of PARAMETER values (no num_ctx)")
-    ap.add_argument("--mmproj", required=True)
+    ap.add_argument("--params", help="JSON of PARAMETER values (no num_ctx); required to publish")
+    ap.add_argument("--mmproj", help="vision projector, or 'none' for a text-only model; required to publish")
+    ap.add_argument("--renderer", default="gemma4")
+    ap.add_argument("--parser", default="gemma4")
+    ap.add_argument("--requires", default=None, help="Modelfile REQUIRES (minimum ollama version)")
+    ap.add_argument("--drafter-repo", default=DRAFTER_REPO)
+    ap.add_argument("--drafter-file", default=DRAFTER_FILE)
+    ap.add_argument("--drafter-rev", default="main", help="HF revision of the drafter (pin it)")
+    ap.add_argument("--drafter-sha", default=None, help="expected sha256 of the drafter GGUF")
+    ap.add_argument("--draft-n", type=int, default=DRAFT_N, help="draft_num_predict of the drafter tags")
+    ap.add_argument("--variants", default="text,vision,mtp,mtp-vision",
+                    help="tag kinds per tier, comma list of text|vision|mtp|mtp-vision; "
+                         ":latest is the first kind at --latest")
+    ap.add_argument("--mtp-prefix", default="mtp-", help="name prefix of the drafter tags ('' = plain <T>)")
     ap.add_argument("--scratch", default="/workspace/ollama_scratch")
     ap.add_argument("--keep", default="Q6_K", help="tiers whose GGUF is kept after publishing (for evals)")
     ap.add_argument("--keep-dir", default="/workspace/eval_gguf")
     ap.add_argument("--latest", default="Q4_K_M")
     ap.add_argument("--poll", type=int, default=120)
     ap.add_argument("--sanity-log", default="/workspace/logs/quants.out",
-                    help="quantize_gguf.py output; a tier is published only after its 'sanity PASS'")
+                    help="quantize_gguf.py output(s), comma list; a tier is published only after its 'sanity PASS'")
     ap.add_argument("--report", default="/workspace/logs/xollama_publish.tsv")
     # REPLACE mode (2026-10-16, v9-agentic re-published from the v9-ml ml_k8 build): the HF repo and
     # the registry already hold the PREVIOUS build under the same file and tag names, so neither
@@ -309,25 +380,51 @@ def main() -> int:
     # restart resumes); and the registry's model-layer digest after the push must equal the one
     # `create` produced locally (ollama re-serialises a GGUF, so the HF sha cannot be compared).
     ap.add_argument("--gguf-dir", default=None, help="REPLACE mode: quantize_gguf output dir (sidecars)")
+    ap.add_argument("--no-gate", action="store_true",
+                    help="publish WITHOUT the GPU gates (sanity-log verdict wait + generation check); "
+                         "run --sanity-round on the published tags afterwards")
+    ap.add_argument("--sanity-round", action="store_true",
+                    help="separate action: pull every --tiers x --variants tag from the registry and run the "
+                         "generation check on it; publishes nothing")
     args = ap.parse_args()
 
+    tiers = [t for t in args.tiers.split(",") if t]
+    kinds = [k for k in args.variants.split(",") if k]
+    bad_kinds = set(kinds) - {"text", "vision", "mtp", "mtp-vision"}
+    assert kinds and not bad_kinds, f"--variants: unknown kinds {sorted(bad_kinds)}"
+    if args.sanity_round:
+        pfx = args.mtp_prefix
+        names = {"text": "{t}", "vision": "vision-{t}", "mtp": pfx + "{t}", "mtp-vision": pfx + "vision-{t}"}
+        return sanity_round(args.ollama, [names[k].format(t=t) for t in tiers for k in kinds], Path(args.report))
+    assert args.params and args.mmproj, "publishing needs --params and --mmproj"
+
     from huggingface_hub import HfApi
-    token = Path.home().joinpath(".cache/huggingface/token").read_text().strip()
-    assert token, "HF token file is empty"
+    tok_file = Path.home().joinpath(".cache/huggingface/token")
+    token = os.environ.get("HF_TOKEN") or (tok_file.read_text().strip() if tok_file.exists() else None)
+    if not token:
+        log("no HF token: anonymous Hub access (public repos only)")
     hf = HfApi(token=token)
+    TAG_CFG.update(renderer=args.renderer, parser=args.parser, requires=args.requires)
     base_params = json.load(open(args.params))
     assert "num_ctx" not in base_params
-    tiers = [t for t in args.tiers.split(",") if t]
     keep = set(args.keep.split(","))
     scratch = Path(args.scratch)
-    mmproj = Path(args.mmproj)
-    while not mmproj.exists():
+    mmproj = None if args.mmproj == "none" else Path(args.mmproj)
+    assert mmproj or not {"vision", "mtp-vision"} & set(kinds), "--mmproj none with a vision variant"
+    while mmproj and not mmproj.exists():
         log(f"waiting for {mmproj}")
         time.sleep(args.poll)
+    sanity_logs = [Path(p) for p in args.sanity_log.split(",") if p]
 
-    dl = hf_lfs(hf, DRAFTER_REPO)
-    drafter = download(DRAFTER_REPO, DRAFTER_FILE, dl[DRAFTER_FILE], scratch / "drafter", token)
-    log(f"drafter {drafter.name} sha {dl[DRAFTER_FILE][:16]}")
+    drafter = None
+    if {"mtp", "mtp-vision"} & set(kinds):
+        dl = hf_lfs(hf, args.drafter_repo, args.drafter_rev)
+        if args.drafter_sha and dl[args.drafter_file] != args.drafter_sha:
+            raise RuntimeError(f"drafter {args.drafter_file} @ {args.drafter_rev}: LFS sha "
+                               f"{dl[args.drafter_file][:16]} != --drafter-sha {args.drafter_sha[:16]}")
+        drafter = download(args.drafter_repo, args.drafter_file, dl[args.drafter_file], scratch / "drafter",
+                           token, rev=args.drafter_rev)
+        log(f"drafter {drafter.name} sha {dl[args.drafter_file][:16]} ({args.drafter_repo}@{args.drafter_rev})")
 
     report = Path(args.report)
     replace = args.gguf_dir is not None
@@ -351,7 +448,8 @@ def main() -> int:
             else:
                 log(f"{t}: waiting for {fname} on {args.hf_repo}")
             time.sleep(args.poll)
-        while (verdict := sanity_verdict(Path(args.sanity_log), t)) is None:
+        verdict = "PASS" if args.no_gate else None
+        while verdict is None and (verdict := sanity_verdict(sanity_logs, t)) is None:
             log(f"{t}: waiting for its sanity verdict in {args.sanity_log}")
             time.sleep(args.poll)
         if verdict != "PASS":
@@ -359,15 +457,17 @@ def main() -> int:
             with open(report, "a") as f:
                 f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\t{args.ollama}:{t}\t-\tskipped_sanity_{verdict}\n")
             continue
-        variants = [(t, False, False), (f"vision-{t}", True, False),
-                    (f"mtp-{t}", False, True), (f"mtp-vision-{t}", True, True)]
+        pfx = args.mtp_prefix
+        kind_tag = {"text": (t, False, False), "vision": (f"vision-{t}", True, False),
+                    "mtp": (f"{pfx}{t}", False, True), "mtp-vision": (f"{pfx}vision-{t}", True, True)}
+        variants = [kind_tag[k] for k in kinds]
         if t == args.latest:
-            variants.append(("latest", False, False))
+            variants.append(("latest", *kind_tag[kinds[0]][1:]))
         want = {}
         for tag, vis, mtp in variants:
             p = dict(base_params)
             if mtp:
-                p["draft_num_predict"] = DRAFT_N
+                p["draft_num_predict"] = args.draft_n
             want[tag] = (p, vis, mtp)
         if replace:
             todo = [tag for tag in want if (f"{args.ollama}:{tag}", lfs[fname]) not in done_ok]
@@ -390,7 +490,8 @@ def main() -> int:
                     xo("create", ref, "-f", str(mf))
                     local_check(ref, p, vis, mtp)
                     made = model_digest(args.ollama, tag)
-                    generation_check(ref)
+                    if not args.no_gate:
+                        generation_check(ref)
                     xo("push", ref)
                     info = registry_readback(args.ollama, tag)
                     ok, why = tag_ok(info, p, vis, mtp)
