@@ -23,6 +23,9 @@ tokenizers==0.22.2
 safetensors==0.7.0
 accelerate==1.13.0
 datasets==4.3.0
+# pyarrow >= 25 requires numpy >= 2: unpinned, a fresh resolve (bs2, 2026-10-25) pulled 26.0.0 and
+# `import datasets` failed against numpy 1.26.4 above. 24.0.0 is what the solidpc env runs.
+pyarrow==24.0.0
 huggingface_hub>=0.27.0       # the new `hf download/upload/auth login` CLI; old `huggingface-cli` is deprecated
 hf-transfer>=0.1.8            # large-file accel uploads
 
