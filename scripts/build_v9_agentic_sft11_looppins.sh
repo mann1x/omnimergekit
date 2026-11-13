@@ -26,10 +26,16 @@ LOOPER=$O/looper_Apre_a12
 export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$GPU PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ts() { date -u +%H:%M:%SZ; }
 fail() { echo "V9A_LP_FAIL $*"; exit 1; }
-for f in Apre.json loop_diff.json loop_pins.txt A_sft11.json; do
+# Resumable, never overwriting: a step whose output exists AND passed (its V9A_LP_OK is in the log the waiter keeps,
+# or its own marker) is skipped; later outputs must not exist yet.
+for f in loop_diff.json loop_pins.txt A_sft11.json; do
   [ -e "$O/$f" ] && fail "$O/$f exists — refusing to overwrite"
 done
-[ -e "$LOOPER" ] && fail "$LOOPER exists — refusing to overwrite"
+DONE_PREPIN=0; DONE_LOOPER=0
+[ -s "$O/Apre.json" ] && DONE_PREPIN=1
+[ -f "$LOOPER/.shared_applied" ] && [ -f "$LOOPER/chat_template.jinja" ] && DONE_LOOPER=1
+[ "$DONE_PREPIN" = 0 ] && [ -e "$LOOPER" ] && fail "$LOOPER exists without Apre.json — refusing to guess"
+[ "$DONE_LOOPER" = 0 ] && [ -e "$LOOPER" ] && fail "$LOOPER exists but is incomplete — move it aside first"
 for f in "$O/competence_code.json" "$O/eog_t106_lift_pins.txt" "$I/expert_neuron_base_v7.slim.json" \
          "$I/expert_neuron_v9_agentic_code.slim.json" "$I/A_lift120_plus_fk12.json" "$I/eog_v4_t106_lift_pins.txt" \
          "$I/chat_template.jinja" "$I/router_diff_agentic.py" "$I/v9ml_same_map.py"; do
@@ -61,11 +67,18 @@ echo "V9A_LP_OK control $(ts)"
 
 echo "########## 1 pre-pin map $(ts) ##########"
 LIFT=$(tr '\n' ',' < "$O/eog_t106_lift_pins.txt" | sed 's/,*$//')
-gen "$O/competence_code.json" "$LIFT" "$O/Apre.json" || fail "pre-pin generator rc=$?"
+if [ "$DONE_PREPIN" = 1 ]; then
+  echo "Apre.json exists ($(sha256sum "$O/Apre.json" | cut -c1-16)) — kept"
+else
+  gen "$O/competence_code.json" "$LIFT" "$O/Apre.json" || fail "pre-pin generator rc=$?"
+fi
 tail -3 "$O/Apre.json.log"
 echo "V9A_LP_OK prepin $(ts)"
 
 echo "########## 2 looper $(ts) ##########"
+if [ "$DONE_LOOPER" = 1 ]; then
+  echo "$LOOPER exists with .shared_applied + template — kept"
+else
 free=$(df --output=avail -BG /mnt/sdc | tail -1 | tr -dc '0-9')
 [ "${free:-0}" -lt 120 ] && fail "/mnt/sdc ${free}G free < 120G"
 "$PY" scripts/expert_drop.py --source-dir "$MODEL" --drop-map "$O/Apre.json" --output-dir "$LOOPER" \
@@ -74,6 +87,7 @@ free=$(df --output=avail -BG /mnt/sdc | tail -1 | tr -dc '0-9')
   --alpha 1.2 --target mlp.down_proj.weight || fail "shared_upweight rc=$?"
 touch "$LOOPER/.shared_applied"
 cp "$I/chat_template.jinja" "$LOOPER/chat_template.jinja"
+fi
 "$PY" - "$LOOPER" <<'PY' || fail "looper config check"
 import json, sys
 c = json.load(open(sys.argv[1] + "/config.json")); t = c.get("text_config", c)

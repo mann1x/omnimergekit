@@ -64,6 +64,28 @@ def log(m):
     print("[adiff %s] %s" % (time.strftime("%H:%M:%S"), m), flush=True)
 
 
+def mapping_tool_args(msgs):
+    """Copy of ``msgs`` with OpenAI-style string ``tool_calls[].function.arguments`` parsed to mappings.
+
+    The fixtures store arguments as JSON strings (OpenAI wire format). Gemma-4's official template (ae53464b)
+    refuses strings and asks for the deserialised object, as vLLM / ollama pass it; the refA diff (2026-06-21)
+    rendered through an older modified template that took strings. Unparseable strings are left as they are.
+    """
+    out = []
+    for m in msgs:
+        if m.get("tool_calls"):
+            m = {**m, "tool_calls": [dict(tc) for tc in m["tool_calls"]]}
+            for tc in m["tool_calls"]:
+                fn = tc.get("function")
+                if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+                    try:
+                        tc["function"] = {**fn, "arguments": json.loads(fn["arguments"])}
+                    except ValueError:
+                        pass
+        out.append(m)
+    return out
+
+
 class PresencePenalty(LogitsProcessor):
     """Subtract `penalty` once from every token id already generated (positions >= plen)."""
 
@@ -149,7 +171,7 @@ def main():
         looper.generation_config.prefill_chunk_size = CHUNK
         seqs = []
         for nm, fx in fixtures:
-            msgs = fx["messages"]
+            msgs = mapping_tool_args(fx["messages"])
             tools = fx.get("tools")
             try:
                 chat = tok.apply_chat_template(msgs, tools=tools, add_generation_prompt=True,
