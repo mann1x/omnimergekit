@@ -350,6 +350,9 @@ def main() -> int:
     ap.add_argument("--stem", default="gemma-4-20B-v9-agentic")
     ap.add_argument("--tiers", required=True, help="comma list, in publish order")
     ap.add_argument("--params", help="JSON of PARAMETER values (no num_ctx); required to publish")
+    ap.add_argument("--mtp-params", default=None,
+                    help="JSON file of PARAMETER values merged over --params for the drafter (mtp*) tags only, "
+                         "e.g. an xOllama think_budget the plain tags (stock-ollama targets) do not carry")
     ap.add_argument("--mmproj", help="vision projector, or 'none' for a text-only model; required to publish")
     ap.add_argument("--renderer", default="gemma4")
     ap.add_argument("--parser", default="gemma4")
@@ -407,6 +410,9 @@ def main() -> int:
     TAG_CFG.update(renderer=args.renderer, parser=args.parser, requires=args.requires)
     base_params = json.load(open(args.params))
     assert "num_ctx" not in base_params
+    mtp_params = json.load(open(args.mtp_params)) if args.mtp_params else {}
+    assert "num_ctx" not in mtp_params and "draft_num_predict" not in mtp_params, \
+        "--mtp-params: no num_ctx; draft_num_predict comes from --draft-n"
     keep = set(args.keep.split(","))
     scratch = Path(args.scratch)
     mmproj = None if args.mmproj == "none" else Path(args.mmproj)
@@ -467,6 +473,7 @@ def main() -> int:
         for tag, vis, mtp in variants:
             p = dict(base_params)
             if mtp:
+                p.update(mtp_params)
                 p["draft_num_predict"] = args.draft_n
             want[tag] = (p, vis, mtp)
         if replace:
