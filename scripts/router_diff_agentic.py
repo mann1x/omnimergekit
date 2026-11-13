@@ -53,7 +53,7 @@ import time
 
 import numpy as np
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache, LogitsProcessor, LogitsProcessorList
 import sys
 
 sys.path.insert(0, "/srv/ml/repos/omnimergekit/scripts")
@@ -62,6 +62,20 @@ from audit_full_bench import detect_loop  # noqa: E402
 
 def log(m):
     print("[adiff %s] %s" % (time.strftime("%H:%M:%S"), m), flush=True)
+
+
+class PresencePenalty(LogitsProcessor):
+    """Subtract `penalty` once from every token id already generated (positions >= plen)."""
+
+    def __init__(self, penalty, plen):
+        self.penalty, self.plen = float(penalty), int(plen)
+
+    def __call__(self, input_ids, scores):
+        gen = input_ids[:, self.plen:]
+        if gen.shape[1] == 0:
+            return scores
+        seen = torch.zeros_like(scores, dtype=torch.bool).scatter_(1, gen, True)
+        return scores - self.penalty * seen.to(scores.dtype)
 
 
 def main():
@@ -93,6 +107,9 @@ def main():
     ap.add_argument("--top-k", type=int, default=64)
     ap.add_argument("--min-p", type=float, default=0.05)
     ap.add_argument("--rep", type=float, default=1.1)
+    ap.add_argument("--presence", type=float, default=0.0,
+                    help="additive presence penalty over the generated tokens (vLLM semantics, applied "
+                         "before temperature); 0 = off, generation identical to the refA diff")
     ap.add_argument("--out", default="/mnt/sdc/ml/google/expert_neuron_v8_agentic_diff.json")
     args = ap.parse_args()
 
@@ -122,8 +139,9 @@ def main():
         tok = AutoTokenizer.from_pretrained(args.looper, trust_remote_code=True)
         if tok.pad_token_id is None:
             tok.pad_token = tok.eos_token
-        log("PHASE 1: load looper -> cuda:0 (eager, chunked prefill=%d, sampled vendor_minp "
-            "t=%.2f minp=%.2f rep=%.2f)" % (CHUNK, args.temp, args.min_p, args.rep))
+        log("PHASE 1: load looper -> cuda:0 (eager, chunked prefill=%d, sampled "
+            "t=%.2f top_p=%.2f top_k=%d minp=%.2f rep=%.2f presence=%.3f)"
+            % (CHUNK, args.temp, args.top_p, args.top_k, args.min_p, args.rep, args.presence))
         looper = AutoModelForCausalLM.from_pretrained(
             args.looper, dtype=torch.bfloat16, trust_remote_code=True,
             low_cpu_mem_usage=True, attn_implementation="eager", device_map={"": 0}).eval()
@@ -141,14 +159,17 @@ def main():
                 chat = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
             enc = tok(chat, return_tensors="pt", add_special_tokens=False).to("cuda:0")
             plen = enc["input_ids"].shape[1]  # FULL untruncated prompt
+            extra = {}
+            if args.presence:
+                extra["logits_processor"] = LogitsProcessorList([PresencePenalty(args.presence, plen)])
             for s in range(args.seeds):
                 torch.manual_seed(args.seed_base + s)
                 with torch.no_grad():
                     gen = looper.generate(
                         **enc, max_new_tokens=args.gen_tokens, do_sample=True,
                         temperature=args.temp, top_p=args.top_p, top_k=args.top_k,
-                        min_p=args.min_p, repetition_penalty=args.rep, use_cache=True,
-                        pad_token_id=tok.pad_token_id or tok.eos_token_id)
+                        min_p=args.min_p or None, repetition_penalty=args.rep, use_cache=True,
+                        pad_token_id=tok.pad_token_id or tok.eos_token_id, **extra)
                 comp = gen[0][plen:]
                 text = tok.decode(comp, skip_special_tokens=True)
                 hit_cap = comp.numel() >= args.gen_tokens - 2
@@ -286,6 +307,8 @@ def main():
         "n_candidates_over_thresh": len(cands),
         "params": {"fixtures": [n for n, _ in fixtures], "seeds": args.seeds,
                    "temp": args.temp, "min_p": args.min_p, "rep": args.rep,
+                   "top_p": args.top_p, "top_k": args.top_k, "presence": args.presence,
+                   "looper": args.looper, "base": args.base, "drop_map": args.drop_map,
                    "gen_tokens": args.gen_tokens, "prefill_chunk": CHUNK},
     }
     json.dump(out, open(args.out, "w"), indent=1)

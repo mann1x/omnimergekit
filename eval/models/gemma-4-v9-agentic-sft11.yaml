@@ -1,0 +1,39 @@
+# gemma-4-20B-v9-agentic-sft11 — v9-agentic rebuilt on the sft11 26B agentic model (bm-893, 2026-11-13).
+#
+# Owner 2026-11-13: "the sampling now of this new v9-agentic is same as 26b agentic, minp 0 and pres_pen 0.025",
+# "with suggested temp 0.8". So this family's eval basis is greedy PLUS presence 0.025 and NO repetition penalty —
+# NOT the 2026-10-14 v9 `greedy_pen` (rep 1.06 / last 96 / presence 0.025), which is a different cohort.
+#
+# Sorted-filename auto-match: 'gemma-4-v9-agentic-sft11.yaml' sorts before 'gemma-4-v9-agentic.yaml'
+# ('-' < '.'), so *v9-agentic-sft11* names resolve here first; require_profile makes omk_eval refuse a run
+# without a sampler profile, as for the parent family.
+family: gemma-4-A4B-20B-v9-agentic-sft11
+require_profile: true
+match:
+  - "*v9-agentic-sft11*"
+  - "*v9agentic-sft11*"
+  - "*v9a-sft11*"
+samplers:
+  greedy_pres:            # the eval sampler: greedy + presence 0.025, no repetition penalty (DEFAULT)
+    temperature: 0.0
+    top_p: 1.0
+    top_k: 0
+    do_sample: false
+    repeat_penalty: 1.0
+    presence_penalty: 0.025
+  deployment:             # the recommended deployment sampler = the 26B agentic's
+    temperature: 0.8
+    top_p: 0.95
+    top_k: 64
+    min_p: 0.0
+    repeat_penalty: 1.0
+    presence_penalty: 0.025
+    do_sample: true
+  greedy:                 # plain greedy, NO penalties — only to compare with old greedy cohorts
+    temperature: 0.0
+    top_p: 1.0
+    top_k: 0
+    do_sample: false
+bench_policy:
+  default: greedy_pres
+protocol_overrides: {}
