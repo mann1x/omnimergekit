@@ -5,7 +5,9 @@
 # Owner decisions 2026-11-13: looper = sft11 pruned with the PRE-PIN map (refA generator args + the 120 sft11
 # lift pins, no loop pins) + shared α 1.2 (refA's looper was likewise expert_drop + α 1.2, no fold);
 # loop-generation sampler = the deployment sampler t0.8 / top_k 64 / top_p 0.95 / min_p 0 / presence 0.025,
-# no repeat penalty (refA: t0.9 / min_p 0.05 / rep 1.1). Gate: >= 6 loop sequences, else stop and report.
+# no repeat penalty (refA: t0.9 / min_p 0.05 / rep 1.1). Owner 14:58: "relabel, real loops only" — LOOP = cap hit AND
+# detect_loop AND tail 8-gram repeat share >= 0.8, CLEAN = neither; ambiguous ones leave both sets (refA's 8 were
+# 6 real + 2 healthy pages cut by the cap). Gate: >= 6 REAL loop sequences, else stop and report.
 #
 #   0. control   the generator on refA's own data + pins must reproduce A_lift120_plus_fk12 exactly
 #   1. pre-pin   map Apre = generator(sft11 competence, force-keep = 120 sft11 lift pins)
@@ -102,6 +104,7 @@ echo "########## 3 loop differential $(ts) ##########"
   --fixtures csharp_loop_parity,csharp_loop_parity_nothink,solar_system_v4,kvstore_deep,solar_build_friction,solar_build_start,agentic_filewrite_v1,agentic_plan_todo_v1,threejs_build \
   --seeds 6 --gen-tokens 2048 --prefill-chunk 2048 --teacher-chunk 1024 \
   --temp 0.8 --top-p 0.95 --top-k 64 --min-p 0 --rep 1.0 --presence 0.025 \
+  --relabel real --real-tail-share 0.8 \
   || fail "differential rc=$?"
 echo "V9A_LP_OK diff $(ts)"
 

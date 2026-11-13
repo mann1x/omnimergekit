@@ -50,6 +50,7 @@ import argparse
 import json
 import os
 import time
+from collections import Counter
 
 import numpy as np
 import torch
@@ -84,6 +85,41 @@ def mapping_tool_args(msgs):
                         pass
         out.append(m)
     return out
+
+
+def tail_repeat_share(ids, n=8, tail=1024):
+    """Share of the last ``tail`` tokens' n-grams that occur more than once in the whole completion."""
+    grams = Counter(tuple(ids[i:i + n]) for i in range(len(ids) - n + 1))
+    t = ids[-tail:]
+    tg = [tuple(t[i:i + n]) for i in range(len(t) - n + 1)]
+    return sum(1 for g in tg if grams[g] > 1) / max(len(tg), 1)
+
+
+def relabel_real(seqs, tok, gen_tokens, share_min):
+    """Keep only unambiguous labels: real loops and clean finishes; drop the rest (owner 2026-11-13).
+
+    refA's 8 'loops' were 6 genuine repetitions (tail share 1.00, detect_loop on) and 2 healthy three.js pages cut
+    by the 2048-token cap (detect_loop off, tail share 0.08-0.11), which the cap-or-detector label called loops.
+    """
+    out, counts = [], {"loop": 0, "clean": 0, "dropped_cap_only": 0, "dropped_detect_only": 0,
+                       "dropped_cap_detect_low_share": 0}
+    for s in seqs:
+        comp = s["ids"][s["plen"]:]
+        dl = bool(detect_loop(tok.decode(comp, skip_special_tokens=True)))
+        cap = len(comp) >= gen_tokens - 2
+        share = tail_repeat_share(comp)
+        s = {**s, "detect_loop": dl, "tail_share": round(share, 3), "hit_cap": cap}
+        if cap and dl and share >= share_min:
+            out.append({**s, "looped": True})
+            counts["loop"] += 1
+        elif not cap and not dl:
+            out.append({**s, "looped": False})
+            counts["clean"] += 1
+        else:
+            key = ("dropped_cap_only" if not dl else "dropped_detect_only" if not cap
+                   else "dropped_cap_detect_low_share")
+            counts[key] += 1
+    return out, {"counts": counts, "share_min": share_min}
 
 
 class PresencePenalty(LogitsProcessor):
@@ -132,6 +168,12 @@ def main():
     ap.add_argument("--presence", type=float, default=0.0,
                     help="additive presence penalty over the generated tokens (vLLM semantics, applied "
                          "before temperature); 0 = off, generation identical to the refA diff")
+    ap.add_argument("--relabel", choices=["none", "real"], default="none",
+                    help="real: after Phase 1, LOOP = hit the cap AND detect_loop AND the tail repeats itself "
+                         "(--real-tail-share), CLEAN = no cap hit and no detection; anything else (a long healthy "
+                         "output cut by the cap, a detector hit on a finished answer) leaves BOTH sets")
+    ap.add_argument("--real-tail-share", type=float, default=0.8,
+                    help="--relabel real: min share of the last 1024 tokens' 8-grams seen earlier in the completion")
     ap.add_argument("--out", default="/mnt/sdc/ml/google/expert_neuron_v8_agentic_diff.json")
     args = ap.parse_args()
 
@@ -205,6 +247,11 @@ def main():
         torch.cuda.empty_cache()
         json.dump(seqs, open(PHASE1_CACHE, "w"))
         log("PHASE 1: saved %d seqs -> %s" % (len(seqs), PHASE1_CACHE))
+    relabel = {}
+    if args.relabel == "real":
+        seqs, relabel = relabel_real(seqs, AutoTokenizer.from_pretrained(args.looper, trust_remote_code=True),
+                                     args.gen_tokens, args.real_tail_share)
+        log("PHASE 1 relabel (real loops only): %s" % json.dumps(relabel["counts"]))
     n_loop = sum(1 for s in seqs if s["looped"])
     n_clean = len(seqs) - n_loop
     log("PHASE 1 done: %d seqs (%d loop / %d clean)" % (len(seqs), n_loop, n_clean))
@@ -331,6 +378,7 @@ def main():
                    "temp": args.temp, "min_p": args.min_p, "rep": args.rep,
                    "top_p": args.top_p, "top_k": args.top_k, "presence": args.presence,
                    "looper": args.looper, "base": args.base, "drop_map": args.drop_map,
+                   "relabel": relabel or "none",
                    "gen_tokens": args.gen_tokens, "prefill_chunk": CHUNK},
     }
     json.dump(out, open(args.out, "w"), indent=1)
