@@ -8,12 +8,15 @@
 # generation/preprocessor config), then a QUICK imatrix (omk calibration_datav5.txt bd925aea, all chunks, as the
 # v10 quick builds) and Q4_K_M only. Not the AC imatrix: a quick test basis, not a publish basis.
 #
-# Usage: build_v9_agentic_sft11_quick.sh <drop_map.json> <tag> [GPU]
+# Usage: build_v9_agentic_sft11_quick.sh <drop_map.json> <tag> [GPU] [ALPHA]
+#   ALPHA = router_shared_upweight α (default 1.2, the recipe's); "none" skips the upweight (owner 2026-11-14:
+#   "regenerate ... without the shared alpha 1.2" — the bm-880 A-noshared idea on sft11).
 #   -> /mnt/sdc/ml/v9a_sft11/<tag>/gemma-4-20B-v9-agentic-sft11-<tag>{,-gguf}     never overwrites
 set -uo pipefail
 MAP=${1:?drop map}
 TAG=${2:?tag}
 GPU=${3:-1}
+ALPHA=${4:-1.2}
 SRC=/mnt/sdc/bm889-exports/gemma-4-26B-A4B-agentic
 PY=/srv/ml/envs/envs/omnimergekit/bin/python3.11
 OMK=/srv/ml/repos/omnimergekit                      # the tool tree the A_sft11 build used (same expert_drop/quantize)
@@ -49,9 +52,15 @@ PY
 say "expert_drop sft11 -> $BF (CPU)"
 CUDA_VISIBLE_DEVICES="" "$PY" "$OMK/scripts/expert_drop.py" --source-dir "$SRC" --drop-map "$O/drop_map.json" \
   --output-dir "$BF" > "$O/logs/expert_drop.log" 2>&1 || { tail -20 "$O/logs/expert_drop.log"; die "expert_drop"; }
-CUDA_VISIBLE_DEVICES="" "$PY" "$OMK/recipes/gemma4/v5_moe_sweep/router_shared_upweight.py" --model-dir "$BF" \
-  --alpha 1.2 --target mlp.down_proj.weight > "$O/logs/upweight.log" 2>&1 || { tail -20 "$O/logs/upweight.log"; die "upweight"; }
-rm -f "$BF"/*.pre_shared_upweight
+if [ "$ALPHA" = none ]; then
+  say "router_shared_upweight SKIPPED (ALPHA=none): shared expert as dropped, unscaled"
+  echo "none" > "$O/shared_alpha.txt"
+else
+  CUDA_VISIBLE_DEVICES="" "$PY" "$OMK/recipes/gemma4/v5_moe_sweep/router_shared_upweight.py" --model-dir "$BF" \
+    --alpha "$ALPHA" --target mlp.down_proj.weight > "$O/logs/upweight.log" 2>&1 || { tail -20 "$O/logs/upweight.log"; die "upweight"; }
+  rm -f "$BF"/*.pre_shared_upweight
+  echo "$ALPHA" > "$O/shared_alpha.txt"
+fi
 cp "$TMPL" "$BF/chat_template.jinja"
 cp "$SRC/generation_config.json" "$SRC/preprocessor_config.json" "$BF/"
 "$PY" - "$BF" <<'PY' || die "config check"
