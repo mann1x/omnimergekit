@@ -178,6 +178,79 @@ MTP_HEAD_OVERRIDE_TIERS = {
     "Q2_K", "IQ3_XXS", "IQ3_XS",
 }
 
+# ---------------------------------------------------------------------------
+# Gemma-4 A4B attention rule (owner, 2026-11-16, bm-892).
+# On the Gemma-4 MoE family (26B-A4B 128e and its 98e prunes) the attention
+# projections attn_q/k/v/output are a small share of the file but a large share
+# of the error: the 26B sweep at 2-bit experts measured attention Q8_0 klk
+# 0.0675, Q6_K 0.0691 (+2.4 %), Q5_K 0.0707, Q4_K 0.0783 (+16 %), and stock
+# Q4_K_M puts attn_q/k/output at Q4_K. Rule: every tier BELOW Q4_K_M carries
+# all four projections at Q6_K; Q4_K_M and every tier above at Q8_0. Applied
+# as the FIRST `--tensor-type` override of llama-quantize (first match wins,
+# so it beats a CD --tensor-type-file entry for the same tensor). Only when
+# the F16 GGUF is architecture gemma4 WITH experts; dense Gemma-4 and other
+# architectures are untouched. F16/BF16 and the Bonsai 2 codecs skip it.
+GEMMA4_ATTN_PATTERN = r"blk\.\d+\.attn_(q|k|v|output)\.weight"
+GEMMA4_ATTN_HIGH_TIERS = {  # Q4_K_M and above -> q8_0; everything else -> q6_k
+    "Q4_K_M", "Q4_K_L", "Q5_K_S", "Q5_K_M", "Q5_K_L", "Q5_0", "Q5_1",
+    "Q6_K", "Q6_K_L", "Q8_0",
+}
+GEMMA4_ATTN_SKIP = {"F16", "BF16", "F32"}
+
+
+def gemma4_attention_type(quant: str) -> str | None:
+    """llama-quantize type the Gemma-4 A4B attention projections get for a tier.
+
+    'q8_0' at Q4_K_M and above, 'q6_k' below (IQ*, Q2_K*, Q3_K*, Q4_K_S, Q4_0/1,
+    IQ4_*), None for the unquantized tiers and the Bonsai 2 codecs. CD-/UD-
+    prefixes and the _L/_XL/_h mix suffixes classify by their base tier.
+    """
+    base = quant
+    for pre in ("CD-", "UD-"):
+        if base.startswith(pre):
+            base = base[len(pre):]
+    base = base.upper()
+    if base in GEMMA4_ATTN_SKIP or base in BONSAI2_QUANTS:
+        return None
+    for suf in ("_XL", "_L", "_H"):
+        if base.endswith(suf) and base[: -len(suf)] in GEMMA4_ATTN_HIGH_TIERS | {
+                "Q4_K_S", "Q3_K_M", "Q3_K_S", "Q3_K_L", "Q2_K", "IQ3_M", "IQ3_XS",
+                "IQ2_M", "IQ2_XS", "IQ2_S", "IQ2_XXS", "IQ4_XS", "IQ4_NL"}:
+            base = base[: -len(suf)]
+            break
+    return "q8_0" if base in GEMMA4_ATTN_HIGH_TIERS else "q6_k"
+
+
+@lru_cache(maxsize=16)
+def gguf_is_gemma4_moe(f16_gguf: str) -> bool:
+    """True when the GGUF declares general.architecture gemma4 with experts.
+
+    Reads the file's own metadata (the family is a property of the artifact,
+    not of a flag). Unreadable or missing metadata -> False, printed, so the
+    rule is never applied by accident; the per-tier log line says when it is.
+    """
+    try:
+        from gguf import GGUFReader
+        r = GGUFReader(str(f16_gguf))
+    except Exception as exc:  # noqa: BLE001
+        print(f"  gemma4 attention rule: cannot read {f16_gguf} ({exc}); "
+              "rule not applied", flush=True)
+        return False
+    arch = None
+    experts = 0
+    for k, f in r.fields.items():
+        if k == "general.architecture":
+            try:
+                arch = bytes(f.parts[f.data[0]]).decode()
+            except Exception:  # noqa: BLE001
+                arch = None
+        elif k.endswith(".expert_count"):
+            try:
+                experts = int(f.parts[f.data[0]].tolist()[0])
+            except Exception:  # noqa: BLE001
+                experts = 0
+    return arch == "gemma4" and experts > 0
+
 
 def detect_mtp(model_path: Path) -> dict | None:
     """Detect MTP (Multi-Token Prediction) head in a HF safetensors model.
@@ -1222,6 +1295,17 @@ def quantize_one(tools: dict, f16_gguf: Path, output_dir: Path,
     # _L/_XL variants: keep embed/output at Q8_0 for better quality
     if quant in _L_XL_VARIANTS:
         cmd.extend(["--output-tensor-type", "q8_0", "--token-embedding-type", "q8_0"])
+
+    # Gemma-4 A4B attention rule: BEFORE any CD map (first matching override
+    # wins in llama-quantize), so the four projections never fall to the
+    # tier's or the map's own choice. See GEMMA4_ATTN_PATTERN.
+    attn_type = (gemma4_attention_type(quant)
+                 if not is_bonsai2 and gguf_is_gemma4_moe(str(f16_gguf)) else None)
+    if attn_type:
+        cmd.extend(["--tensor-type", f"{GEMMA4_ATTN_PATTERN}={attn_type}"])
+        print(f"  {quant}: Gemma-4 A4B attention rule — attn_q/k/v/output -> "
+              f"{attn_type} ({'Q4_K_M and above' if attn_type == 'q8_0' else 'below Q4_K_M'})",
+              flush=True)
 
     # CD (ContribDynamic) quants: use per-layer tensor type file
     if tensor_type_file is not None:
