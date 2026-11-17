@@ -2974,8 +2974,13 @@ def main():
                         help="Target HF repo for uploads (default: auto-generate with -GGUF suffix)")
     parser.add_argument("--output-dir", default=None,
                         help="Local output directory (default: ./gguf_output/<model_name>)")
-    parser.add_argument("--base-precision", choices=["f16", "f32"], default="f16",
-                        help="Base GGUF precision (default: f16)")
+    parser.add_argument("--base-precision", choices=["bf16", "f16", "f32"], default="bf16",
+                        help="Base GGUF precision for convert_hf_to_gguf.py --outtype "
+                             "(default: bf16). A bf16 checkpoint converted as f16 keeps every "
+                             "normal-range weight exactly but loses the weights below ~6e-5 "
+                             "(f16 subnormals): on Gemma-4 20B attention that is 0.2 %% of the "
+                             "weights, enough to break byte-identity gates against bf16-sourced "
+                             "encodings (bug-957, 2026-11-17). Base file: <model>-<PRECISION>.gguf")
     parser.add_argument("--only", default=None,
                         help="Comma-separated list of quants to create (overrides full list)")
     parser.add_argument("--exclude", default=None,
