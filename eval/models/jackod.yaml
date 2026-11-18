@@ -1,13 +1,18 @@
 # JackOD-9B-Coder (Qwen3.5-9B hybrid merges: v1, v2/JackODF, F15O30 = v3) — the model's OWN sampler.
 #
-# Owner 2026-10-24: this is the ONLY supported sampler for JackOD; it goes into the HF
-# generation_config.json, the ollama Modelfiles and every eval of this family:
-#   temperature 0.7 / top_k 20 / top_p 0.95 / repeat_penalty 1.002 / repeat_last_n 96 /
-#   presence_penalty 0.0375 / seed 42.
-# Seed 42 is part of the sampler, not an eval convenience: the owner observed (and confirmed
-# on an ollama Qwen3.5-9B model) that other seeds loop. Temperature is held at 0.7 because the
-# model is loop-prone above and below it. Toolbench therefore runs ONE pass at seed 42
-# (other seeds are "not supported"), not the 42..46 greedy basis of the earlier cohort.
+# owner_t04 (owner 2026-10-25) is the supported sampler and the default:
+#   temperature 0.4 / top_k 20 / top_p 0.95 / repeat_penalty 1.002 / repeat_last_n 112 /
+#   presence_penalty 1.05 / seed NOT fixed.
+# seed -1 is how "not fixed" is written: lm-eval otherwise puts seed=1234 in EVERY request,
+# so an absent seed would be a fixed 1234. -1 reaches llama-server as LLAMA_DEFAULT_SEED
+# (0xFFFFFFFF) = a fresh random seed per request, and is the server --seed default.
+# Seed 42 is no longer part of the sampler: owner tested it and it is better but not reliable
+# (does not loop, stellar on some tasks, fails others) -> the card only SUGGESTS users try it.
+# Toolbench runs the usual paired seeds 42..46 (tool-eval-bench --seed is a per-request
+# sampling seed sent to the server; each pass is seeded by design).
+#
+# owner_s42 (2026-10-24: temp .7 / rep 1.002 / last_n 96 / presence .0375 / seed 42) is kept
+# as measured: it is the PROVISIONAL v3 cohort (never carded). Never pool it with owner_t04.
 #
 # require_profile: a JackOD eval without --sampler-profile is refused, so no greedy row can
 # be produced by accident and pooled with this cohort. The earlier greedy JackOD cells
@@ -18,6 +23,16 @@ match:
   - "*jackod*"
   - "*JackOD*"
 samplers:
+  owner_t04:
+    temperature: 0.4
+    top_p: 0.95
+    top_k: 20
+    min_p: 0.0
+    repeat_penalty: 1.002
+    repeat_last_n: 112
+    presence_penalty: 1.05
+    seed: -1
+    do_sample: true
   owner_s42:
     temperature: 0.7
     top_p: 0.95
@@ -29,5 +44,5 @@ samplers:
     seed: 42
     do_sample: true
 bench_policy:
-  default: owner_s42
+  default: owner_t04
 protocol_overrides: {}
