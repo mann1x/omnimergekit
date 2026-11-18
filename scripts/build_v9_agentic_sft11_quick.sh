@@ -12,17 +12,21 @@
 #   ALPHA = router_shared_upweight α (default 1.2, the recipe's); "none" skips the upweight (owner 2026-11-14:
 #   "regenerate ... without the shared alpha 1.2" — the bm-880 A-noshared idea on sft11).
 #   -> /mnt/sdc/ml/v9a_sft11/<tag>/gemma-4-20B-v9-agentic-sft11-<tag>{,-gguf}     never overwrites
+#   Env overrides (bm-898, owner 2026-11-18: prune the 26B VENDOR BASE with ml_k8, no α, then run sft11 on it once):
+#     SRC=<26B model dir>  OUT_ROOT=<dir holding <tag>/>  NAME_PREFIX=<model name prefix>, e.g.
+#     SRC=/mnt/sdc/ml/models/gemma-4-26B-A4B-it OUT_ROOT=/mnt/sdc/ml/v9a_base NAME_PREFIX=gemma-4-20B-v9-agentic-base \
+#       build_v9_agentic_sft11_quick.sh inputs/ml_k8.json mlk8-noa 1 none
 set -uo pipefail
 MAP=${1:?drop map}
 TAG=${2:?tag}
 GPU=${3:-1}
 ALPHA=${4:-1.2}
-SRC=/mnt/sdc/bm889-exports/gemma-4-26B-A4B-agentic
+SRC=${SRC:-/mnt/sdc/bm889-exports/gemma-4-26B-A4B-agentic}
 PY=/srv/ml/envs/envs/omnimergekit/bin/python3.11
 OMK=/srv/ml/repos/omnimergekit                      # the tool tree the A_sft11 build used (same expert_drop/quantize)
 LC=/mnt/sdc/ml/llama.cpp-b12386   # 2026-11-14 owner: switch to latest; b9700 CUDA IQ3_S matmul is wrong on sm_120 (bm-892)
-O=/mnt/sdc/ml/v9a_sft11/$TAG
-NAME=gemma-4-20B-v9-agentic-sft11-$TAG
+O=${OUT_ROOT:-/mnt/sdc/ml/v9a_sft11}/$TAG
+NAME=${NAME_PREFIX:-gemma-4-20B-v9-agentic-sft11}-$TAG
 BF=$O/$NAME
 GG=$O/gguf
 TMPL=/mnt/sdc/ml/v9a_sft11/inputs/chat_template.jinja
@@ -49,7 +53,7 @@ print("[map] layers", len(m), "drops/layer", sorted(set(n)), "total", sum(n))
 assert len(m) == 30 and set(n) == {30}
 PY
 
-say "expert_drop sft11 -> $BF (CPU)"
+say "expert_drop $(basename "$SRC") -> $BF (CPU)"
 CUDA_VISIBLE_DEVICES="" "$PY" "$OMK/scripts/expert_drop.py" --source-dir "$SRC" --drop-map "$O/drop_map.json" \
   --output-dir "$BF" > "$O/logs/expert_drop.log" 2>&1 || { tail -20 "$O/logs/expert_drop.log"; die "expert_drop"; }
 if [ "$ALPHA" = none ]; then
