@@ -31,6 +31,7 @@ DO_REPO=1
 REPO_DIR=/workspace/omnimergekit
 REPO_URL=https://github.com/mann1x/omnimergekit
 BUILD_LLAMA=1
+LLAMA_REV=""                   # tag/branch to clone (e.g. b12386); empty = default branch HEAD
 CUDA_ARCH=86
 LLAMA_CURL=OFF
 ENV_NAME=omnimergekit
@@ -66,6 +67,7 @@ Flags:
   --llama / --no-llama    build llama.cpp (default: build)
   --cuda-arch ARCH        CUDA arch for llama.cpp (default 86=3090; 89=4090; "86;89")
   --llama-curl            build llama.cpp with LLAMA_CURL=ON (default OFF)
+  --llama-rev TAG         clone llama.cpp at TAG (e.g. b12386) so quants match a pinned build elsewhere
   --env NAME              conda env to use/create (default omnimergekit)
   --deps PROFILE          eval-full | eval-augment | train | none (default eval-full)
                             eval-full   : requirements.txt + requirements-eval.txt (bare pod)
@@ -102,6 +104,7 @@ while [ $# -gt 0 ]; do
         --no-llama)         BUILD_LLAMA=0; shift ;;
         --cuda-arch)        CUDA_ARCH="$2"; shift 2 ;;
         --llama-curl)       LLAMA_CURL=ON; shift ;;
+        --llama-rev)        LLAMA_REV="$2"; shift 2 ;;
         --env)              ENV_NAME="$2"; shift 2 ;;
         --deps)             DEPS="$2"; shift 2 ;;
         --lm-eval-extras)   LMEVAL_EXTRAS="$2"; shift 2 ;;
@@ -213,8 +216,8 @@ fi
 # ── 4. llama.cpp build (CUDA) ────────────────────────────────────────────────
 if [ "$BUILD_LLAMA" = 1 ]; then
     if [ ! -x /workspace/llama.cpp/build/bin/llama-server ]; then
-        log "4. build llama.cpp (arch=$CUDA_ARCH curl=$LLAMA_CURL)"
-        [ -d /workspace/llama.cpp ] || git clone --depth 1 https://github.com/ggml-org/llama.cpp /workspace/llama.cpp 2>&1 | tail -2
+        log "4. build llama.cpp (arch=$CUDA_ARCH curl=$LLAMA_CURL rev=${LLAMA_REV:-HEAD})"
+        [ -d /workspace/llama.cpp ] || git clone --depth 1 ${LLAMA_REV:+--branch "$LLAMA_REV"} https://github.com/ggml-org/llama.cpp /workspace/llama.cpp 2>&1 | tail -2
         cd /workspace/llama.cpp
         cmake -B build -G Ninja \
             -DGGML_CUDA=ON \

@@ -72,3 +72,12 @@ PEGFIX_GATE_PASS
 A lenient-only run passed on bs2 while the guard was written `== 1` (int) instead of
 `== '1'` (char) — the fallback fired unconditionally and the escape hatch was dead.
 See buglog `bug-684`.
+
+## b12386 (2026-11-16, Bulgarian pod): a third source variant
+
+`common_chat_peg_parse(const common_peg_arena &, const common_chat_input &, bool, const common_chat_parser_params &)`:
+the input is a `common_chat_input` (text + tokens) whose `.text` is moved into `ctx.input`, so the fallback block must
+read `ctx.input` (the two patches above reference `effective_input` as a string and do not apply). The throw message is the
+newer one ("...does not match the expected..."). Ported by hand into `/workspace/llama.cpp` on the pod (build dir
+`build-pegfix`, `build/` stays the clean tree). The gate harness for this signature is `pegfix_gate_chatinput.cpp`
+(wraps the string in `common_chat_input(in)`); `pegfix_gate.cpp` does not compile there.
