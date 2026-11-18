@@ -1,0 +1,47 @@
+[09:33:05] SCORER version=2.6.0 module=/root/.local/share/uv/tools/tool-eval-bench/lib/python3.12/site-packages/tool_eval_bench
+[09:33:05] ######## SEED 42 — balanced pass over all 1 models ########
+[09:33:05] == v9-agentic-sft12 (gemma-4-20B-v9-agentic-Q4_K_M.gguf) nextn=NO spec=none seed=42 sampler: --temp 0 --top-p 1 --top-k 0 --min-p 0 --presence-penalty 0.035 --repeat-penalty 1.0 client: --temperature 0 --backend-kwargs {"temperature":0,"top_p":1,"top_k":0,"min_p":0,"presence_penalty":0.035,"repeat_penalty":1.0}
+[09:33:15]   ready — VRAM 9683 MiB
+15611 MiB
+[09:33:15]   -> v9-agentic-sft12 seed 42
+[09:42:17]      rc=0  9m2s  **Total Points**: 143 / 176
+[09:42:27]   stopping server pid 3208092
+[09:42:40]   !! chart refresh FAILED (cohort unaffected)
+[09:42:40] ######## SEED 42 PASS COMPLETE — balanced cohort at n=1 ########
+[09:42:40] ######## SEED 43 — balanced pass over all 1 models ########
+[09:42:40] == v9-agentic-sft12 (gemma-4-20B-v9-agentic-Q4_K_M.gguf) nextn=NO spec=none seed=43 sampler: --temp 0 --top-p 1 --top-k 0 --min-p 0 --presence-penalty 0.035 --repeat-penalty 1.0 client: --temperature 0 --backend-kwargs {"temperature":0,"top_p":1,"top_k":0,"min_p":0,"presence_penalty":0.035,"repeat_penalty":1.0}
+[09:42:50]   ready — VRAM 25504 MiB
+15611 MiB
+[09:42:50]   -> v9-agentic-sft12 seed 43
+[09:52:04]      rc=0  9m14s  **Total Points**: 141 / 176
+[09:52:14]   stopping server pid 3506572
+[09:52:26]   !! chart refresh FAILED (cohort unaffected)
+[09:52:26] ######## SEED 43 PASS COMPLETE — balanced cohort at n=1 ########
+[09:52:26] ######## SEED 44 — balanced pass over all 1 models ########
+[09:52:27] == v9-agentic-sft12 (gemma-4-20B-v9-agentic-Q4_K_M.gguf) nextn=NO spec=none seed=44 sampler: --temp 0 --top-p 1 --top-k 0 --min-p 0 --presence-penalty 0.035 --repeat-penalty 1.0 client: --temperature 0 --backend-kwargs {"temperature":0,"top_p":1,"top_k":0,"min_p":0,"presence_penalty":0.035,"repeat_penalty":1.0}
+[09:52:37]   ready — VRAM 25502 MiB
+15611 MiB
+[09:52:37]   -> v9-agentic-sft12 seed 44
+[10:01:40]      rc=0  9m3s  **Total Points**: 144 / 176
+[10:01:50]   stopping server pid 3819391
+[10:02:02]   !! chart refresh FAILED (cohort unaffected)
+[10:02:02] ######## SEED 44 PASS COMPLETE — balanced cohort at n=1 ########
+[10:02:02] ######## SEED 45 — balanced pass over all 1 models ########
+[10:02:02] == v9-agentic-sft12 (gemma-4-20B-v9-agentic-Q4_K_M.gguf) nextn=NO spec=none seed=45 sampler: --temp 0 --top-p 1 --top-k 0 --min-p 0 --presence-penalty 0.035 --repeat-penalty 1.0 client: --temperature 0 --backend-kwargs {"temperature":0,"top_p":1,"top_k":0,"min_p":0,"presence_penalty":0.035,"repeat_penalty":1.0}
+[10:02:12]   ready — VRAM 25504 MiB
+15611 MiB
+[10:02:12]   -> v9-agentic-sft12 seed 45
+[10:11:31]      rc=0  9m19s  **Total Points**: 143 / 176
+[10:11:41]   stopping server pid 4145447
+[10:11:53]   !! chart refresh FAILED (cohort unaffected)
+[10:11:53] ######## SEED 45 PASS COMPLETE — balanced cohort at n=1 ########
+[10:11:53] ######## SEED 46 — balanced pass over all 1 models ########
+[10:11:54] == v9-agentic-sft12 (gemma-4-20B-v9-agentic-Q4_K_M.gguf) nextn=NO spec=none seed=46 sampler: --temp 0 --top-p 1 --top-k 0 --min-p 0 --presence-penalty 0.035 --repeat-penalty 1.0 client: --temperature 0 --backend-kwargs {"temperature":0,"top_p":1,"top_k":0,"min_p":0,"presence_penalty":0.035,"repeat_penalty":1.0}
+[10:12:04]   ready — VRAM 15818 MiB
+15611 MiB
+[10:12:04]   -> v9-agentic-sft12 seed 46
+[10:21:16]      rc=0  9m12s  **Total Points**: 142 / 176
+[10:21:26]   stopping server pid 249007
+[10:21:38]   !! chart refresh FAILED (cohort unaffected)
+[10:21:38] ######## SEED 46 PASS COMPLETE — balanced cohort at n=1 ########
+[10:21:38] COHORT COMPLETE

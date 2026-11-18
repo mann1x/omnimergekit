@@ -1,0 +1,23 @@
+# cohort64k + v9-agentic-sft12 arm (2026-11-17), summarize_cohort.py over all 12 arms x 5 seeds
+# sft12 arm: K-FAC Q4_K_M sha 4375847d, greedy + presence 0.035 + repeat 1.0, stock llama.cpp b12386, bs2 RTX PRO 6000, scorer 2.6.0 (992a6978); see RUN_BASIS.txt
+# per seed: s42 143  s43 141  s44 144  s45 143  s46 142  (of 176)
+BALANCED across all 12 models at n=5  seeds=[42, 43, 44, 45, 46]
+
+  model               mean raw            95% CI  mean adj/176  excl
+  --------------------------------------------------------------------
+  omnimerge-v6           156.4   [ 152.0, 160.8]         88.9%     0  
+  qwen3.8-27b            150.8   [ 147.7, 153.9]         85.7%     0  
+  ornith-1.5-35b         146.2   [ 143.0, 149.4]         83.1%     0  
+  omnimerge-v4           146.2   [ 142.9, 149.5]         83.1%     0  
+  qwen3.6-27b            144.0   [ 139.8, 148.2]         81.8%     0  
+  v9-agentic-sft12       142.6   [ 141.2, 144.0]         81.0%     0  
+  qwen3.6-35b-a3b        141.6   [ 138.6, 144.6]         80.5%     0  
+  v9-agentic             137.6   [ 132.2, 143.0]         78.2%     0  
+  a3b-coderx             137.4   [ 131.3, 143.5]         78.1%     0  
+  ornith-27b-coder       136.8   [ 130.9, 142.7]         77.7%     0  
+  ornith-27b-coderx      134.0   [ 130.8, 137.2]         76.1%     1  MIXED
+  a3b-coder              123.2   [ 120.4, 126.0]         70.0%     0  
+
+  ** Cells with excluded scenarios are graded on <176. Raw points are NOT
+     directly comparable there; the adj column divides by the full 176.
+     ornith-27b-coderx s42: 138/174 excluded=1 (TC-05)

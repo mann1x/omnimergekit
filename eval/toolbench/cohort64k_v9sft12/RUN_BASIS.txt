@@ -1,0 +1,8 @@
+v9-agentic-sft12 arm (sft12 K-FAC Q4_K_M), cohort64k basis, 2026-11-17
+model    ManniX-ITA/gemma-4-20B-v9-agentic-GGUF gemma-4-20B-v9-agentic-Q4_K_M.gguf (K-FAC rounded, attention Q8_0) sha256 4375847df8593f0a239c440704d9b0bfa866e4cfc284305862d922d9f552caa6
+drafter  none
+sampler  greedy + the sft12 deployment penalty: temp 0 / top_k 0 / top_p 1 / min_p 0 / presence_penalty 0.035 / repeat_penalty 1.0, forwarded per request (owner 2026-11-17: 'use 0.035'). The 2026-10-16 v9-agentic cell (137.6) forwarded repeat 1.06 / repeat_last_n 96 / presence 0.025, that build's sampler.
+server   /mnt/sdc/ml/llama.cpp-b12386/build/bin/llama-server (version: 1.0.0-dev (build 2299, commit c6c0ec6d5); binary sha 739ec0c63f04; the K-FAC ladder's llama.cpp b12386 tree) via /mnt/sdc/omk-model-optimizer/runs/tb_sft12/bin/llama-server-cohort, which only drops the llamafile-only --server argv
+host     bs2 (Linode) RTX PRO 6000 Blackwell 96 GB, GPU1 (3 MiB in use at start; the K-FAC lanes round on GPU0 and score on the freer GPU). The 137.6 cell: vast pod 55947563 RTX 3090 + stock b9700.
+harness  tool-eval-bench 2.6.0 (992a6978e) at /mnt/sdc/uv/bin_v260/tool-eval-bench, --hardmode --weight-by-difficulty, ctx 65536, pressure 0.25, timeout 600, seeds 42..46
+scorer-note  run_cohort.sh prepends $HOME/.local/bin, so the shim actually used is /root/.local/bin/tool-eval-bench (uv tool, installed 2026-10-25): version 2.6.0, commit 992a6978ecbee2d72fa2ead9ccc509436769d088 -- the SAME commit as the /mnt/sdc/uv/bin_v260 install named above (verified from its direct_url.json at 09:36Z); basis unchanged.
